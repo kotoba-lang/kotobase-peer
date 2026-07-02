@@ -2,6 +2,7 @@
   (:require #?(:clj [clojure.test :refer [deftest is testing]]
                :cljs [cljs.test :refer [deftest is testing] :include-macros true])
             [clojure.set :as set]
+            [ipld.core :as ipld]
             [kotobase-engine.core :as eng]))
 
 (defn- mem-store []
@@ -63,7 +64,9 @@
     (is (= [0 1] (map :seq history)))
     (is (not= (:state (first history)) (:state (second history)))
         "different db content -> different snapshot CID")
-    (is (= (eng/latest-snapshot-cid get-fn c1) (:state (last history))))
+    (is (= (eng/latest-snapshot-cid get-fn c1)
+           (ipld/link-cid (:state (last history))))
+        "chain state is a tag-42 Link wrapping the snapshot CID")
     (is (true? (eng/verify-chain get-fn c1)))))
 
 (deftest verify-chain-catches-a-store-that-lies

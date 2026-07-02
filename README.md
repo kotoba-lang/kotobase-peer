@@ -3,7 +3,9 @@
 **The kotobase XRPC-surface engine, in real CLJC — verified on both JVM and
 ClojureScript.** Composes the already-landed Wave 1–3 primitives
 (`prolly-tree`, `quad-store`, `kqe`, `commit-dag`) into `transact`/`datoms`/
-`q`/`pull`, persisted as a content-addressed, verifiable commit chain — the
+`q`/`pull`, persisted as a content-addressed, verifiable commit chain whose references
+are real tag-42 IPLD links end to end (chain prev, snapshot state, index
+roots, tree children — one generic `ipld.core/links` walk reaches them all) — the
 piece that was still missing before production `kotobase.net` traffic can
 move off the wasm build of the deleted Rust engine (`kotobase.aozora.app`).
 See [ADR-2607022600](https://github.com/com-junkawasaki/root/blob/main/90-docs/adr/2607022600-kotoba-database-crates-cljc-migration-roadmap.md).

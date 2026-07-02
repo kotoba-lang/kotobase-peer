@@ -5,8 +5,8 @@
  ;; content-addressed, verifiable commit-dag chain. multiformats/dag-cbor/
  ;; prolly-tree/quad-store all come in transitively via kqe's and commit-dag's
  ;; own deps.edn.
- :deps {io.github.kotoba-lang/kqe        {:git/sha "9f4dc81599adc57770a8b309b2bd4633dae38189"}
-        io.github.kotoba-lang/commit-dag {:git/sha "1a037a03e09e495d473fd374d9d9ee38f9eefc87"}}
+ :deps {io.github.kotoba-lang/kqe        {:git/sha "9901532a77b2280ce89eac6793e6da5e900bc739"}
+        io.github.kotoba-lang/commit-dag {:git/sha "05cc0473dce76539edab46d9fb8cf785f6ff6117"}}
  :aliases
  {:test {:extra-paths ["test"]
          :extra-deps {io.github.cognitect-labs/test-runner

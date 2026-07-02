@@ -16,7 +16,8 @@
 ;; that snapshot CID as its opaque `state`. Neither library is modified; this
 ;; namespace is the seam between them.
 (ns kotobase-engine.core
-  (:require [quad-store.core :as qs]
+  (:require [ipld.core :as ipld]
+            [quad-store.core :as qs]
             [kqe.core :as kqe]
             [commit-dag.core :as cd]))
 
@@ -90,7 +91,10 @@
    convention: `(put! cid bytes)` / `(get-fn cid) -> bytes`."
   [put! get-fn db prev-chain-cid]
   (let [snapshot-cid (qs/commit! put! db nil)]
-    (cd/commit! put! get-fn snapshot-cid prev-chain-cid)))
+    ;; state is a REAL tag-42 link, so a generic walk (ipld.core/links /
+    ;; kotoba-client.ipld-hydrate) reaches chain -> snapshot -> index trees
+    ;; with no engine-specific schema knowledge.
+    (cd/commit! put! get-fn (ipld/link snapshot-cid) prev-chain-cid)))
 
 (defn chain
   "Full commit history rooted at `chain-cid`, oldest first. Each entry's
@@ -108,7 +112,7 @@
   "The quad-store snapshot CID (`:state`) of the most recent commit in the
    chain rooted at `chain-cid`, or nil if the chain is empty."
   [get-fn chain-cid]
-  (:state (head get-fn chain-cid)))
+  (some-> (head get-fn chain-cid) :state ipld/link-cid))
 
 (defn verify-chain
   "True iff the commit-dag chain rooted at `chain-cid` is untampered and its
