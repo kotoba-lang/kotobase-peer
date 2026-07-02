@@ -58,12 +58,41 @@
   [v] (pr-str v))
 
 (defn datoms
-  "`datomic.datoms`-shaped rows over the whole `db`: `{:e :a :v_edn :added}`,
-   AppView-scan compatible (same wire shape as the DataScript-backed
-   `kotobase.engine` this replaces)."
-  [db]
-  (vec (for [[s pm] (:spo db) [p os] pm o os]
-         {:e s :a p :v_edn (v->edn o) :added true})))
+  "`datomic.datoms`-shaped rows `{:e :a :v_edn :added}`, AppView-scan compatible
+   (same wire shape as the DataScript-backed `kotobase.engine` this replaces).
+
+   1-arg → whole-db (:eavt full scan, unchanged). 2-arg honors an optional
+   `{:index :components :limit}` SERVER-SIDE via quad-store's index accessors, so
+   a filtered read (e.g. getBackup by entity, or by [attr value]) materialises
+   ONLY the matching entity/attr instead of the whole graph — the root fix for
+   the deployed wasm worker ignoring index/components_edn/limit and rehydrating
+   the full graph per read (ADR-2607022330 addendum 2).
+
+   `:index` ∈ #{:eavt :aevt :avet} (default :eavt); `:components` is an ordered
+   prefix in that index's key order (:eavt=[e a v], :aevt/:avet=[a … ]); values
+   are the opaque strings quad-store stores (the PDS's :db/id for e, `:ns/attr`
+   for a, the stored value string for v). `:limit` caps the row count."
+  ([db] (datoms db nil))
+  ([db {:keys [index components limit]}]
+   (let [[c0 c1] components
+         triples
+         (case (or index :eavt)
+           ;; EAVT — key order [e a v]
+           :eavt (cond
+                   (and c0 c1) (for [v (get (qs/entity-attrs db c0) c1 #{})] [c0 c1 v])
+                   c0          (for [[a vs] (qs/entity-attrs db c0), v vs]   [c0 a v])
+                   :else       (for [[e pm] (:spo db), [a vs] pm, v vs]      [e a v]))
+           ;; AEVT — key order [a e v]
+           :aevt (cond
+                   c0    (for [[e vs] (qs/by-predicate db c0), v vs]   [e c0 v])
+                   :else (for [[a em] (:pso db), [e vs] em, v vs]      [e a v]))
+           ;; AVET — key order [a v e]; [a v] is quad-store's point lookup
+           :avet (cond
+                   (and c0 c1) (for [e (qs/by-predicate-value db c0 c1)] [e c0 c1])
+                   c0          (for [[e vs] (qs/by-predicate db c0), v vs] [e c0 v])
+                   :else       (for [[a em] (:pso db), [e vs] em, v vs]    [e a v])))
+         triples (cond->> triples limit (take limit))]
+     (vec (for [[e a v] triples] {:e e :a a :v_edn (v->edn v) :added true})))))
 
 (defn q
   "`datomic.q`-equivalent: `pattern` is `[s p o]` (nil = wildcard), routed to
