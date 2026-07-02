@@ -22,6 +22,43 @@
       (is (every? #(and (:e %) (:a %) (:v_edn %) (:added %)) rows))
       (is (= #{"\"admin\"" "\"Alice\"" "\"user\""} (set (map :v_edn rows)))))))
 
+(deftest datoms-honors-index-components-limit
+  ;; Models the getBackup shape: several entities, fetch ONE by an index prefix
+  ;; instead of scanning the whole graph (ADR-2607022330 addendum 2).
+  (let [db (eng/transact (eng/empty-db)
+                          [["keybackup/did:key:zAlice" ":aozora.keyBackup/did" "did:key:zAlice"]
+                           ["keybackup/did:key:zAlice" ":aozora.keyBackup/blob" "{blobA}"]
+                           ["keybackup/did:key:zBob"   ":aozora.keyBackup/did" "did:key:zBob"]
+                           ["keybackup/did:key:zBob"   ":aozora.keyBackup/blob" "{blobB}"]
+                           ["acct/alice" ":atproto.account/handle" "alice.aozora.app"]])]
+    (testing "no opts → whole-db scan (unchanged)"
+      (is (= 5 (count (eng/datoms db))))
+      (is (= 5 (count (eng/datoms db nil)))))
+    (testing ":eavt + [e] returns ONLY that entity's datoms (the getBackup query)"
+      (let [rows (eng/datoms db {:index :eavt :components ["keybackup/did:key:zAlice"]})]
+        (is (= 2 (count rows)))
+        (is (every? #(= "keybackup/did:key:zAlice" (:e %)) rows))
+        (is (= #{":aozora.keyBackup/did" ":aozora.keyBackup/blob"} (set (map :a rows))))))
+    (testing ":eavt + [e a] narrows to one attribute"
+      (is (= [{:e "keybackup/did:key:zAlice" :a ":aozora.keyBackup/blob"
+               :v_edn "\"{blobA}\"" :added true}]
+             (eng/datoms db {:index :eavt
+                             :components ["keybackup/did:key:zAlice" ":aozora.keyBackup/blob"]}))))
+    (testing ":avet + [attr value] point-looks-up the subject(s)"
+      (let [rows (eng/datoms db {:index :avet
+                                 :components [":aozora.keyBackup/did" "did:key:zBob"]})]
+        (is (= [{:e "keybackup/did:key:zBob" :a ":aozora.keyBackup/did"
+                 :v_edn "\"did:key:zBob\"" :added true}] rows))))
+    (testing ":avet + [attr] returns all datoms for that attribute"
+      (is (= 2 (count (eng/datoms db {:index :avet :components [":aozora.keyBackup/did"]})))))
+    (testing ":aevt + [attr] scans one attribute"
+      (is (= 2 (count (eng/datoms db {:index :aevt :components [":aozora.keyBackup/blob"]})))))
+    (testing ":limit caps rows"
+      (is (= 1 (count (eng/datoms db {:index :avet :components [":aozora.keyBackup/did"] :limit 1})))))
+    (testing "missing entity/attr → empty, not a full scan"
+      (is (= [] (eng/datoms db {:index :eavt :components ["keybackup/nope"]})))
+      (is (= [] (eng/datoms db {:index :avet :components [":aozora.keyBackup/did" "did:key:zNope"]}))))))
+
 (deftest q-routes-through-kqe
   (let [db (eng/transact (eng/empty-db)
                           [{:s "alice" :p "role" :o "admin"}
