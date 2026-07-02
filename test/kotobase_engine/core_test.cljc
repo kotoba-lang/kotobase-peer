@@ -1,5 +1,6 @@
 (ns kotobase-engine.core-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require #?(:clj [clojure.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing] :include-macros true])
             [clojure.set :as set]
             [kotobase-engine.core :as eng]))
 
