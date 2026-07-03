@@ -270,3 +270,19 @@
           (is (= (conj (set (eng/datoms db))
                        {:e "bob" :a "role" :v_edn "\"user\"" :added true})
                  (set (eng/hot-datoms get-fn c1)))))))))
+
+;; ── canonical datom model (datom-clj) — ADR-2607032500 ───────────────────────
+(deftest datafy-via-canonical-datom-model
+  (testing "entities->datoms uses datom.core/eavt: :db/id → e, other pairs → [e a v]"
+    (is (= [["e1" :ns/a "v1"] ["e1" :ns/b "v2"]]
+           (eng/entities->datoms [{:db/id "e1" :ns/a "v1" :ns/b "v2"}]))))
+  (testing "transact-tx (entity tx-maps) ≡ transact (equivalent [e a v] triples)"
+    (let [ents [{:db/id "alice" :atproto.account/did "alice" :atproto.account/handle "a.app"}
+                {:db/id "keybackup/alice" :aozora.keyBackup/did "alice"}]
+          via-tx  (eng/transact-tx (eng/empty-db) ents)
+          via-raw (eng/transact (eng/empty-db)
+                                [["alice" :atproto.account/did "alice"]
+                                 ["alice" :atproto.account/handle "a.app"]
+                                 ["keybackup/alice" :aozora.keyBackup/did "alice"]])]
+      (is (= (set (eng/datoms via-raw)) (set (eng/datoms via-tx)))
+          "the DB engine's entity datafication == kotoba's shared [e a v] model"))))

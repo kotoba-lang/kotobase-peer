@@ -33,7 +33,8 @@
             [prolly-tree.core :as pt]
             [quad-store.core :as qs]
             [kqe.core :as kqe]
-            [commit-dag.core :as cd]))
+            [commit-dag.core :as cd]
+            [datom.core :as dc]))   ; canonical datom model (kotoba : kotobase = Clojure : Datomic)
 
 (defn empty-db [] (qs/empty-db))
 
@@ -69,6 +70,32 @@
   ([db tx-data ref?]
    (reduce (fn [db item] (qs/assert-quad db (->quad item) ref?))
            db tx-data)))
+
+;; ── datafication via the canonical datom model (datom-clj) ───────────────────
+;; kotoba : kotobase = Clojure : Datomic (ADR-2607032500). An entity tx-map is
+;; turned into `[e a v]` datoms by `datom.core/eavt` — kotoba's shared datom
+;; representation, the same `[e a v]` `kotoba.kgraph` (the language's in-mem view)
+;; speaks and the same shape `transact`/`->quad` already accept. The kotobase
+;; datom DATABASE thus consumes the language's datom model instead of a private
+;; entity→quad reimplementation.
+
+(defn tx-map->datoms
+  "Datafy one Datomic-style entity tx-map `{:db/id e :ns/a v …}` → `[e a v]`
+   datoms (`datom.core/eavt`)."
+  [ent]
+  (dc/eavt ent))
+
+(defn entities->datoms
+  "Flatten a seq of entity tx-maps into `[e a v]` datoms (`datom.core/eavt`)."
+  [entities]
+  (vec (mapcat dc/eavt entities)))
+
+(defn transact-tx
+  "Transact a seq of entity tx-maps into `db`: datafy through the canonical datom
+   model (`entities->datoms`), then `transact`. The engine's entity-transaction
+   expressed in kotoba's datom representation."
+  ([db entities] (transact-tx db entities (constantly false)))
+  ([db entities ref?] (transact db (entities->datoms entities) ref?)))
 
 (defn- v->edn
   "Serialize a quad-store value (always a string) to the EDN string the
