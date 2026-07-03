@@ -6,7 +6,7 @@
  ;; prolly-tree/quad-store all come in transitively via kqe's and commit-dag's
  ;; own deps.edn.
  :deps {io.github.kotoba-lang/kqe        {:git/sha "7f1d931a2c03bbe33aa2a08c691bef2500eaf268"}
-        io.github.kotoba-lang/commit-dag {:git/sha "05cc0473dce76539edab46d9fb8cf785f6ff6117"}}
+        io.github.kotoba-lang/commit-dag {:git/sha "2d352c6d4703390ed2c18f32e5436d152d7e121d"}}
  :aliases
  {:test {:extra-paths ["test"]
          :extra-deps {io.github.cognitect-labs/test-runner

@@ -1,20 +1,31 @@
 ;; kotobase-engine.core — the kotobase XRPC-surface engine, assembled from the
 ;; already-landed Wave 1-3 primitives (ADR-2607010930 Phase 6 + ADR-2607022600):
 ;; quad-store (hot 4-index Arrangement + per-commit snapshot), kqe (triple-pattern
-;; query routing), commit-dag (chain/verify). This is the piece that was still
-;; missing: something that actually implements the `ai.gftd.apps.kotobase.datomic.*`
-;; surface (transact/datoms/q/pull) end to end, backed by content-addressed,
-;; verifiable persistence, in CLJC — as opposed to the wasm build of the deleted
-;; Rust engine that kotobase.net's production backend (kotobase.aozora.app)
-;; currently runs.
+;; query routing), commit-dag (chain/verify). This is the piece that implements the
+;; `ai.gftd.apps.kotobase.datomic.*` surface (transact/datoms/q/pull) end to end,
+;; backed by content-addressed, verifiable persistence, in CLJC.
+;;
+;; ADR-2607032430 (log-structured write path): the original `commit!` snapshotted
+;; a full hot db into 4 fresh prolly-trees on EVERY write -- O(graph). Confirmed
+;; live 2026-07-03 as the root cause of a CF Worker CPU-limit collapse (error 1102)
+;; during a 321-actor mass write. `commit!` is now a novelty-log APPEND (O(tx)):
+;; commit-dag's opaque `state` carries `{"indexed" <snapshot Link>|nil "novelty"
+;; [<tx-block Link> ...]}`; a write puts one small tx block and prepends its link,
+;; touching neither a prolly-tree nor the graph itself. `fold!` compacts novelty
+;; into a fresh `indexed` snapshot (the same O(graph) work the old `commit!` always
+;; did, now amortized over however many writes accumulated first) and is content-
+;; addressed -- deterministic, safe for any writer (server cron, a browser at idle)
+;; to run redundantly. Reads go through `hot-datoms` (indexed snapshot, range-pruned,
+;; + novelty merged in memory) instead of `hydrate-db` + `datoms` wherever a full hot
+;; db value isn't actually needed.
 ;;
 ;; Composition decision (resolves the ADR-2607022600 "quad-store/commit! and
 ;; commit-dag are two unmerged implementations" gap): quad-store/commit! is called
 ;; with `prev` always nil here — it is used ONLY to snapshot the 4 indexes into
 ;; content-addressed prolly-trees and return one CID for that snapshot. Chain
 ;; history, `:seq`, and tamper/gap verification are commit-dag's job, wrapping
-;; that snapshot CID as its opaque `state`. Neither library is modified; this
-;; namespace is the seam between them.
+;; the {indexed, novelty} state map as its opaque `state`. Neither library is
+;; modified; this namespace is the seam between them.
 (ns kotobase-engine.core
   (:require #?(:clj  [clojure.edn :as edn]
                :cljs [cljs.reader :as edn])   ; both expose read-string over EDN
@@ -48,7 +59,12 @@
 (defn transact
   "Apply `tx-data` (a seq of `{:s :p :o}` quads, `[:db/add e a v]`, or `[e a v]`
    triples) to `db`. Returns the new (immutable) db value. `ref?` is passed
-   through to `quad-store.core/assert-quad` for reverse-reference indexing."
+   through to `quad-store.core/assert-quad` for reverse-reference indexing.
+
+   A pure hot-db utility, independent of persistence strategy -- used
+   internally by `fold!` (via `hydrate-db`'s reduce, not this fn directly) and
+   available for anyone assembling/inspecting a hot db value directly (tests,
+   migration/backfill tooling). The write path proper is `commit!`, below."
   ([db tx-data] (transact db tx-data (constantly false)))
   ([db tx-data ref?]
    (reduce (fn [db item] (qs/assert-quad db (->quad item) ref?))
@@ -113,38 +129,128 @@
   (qs/entity-attrs db s))
 
 ;; ── persistence: content-addressed, chained, verifiable ─────────────────────
+;;
+;; state shape (opaque to commit-dag; this engine's own convention, encoded
+;; with STRING keys per the codebase's IPLD-node convention):
+;;   {"indexed" Link|nil    -- the last-folded quad-store snapshot CID
+;;    "novelty" [Link ...]} -- tx-block CIDs appended since, oldest first
+;;
+;; Pre-D1 chains store a BARE snapshot Link as `state` (the original commit!,
+;; now `snapshot!`) -- `normalize-state` reads that as the D1 empty-novelty
+;; equivalent, so existing chains (incl. every actor already live on
+;; pds.aozora.app before this landed) keep reading and writing correctly with
+;; zero migration step.
 
-(defn commit!
-  "Snapshot `db`'s 4 indexes into content-addressed prolly-trees (via
-   `quad-store.core/commit!`, always with `prev` nil — see namespace
-   docstring) and append that snapshot CID onto the commit-dag chain rooted
-   at `prev-chain-cid` (nil for the first commit). Returns the new chain
-   commit CID. `put!`/`get-fn` follow the prolly-tree/quad-store/commit-dag
-   convention: `(put! cid bytes)` / `(get-fn cid) -> bytes`."
+(defn snapshot!
+  "Full O(graph) commit: snapshot `db`'s 4 indexes into content-addressed
+   prolly-trees (`quad-store.core/commit!`, always with `prev` nil) and
+   append that snapshot CID (as `{\"indexed\" snap \"novelty\" []}`) onto the
+   commit-dag chain rooted at `prev-chain-cid`. This is the SAME expensive
+   rebuild the pre-D1 `commit!` did on every write; it now exists only as a
+   primitive `fold!` calls internally, plus a one-shot cold-start entry point
+   for callers that already have a fully materialized hot `db` (backfill /
+   migration tooling, tests). Most write paths want `commit!`, below."
   [put! get-fn db prev-chain-cid]
   (let [snapshot-cid (qs/commit! put! db nil)]
-    ;; state is a REAL tag-42 link, so a generic walk (ipld.core/links /
-    ;; kotoba-client.ipld-hydrate) reaches chain -> snapshot -> index trees
-    ;; with no engine-specific schema knowledge.
-    (cd/commit! put! get-fn (ipld/link snapshot-cid) prev-chain-cid)))
+    (cd/commit! put! get-fn
+                {"indexed" (ipld/link snapshot-cid) "novelty" []}
+                prev-chain-cid)))
+
+(defn- normalize-state [state]
+  (cond
+    (map? state)       state
+    (ipld/link? state) {"indexed" state "novelty" []}
+    (nil? state)       {"indexed" nil "novelty" []}
+    :else (throw (ex-info "kotobase-engine: unrecognized commit state shape"
+                          {:state state}))))
+
+(defn- state-at
+  "The normalized `{\"indexed\" ... \"novelty\" ...}` state at `chain-cid`
+   (an O(1) head fetch since commit-dag/head, ADR-2607032430's other half).
+   nil chain-cid (no prior commit) → the empty state."
+  [get-fn chain-cid]
+  (if (nil? chain-cid)
+    {"indexed" nil "novelty" []}
+    (normalize-state (:state (cd/head get-fn chain-cid)))))
+
+(defn- indexed-cid [state] (some-> (get state "indexed") ipld/link-cid))
+(defn- novelty-cids [state] (mapv ipld/link-cid (get state "novelty" [])))
+
+(defn- quad->wire [{:keys [s p o]}] {"s" s "p" p "o" o})
+(defn- wire->quad [{:strs [s p o]}] {:s s :p p :o o})
+
+(defn- put-tx-block! [put! quads]
+  (ipld/put-node! put! {"quads" (mapv quad->wire quads)}))
+
+(defn- read-tx-block [get-fn tx-cid]
+  (mapv wire->quad (get (ipld/get-node get-fn tx-cid) "quads")))
+
+(defn commit!
+  "THE write path (ADR-2607032430 D1): append `tx-data` as one novelty tx
+   block. O(|tx-data|) — reads only the previous state's {indexed, novelty}
+   LINKS (one O(1) head fetch via commit-dag, never the graph itself) and
+   writes one new small tx block plus one new commit-dag entry. Touches no
+   prolly-tree, rehydrates nothing. `tx-data` accepts the same shapes
+   `transact` does (quad maps, `[:db/add e a v]`, bare `[e a v]` triples).
+
+   This REPLACES the pre-D1 `commit!` (now `snapshot!`), which took an
+   already-hydrated hot db and paid a full O(graph) rebuild on every call —
+   confirmed live 2026-07-03 as the root cause of a CF Worker CPU-limit
+   collapse (error 1102) partway through a 321-actor mass write. Call
+   `fold!` periodically (see `should-fold?`) to bound novelty size and keep
+   `hot-datoms` reads fast; correctness never depends on folding promptly."
+  [put! get-fn tx-data prev-chain-cid]
+  (let [quads (mapv ->quad tx-data)
+        state (state-at get-fn prev-chain-cid)
+        tx-cid (put-tx-block! put! quads)
+        new-state (update state "novelty" (fnil conj []) (ipld/link tx-cid))]
+    (cd/commit! put! get-fn new-state prev-chain-cid)))
+
+(defn novelty-size
+  "How many not-yet-folded tx blocks sit on `chain-cid`'s current state —
+   the `fold!` trigger signal."
+  [get-fn chain-cid]
+  (count (get (state-at get-fn chain-cid) "novelty" [])))
+
+(def default-fold-threshold
+  "novelty length `should-fold?` flags for compaction at. Tunes the
+   amortization: a fold costs O(graph_shard) once every `default-fold-
+   threshold` writes, so write-heavy shards fold more often in absolute
+   time but pay the SAME amortized cost per write. A shard's own write
+   volume and latency budget should drive the real value in production;
+   this is a reasonable engine-level default, not a tuned constant."
+  64)
+
+(defn should-fold?
+  ([get-fn chain-cid] (should-fold? get-fn chain-cid default-fold-threshold))
+  ([get-fn chain-cid threshold]
+   (>= (novelty-size get-fn chain-cid) threshold)))
 
 (defn chain
   "Full commit history rooted at `chain-cid`, oldest first. Each entry's
-   `:state` is a quad-store snapshot CID (not a db value — see README's
-   \"cold query\" gap: nothing here rehydrates a db from a snapshot CID yet)."
+   `:state` is the `{indexed novelty}` map (or, for a pre-D1 commit, the
+   bare snapshot Link `normalize-state` would expand — `chain`/`head` return
+   the RAW state as commit-dag stored it; callers that need the normalized
+   shape go through `state-at` / `hot-datoms` / `latest-snapshot-cid`)."
   [get-fn chain-cid]
   (cd/chain get-fn chain-cid))
 
 (defn head
-  "The most recent commit-dag entry in the chain rooted at `chain-cid`."
+  "The commit-dag entry AT `chain-cid` (O(1) — see commit-dag/head). Returns
+   the RAW `:state` (not normalize-state-expanded); see `chain`'s docstring."
   [get-fn chain-cid]
   (cd/head get-fn chain-cid))
 
 (defn latest-snapshot-cid
-  "The quad-store snapshot CID (`:state`) of the most recent commit in the
-   chain rooted at `chain-cid`, or nil if the chain is empty."
+  "The INDEXED quad-store snapshot CID as of `chain-cid`'s current state —
+   the last fold point, NOT including any pending novelty. nil when the
+   chain is empty OR when nothing has been folded yet (an all-novelty chain,
+   the common case for a fresh, low-write-volume shard between folds — this
+   is NOT the same as \"no data\"; use `hot-datoms`/`novelty-size` to check
+   for pending unfolded writes, not this fn alone, before deciding a graph
+   is empty)."
   [get-fn chain-cid]
-  (some-> (head get-fn chain-cid) :state ipld/link-cid))
+  (when chain-cid (indexed-cid (state-at get-fn chain-cid))))
 
 ;; ── cold read: filtered datoms straight from a persisted snapshot ───────────
 ;; Closes the "nothing rehydrates a db from a snapshot CID" gap for the ONE case
@@ -174,28 +280,32 @@
   rehydrating the whole db. `snapshot-cid` is a quad-store commit CID
   (`latest-snapshot-cid`). opts = `{:index :components :limit}` as in `datoms`.
   Touches only the chosen index tree's blocks along the components prefix path
-  (v1: prolly-tree.scan-prefix, whole-tree walk; range-pruning is a follow-up),
-  never the other three indexes — so a keyed read stays small regardless of graph
-  size. get-fn: `(get-fn cid) -> bytes`."
+  (range-pruned via `prolly-tree.core/scan-prefix`), never the other three
+  indexes — so a keyed read stays small regardless of graph size. `nil`
+  snapshot-cid → `[]` (nothing folded yet; see `hot-datoms` for the
+  novelty-inclusive read). get-fn: `(get-fn cid) -> bytes`."
   [get-fn snapshot-cid {:keys [index components limit]}]
-  (let [{:keys [root ->eav]} (index-spec (or index :eavt))
-        snap      (ipld/decode (get-fn snapshot-cid))
-        root-cid  (some-> (get-in snap ["index-roots" root]) ipld/link-cid)
-        entries   (if (nil? root-cid)
-                    []
-                    (pt/scan-prefix get-fn root-cid (or (components-prefix components) "")))
-        rows      (for [[k _] entries
-                        :let [[e a v] (->eav (edn/read-string k))]]
-                    {:e e :a a :v_edn (v->edn v) :added true})
-        rows      (cond->> rows limit (take limit))]
-    (vec rows)))
+  (if (nil? snapshot-cid)
+    []
+    (let [{:keys [root ->eav]} (index-spec (or index :eavt))
+          snap      (ipld/decode (get-fn snapshot-cid))
+          root-cid  (some-> (get-in snap ["index-roots" root]) ipld/link-cid)
+          entries   (if (nil? root-cid)
+                      []
+                      (pt/scan-prefix get-fn root-cid (or (components-prefix components) "")))
+          rows      (for [[k _] entries
+                          :let [[e a v] (->eav (edn/read-string k))]]
+                      {:e e :a a :v_edn (v->edn v) :added true})
+          rows      (cond->> rows limit (take limit))]
+      (vec rows))))
 
 (defn hydrate-db
-  "Rebuild the full hot 4-index `db` from a persisted snapshot — the write path's
-  counterpart to `cold-datoms`. Reads ONE index tree (spo) in full and re-asserts
-  every quad, so the reconstructed db is ~1× graph size (vs the wasm worker's
-  10-30× amplified rehydrate). Used by a transact: `hydrate-db` → `assert-quad`s
-  → `commit!`. get-fn: `(get-fn cid) -> bytes`; nil snapshot → empty db."
+  "Rebuild the full hot 4-index `db` from a persisted snapshot. Reads ONE
+  index tree (spo) in full and re-asserts every quad, so the reconstructed
+  db is ~1× graph size. This is `fold!`'s internal starting point (hydrate
+  the last-indexed snapshot, then re-assert novelty on top) — an O(graph_shard)
+  operation, now paid once per fold instead of once per write. get-fn:
+  `(get-fn cid) -> bytes`; nil snapshot → empty db."
   [get-fn snapshot-cid]
   (if (nil? snapshot-cid)
     (qs/empty-db)
@@ -204,10 +314,56 @@
             (qs/empty-db)
             (cold-datoms get-fn snapshot-cid {:index :eavt}))))
 
+(defn hot-datoms
+  "THE scale-safe read path (ADR-2607032430 D1): `datoms`-shaped rows as of
+  `chain-cid`'s current state, merging the indexed snapshot (`cold-datoms` —
+  range-pruned, untouched by graph size) with any not-yet-folded novelty
+  (small, bounded by the fold threshold). Novelty filtering reuses `datoms`'s
+  own index/components logic (build a throwaway hot db from just the
+  novelty quads, filter it the normal way) — exactly consistent with the
+  snapshot path's semantics, no separate filter implementation to drift.
+  Replaces `hydrate-db` + `datoms` for any caller that doesn't need a full
+  hot db value. `nil` chain-cid → `[]`."
+  ([get-fn chain-cid] (hot-datoms get-fn chain-cid nil))
+  ([get-fn chain-cid opts]
+   (if (nil? chain-cid)
+     []
+     (let [state (state-at get-fn chain-cid)
+           snap-rows (cold-datoms get-fn (indexed-cid state) opts)
+           novelty-quads (mapcat #(read-tx-block get-fn %) (novelty-cids state))
+           novelty-rows (datoms (reduce qs/assert-quad (qs/empty-db) novelty-quads) opts)]
+       (vec (concat snap-rows novelty-rows))))))
+
+(defn fold!
+  "Compact `chain-cid`'s novelty into a fresh indexed snapshot: hydrate the
+  current `indexed` snapshot, re-assert every novelty quad on top (append
+  order), `qs/commit!` that as the new `indexed`, and append ONE new
+  commit-dag entry with an empty `novelty`. Cost: O(graph_shard) — the same
+  full rebuild `snapshot!`/the pre-D1 `commit!` always paid, now amortized
+  over however many `commit!` writes accumulated the folded novelty instead
+  of being paid on every single one (`should-fold?`/`novelty-size` decide
+  when to call this; correctness never depends on it running promptly).
+
+  Deterministic: prolly-tree/quad-store are content-addressed, so folding
+  the identical (indexed, novelty) pair — from ANY writer, a server cron or
+  a browser at idle — always produces the same snapshot CID. Concurrent
+  folds of the same state are safe, redundant, and cheap (re-`put!`ing
+  already-stored bytes is a no-op at the block-store layer)."
+  ([put! get-fn chain-cid] (fold! put! get-fn chain-cid (constantly false)))
+  ([put! get-fn chain-cid ref?]
+   (let [state (state-at get-fn chain-cid)
+         novelty-quads (mapcat #(read-tx-block get-fn %) (novelty-cids state))
+         db (reduce (fn [db q] (qs/assert-quad db q ref?))
+                    (hydrate-db get-fn (indexed-cid state))
+                    novelty-quads)
+         new-snap-cid (qs/commit! put! db nil)
+         new-state {"indexed" (ipld/link new-snap-cid) "novelty" []}]
+     (cd/commit! put! get-fn new-state chain-cid))))
+
 (defn verify-chain
   "True iff the commit-dag chain rooted at `chain-cid` is untampered and its
    `:seq` values are gapless from 0. Does NOT verify the prolly-tree
-   snapshots each commit's `:state` points to are themselves intact (that
-   would require walking every index — a follow-up, see README)."
+   snapshots or tx blocks each commit's `:state` links to are themselves
+   intact (that would require walking every index/tx-block — a follow-up)."
   [get-fn chain-cid]
   (cd/verify-chain get-fn chain-cid))

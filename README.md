@@ -48,65 +48,110 @@ Two adjacent, already-existing `kotoba-lang` repos have different jobs:
 ```clojure
 (require '[kotobase-engine.core :as eng])
 
-(def db (-> (eng/empty-db)
-            (eng/transact [{:s "alice" :p "role" :o "admin"}
-                            [:db/add "alice" "name" "Alice"]])))
-
-(eng/datoms db)          ;=> [{:e "alice" :a "role" :v_edn "\"admin\"" :added true} ...]
-(eng/q db ["alice" nil nil])
-(eng/pull db "alice")    ;=> {"role" #{"admin"} "name" #{"Alice"}}
-
-;; content-addressed, chained, verifiable persistence
 (def store (atom {}))
 (def put!   (fn [cid bytes] (swap! store assoc cid bytes)))
 (def get-fn (fn [cid] (get @store cid)))
 
-(def c0 (eng/commit! put! get-fn db nil))
-(eng/chain get-fn c0)          ;=> ({:cid c0 :state <quad-store snapshot cid> :seq 0 ...})
-(eng/verify-chain get-fn c0)   ;=> true
+;; write path: O(|tx-data|), independent of graph size (see D1 below)
+(def c0 (eng/commit! put! get-fn [{:s "alice" :p "role" :o "admin"}
+                                    [:db/add "alice" "name" "Alice"]] nil))
+(def c1 (eng/commit! put! get-fn [{:s "bob" :p "role" :o "user"}] c0))
+
+;; read path: scale-safe, merges the last-folded snapshot with pending novelty
+(eng/hot-datoms get-fn c1)     ;=> [{:e "alice" ...} {:e "bob" ...} ...]
+(eng/hot-datoms get-fn c1 {:index :eavt :components ["alice"]})
+
+;; compaction: fold accumulated novelty into a fresh indexed snapshot
+(eng/should-fold? get-fn c1 32)  ;=> false (only 2 novelty commits so far)
+(def folded (eng/fold! put! get-fn c1))
+(eng/novelty-size get-fn folded) ;=> 0
+
+(eng/chain get-fn folded)        ;=> commit history, oldest first
+(eng/verify-chain get-fn folded) ;=> true
+
+;; pure, hot-db primitives — for tests, backfill tooling, or anyone who wants
+;; an in-memory db value to inspect before deciding whether/how to persist it
+(def db (eng/transact (eng/empty-db) [{:s "alice" :p "role" :o "admin"}]))
+(eng/datoms db)
+(eng/q db ["alice" nil nil])
+(eng/pull db "alice")            ;=> {"role" #{"admin"}}
 ```
+
+## D1: log-structured write path (ADR-2607032430)
+
+Confirmed live 2026-07-03: the original `commit!` took an already-hydrated
+hot `db` and rebuilt all 4 prolly-tree indexes from scratch on **every**
+write — O(graph). At real mass-write volume (321 actors against a shared
+graph) this collapsed a Cloudflare Worker's CPU budget (error 1102) well
+before the graph itself was large by any absolute measure. The fix ports
+Datomic's log/index separation (memtable/SSTable in LSM-tree terms) into
+this content-addressed chain:
+
+- `commit-dag`'s opaque `state` is now `{"indexed" Link|nil "novelty"
+  [Link ...]}` — `"indexed"` is the last-folded quad-store snapshot CID,
+  `"novelty"` is the ordered list of small tx-block CIDs appended since.
+- **`commit!`** appends one novelty tx block: O(|tx-data|), one `commit-
+  dag/head` fetch (O(1) since [commit-dag#1](https://github.com/kotoba-lang/commit-dag/pull/1)), never touches a prolly-tree.
+- **`hot-datoms`** merges `cold-datoms` on the indexed snapshot
+  (range-pruned, untouched by graph size) with the bounded novelty tail
+  (decoded and filtered in memory, reusing `datoms`'s own index logic) —
+  the scale-safe read path.
+- **`fold!`** compacts: hydrate the indexed snapshot, re-assert novelty on
+  top, `snapshot!` the result, commit a fresh `{indexed novelty: []}`
+  state. This is the SAME O(graph) work the old `commit!` always paid, now
+  amortized over however many `commit!` writes accumulated first —
+  triggered by `should-fold?`/`novelty-size`, not required for correctness.
+  Content-addressed, so concurrent/redundant folds from any writer (a
+  server cron, a browser at idle) converge to the same CID.
+- **Backward compatible with zero migration**: a pre-D1 chain's `state` is
+  a bare snapshot `Link` (no `{indexed novelty}` wrapper) — `hot-datoms`/
+  `latest-snapshot-cid`/`commit!` all normalize that transparently as the
+  D1 empty-novelty equivalent, so already-deployed chains keep working.
+
+`snapshot!` is the pre-D1 `commit!`, kept as `fold!`'s internal primitive
+and as a one-shot cold-start entry point for callers that already have a
+fully materialized hot `db` (backfill/migration tooling, tests).
 
 ## Composition decision (resolves a known gap from ADR-2607022600)
 
 `quad-store.core/commit!` and `commit-dag.core/commit!` both implement a
 notion of "commit," with different shapes (`{index-roots prev}` vs
 `{state prev seq}`) and neither aware of the other. Rather than modifying
-either upstream repo, `commit!` here calls `quad-store.core/commit!` with
+either upstream repo, `snapshot!` here calls `quad-store.core/commit!` with
 `prev` **always nil** — using it purely to snapshot the 4 indexes into
 content-addressed prolly-trees and return one CID — then wraps that
-snapshot CID as commit-dag's opaque `state`, so chain history, `:seq`, and
-tamper/gap verification are entirely commit-dag's job. Neither library
-needed to change.
+snapshot CID (inside the D1 `{indexed novelty}` state map) as commit-dag's
+opaque `state`, so chain history, `:seq`, and tamper/gap verification are
+entirely commit-dag's job. Neither library needed to change.
 
 ## What is NOT in this landing
 
-- **Cold query / hydrate-from-commit**: nothing here rebuilds a `db` value
-  from a stored snapshot CID. `quad-store`'s `commit!` writes the 4 index
-  prolly-trees but there's no public "walk the tree back into a db" path
-  yet (would need to be added to `quad-store`, not reverse-engineered here
-  against its private db shape). Every `transact`/`q`/`pull`/`datoms` call
-  in this repo operates on the **hot**, in-memory `db` value only.
 - **Multi-clause Datalog join / recursive-rule fixpoint / SPARQL BGP** —
   `kqe`'s own documented scope is triple-pattern only; unchanged here.
 - **CACAO / capability auth** — a Worker embedding this engine still needs
   to verify CACAO and check write capability itself (`kotoba-lang/cacao`)
-  before calling `transact`; this repo has no auth opinion.
+  before calling `commit!`; this repo has no auth opinion.
 - **BlockStore backends** (R2, B2, Kubo) — `put!`/`get-fn` are the same
   injection seam `prolly-tree`/`quad-store`/`commit-dag` already use; a
   Worker wires them to real storage. No Memory-only assumption is baked in,
   but no real backend ships here either.
 - **Snapshot-level tamper-evidence**: `verify-chain` checks the commit
-  chain itself, not whether the prolly-tree bytes a commit's `:state`
-  points to are intact — that would mean walking every index.
+  chain itself, not whether the prolly-tree/tx-block bytes a commit's
+  `:state` points to are intact — that would mean walking every index.
+- **Automatic/scheduled folding**: `should-fold?`/`fold!` are exposed as
+  primitives; nothing in this repo decides *when* to call them. A Worker
+  or cron wires the policy (e.g. fold after every write past a threshold,
+  or on a timer) using its own storage/scheduling.
 
 ## Test
 
 ```bash
-clojure -M:test    # or: bb test
+clojure -M:test              # JVM
+npm run test:cljs            # real shadow-cljs build + node, not nbb
 ```
 
 ```
-Ran 7 tests containing 17 assertions.
+Ran 17 tests containing 64 assertions.
 0 failures, 0 errors.
 ```
 
