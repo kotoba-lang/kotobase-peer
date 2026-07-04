@@ -12,7 +12,7 @@ reaches them all) — the piece that was still missing before production
 engine (`kotobase.aozora.app`). See
 [ADR-2607022600](https://github.com/com-junkawasaki/root/blob/main/90-docs/adr/2607022600-kotoba-database-crates-cljc-migration-roadmap.md).
 
-**Renamed from `kotobase-engine`** (ADR-2607050600): "kotobase" alone was
+**Renamed from `kotobase-engine`** (ADR-2607050700): "kotobase" alone was
 already taken by the client-side `IStore` port (see below), and "engine"
 undersold what this actually is against the Datomic vocabulary the rest of
 this substrate deliberately mirrors (`kotoba : kotobase = Clojure :

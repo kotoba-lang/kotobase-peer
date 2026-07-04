@@ -1,11 +1,11 @@
 ;; kotobase-peer.core — the kotobase peer library (Datomic's own term for
 ;; the transact/q/pull library an application embeds; this repo was named
-;; kotobase-engine until ADR-2607050600 -- "kotobase" itself was already
+;; kotobase-engine until ADR-2607050700 -- "kotobase" itself was already
 ;; taken by the client-side IStore port, kotoba-lang/kotobase), assembled
 ;; from the already-landed Wave 1-3 primitives (ADR-2607010930 Phase 6 +
 ;; ADR-2607022600): arrangement (hot 4-covering-index Arrangement + query
 ;; routing + per-commit snapshot -- formerly two repos, quad-store and kqe,
-;; merged into one per ADR-2607050600), commit-dag (chain/verify). This is
+;; merged into one per ADR-2607050700), commit-dag (chain/verify). This is
 ;; the piece
 ;; that implements the `ai.gftd.apps.kotobase.datomic.*` surface
 ;; (transact/datoms/q/pull) end to end, backed by content-addressed,
@@ -27,7 +27,7 @@
 ;;
 ;; Composition decision (resolves the ADR-2607022600 "quad-store/commit! and
 ;; commit-dag are two unmerged implementations" gap -- quoting that ADR's own
-;; wording; the repo it refers to is arrangement post-ADR-2607050600 rename):
+;; wording; the repo it refers to is arrangement post-ADR-2607050700 rename):
 ;; arrangement/commit! is called
 ;; with `prev` always nil here — it is used ONLY to snapshot the 4 indexes into
 ;; content-addressed prolly-trees and return one CID for that snapshot. Chain
