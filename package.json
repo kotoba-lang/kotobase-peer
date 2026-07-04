@@ -1,5 +1,5 @@
 {
-  "name": "kotobase-engine",
+  "name": "kotobase-peer",
   "private": true,
   "scripts": {
     "test:cljs": "bb gen-shadow-cljs-edn.bb && shadow-cljs compile test && node out/test.js"

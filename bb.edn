@@ -1,3 +1,3 @@
 {:tasks
- {test {:doc "Run kotobase-engine tests."
+ {test {:doc "Run kotobase-peer tests."
         :task (shell "clojure -M:test")}}}

@@ -1,11 +1,11 @@
-(ns kotobase-engine.core-test
+(ns kotobase-peer.core-test
   (:require #?(:clj [clojure.test :refer [deftest is testing]]
                :cljs [cljs.test :refer [deftest is testing] :include-macros true])
             [clojure.set :as set]
             [ipld.core :as ipld]
             [commit-dag.core :as cd]
-            [quad-store.core :as qs]
-            [kotobase-engine.core :as eng]))
+            [arrangement.core :as qs]
+            [kotobase-peer.core :as eng]))
 
 (defn- mem-store []
   (let [store (atom {})]
@@ -113,7 +113,7 @@
     (testing "nil snapshot → empty db"
       (is (= [] (eng/datoms (eng/hydrate-db get-fn nil)))))))
 
-(deftest q-routes-through-kqe
+(deftest q-routes-through-arrangement-query
   (let [db (eng/transact (eng/empty-db)
                           [{:s "alice" :p "role" :o "admin"}
                            {:s "bob" :p "role" :o "user"}])
@@ -130,7 +130,7 @@
   (let [db (eng/transact (eng/empty-db) [{:s "alice" :p "role" :o "admin"}])]
     (is (thrown? #?(:clj clojure.lang.ArityException :cljs js/Error)
                  (eng/q db [nil nil nil]))
-        "q cascades kqe's required visibility decision -- no permissive default")))
+        "q cascades arrangement.query's required visibility decision -- no permissive default")))
 
 (deftest pull-returns-entity-attrs
   (let [db (eng/transact (eng/empty-db) [{:s "alice" :p "role" :o "admin"}
@@ -145,7 +145,7 @@
 
 (deftest commit-snapshots-are-content-addressed-and-deterministic
   (testing "committing the identical db content twice, from two independent
-            chains/stores, yields the same snapshot CID -- quad-store's own
+            chains/stores, yields the same snapshot CID -- arrangement's own
             content-addressing guarantee, exercised end to end through this
             namespace's snapshot! composition"
     (let [db (eng/transact (eng/empty-db) [{:s "alice" :p "role" :o "admin"}])

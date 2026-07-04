@@ -1,9 +1,15 @@
-;; kotobase-engine.core — the kotobase XRPC-surface engine, assembled from the
-;; already-landed Wave 1-3 primitives (ADR-2607010930 Phase 6 + ADR-2607022600):
-;; quad-store (hot 4-index Arrangement + per-commit snapshot), kqe (triple-pattern
-;; query routing), commit-dag (chain/verify). This is the piece that implements the
-;; `ai.gftd.apps.kotobase.datomic.*` surface (transact/datoms/q/pull) end to end,
-;; backed by content-addressed, verifiable persistence, in CLJC.
+;; kotobase-peer.core — the kotobase peer library (Datomic's own term for
+;; the transact/q/pull library an application embeds; this repo was named
+;; kotobase-engine until ADR-2607050600 -- "kotobase" itself was already
+;; taken by the client-side IStore port, kotoba-lang/kotobase), assembled
+;; from the already-landed Wave 1-3 primitives (ADR-2607010930 Phase 6 +
+;; ADR-2607022600): arrangement (hot 4-covering-index Arrangement + query
+;; routing + per-commit snapshot -- formerly two repos, quad-store and kqe,
+;; merged into one per ADR-2607050600), commit-dag (chain/verify). This is
+;; the piece
+;; that implements the `ai.gftd.apps.kotobase.datomic.*` surface
+;; (transact/datoms/q/pull) end to end, backed by content-addressed,
+;; verifiable persistence, in CLJC.
 ;;
 ;; ADR-2607032430 (log-structured write path): the original `commit!` snapshotted
 ;; a full hot db into 4 fresh prolly-trees on EVERY write -- O(graph). Confirmed
@@ -20,19 +26,21 @@
 ;; db value isn't actually needed.
 ;;
 ;; Composition decision (resolves the ADR-2607022600 "quad-store/commit! and
-;; commit-dag are two unmerged implementations" gap): quad-store/commit! is called
+;; commit-dag are two unmerged implementations" gap -- quoting that ADR's own
+;; wording; the repo it refers to is arrangement post-ADR-2607050600 rename):
+;; arrangement/commit! is called
 ;; with `prev` always nil here — it is used ONLY to snapshot the 4 indexes into
 ;; content-addressed prolly-trees and return one CID for that snapshot. Chain
 ;; history, `:seq`, and tamper/gap verification are commit-dag's job, wrapping
 ;; the {indexed, novelty} state map as its opaque `state`. Neither library is
 ;; modified; this namespace is the seam between them.
-(ns kotobase-engine.core
+(ns kotobase-peer.core
   (:require #?(:clj  [clojure.edn :as edn]
                :cljs [cljs.reader :as edn])   ; both expose read-string over EDN
             [ipld.core :as ipld]
             [prolly-tree.core :as pt]
-            [quad-store.core :as qs]
-            [kqe.core :as kqe]
+            [arrangement.core :as qs]
+            [arrangement.query :as kqe]
             [commit-dag.core :as cd]
             [datom.core :as dc]))   ; canonical datom model (kotoba : kotobase = Clojure : Datomic)
 
@@ -62,13 +70,13 @@
     (let [[e a v] item] {:s (str e) :p (str a) :o (->quad-value v)})
 
     :else
-    (throw (ex-info "kotobase-engine: unrecognized tx-data item"
+    (throw (ex-info "kotobase-peer: unrecognized tx-data item"
                      {:item item}))))
 
 (defn transact
   "Apply `tx-data` (a seq of `{:s :p :o}` quads, `[:db/add e a v]`, or `[e a v]`
    triples) to `db`. Returns the new (immutable) db value. `ref?` is passed
-   through to `quad-store.core/assert-quad` for reverse-reference indexing
+   through to `arrangement.core/assert-quad` for reverse-reference indexing
    (default `ipld.core/link?`, ADR-2607050200 -- a value asserted as a Link is
    automatically reverse-indexed, see `refs`).
 
@@ -102,13 +110,13 @@
 
 (defn transact-tx
   "Transact a seq of entity tx-maps into `db`: datafy through the canonical datom
-   model (`entities->datoms`), then `transact`. The engine's entity-transaction
+   model (`entities->datoms`), then `transact`. The peer library's entity-transaction
    expressed in kotoba's datom representation."
   ([db entities] (transact-tx db entities ipld/link?))
   ([db entities ref?] (transact db (entities->datoms entities) ref?)))
 
 (defn- v->edn
-  "Serialize a quad-store value to the EDN string the kotobase wire uses -- a
+  "Serialize an arrangement value to the EDN string the kotobase wire uses -- a
    Link renders as `qs/link->edn`'s `[\"ipld/link\" cid]` form (readable, no
    custom reader needed), anything else pr-str's directly as before. Matches
    the shape the pre-existing DataScript-backed `kotobase.engine` (app-aozora)
@@ -120,7 +128,7 @@
    (same wire shape as the DataScript-backed `kotobase.engine` this replaces).
 
    1-arg → whole-db (:eavt full scan, unchanged). 2-arg honors an optional
-   `{:index :components :limit}` SERVER-SIDE via quad-store's index accessors, so
+   `{:index :components :limit}` SERVER-SIDE via arrangement's index accessors, so
    a filtered read (e.g. getBackup by entity, or by [attr value]) materialises
    ONLY the matching entity/attr instead of the whole graph — the root fix for
    the deployed wasm worker ignoring index/components_edn/limit and rehydrating
@@ -128,7 +136,7 @@
 
    `:index` ∈ #{:eavt :aevt :avet} (default :eavt); `:components` is an ordered
    prefix in that index's key order (:eavt=[e a v], :aevt/:avet=[a … ]); values
-   are the opaque strings quad-store stores (the PDS's :db/id for e, `:ns/attr`
+   are the opaque strings arrangement stores (the PDS's :db/id for e, `:ns/attr`
    for a, the stored value string for v). `:limit` caps the row count."
   ([db] (datoms db nil))
   ([db {:keys [index components limit]}]
@@ -144,7 +152,7 @@
            :aevt (cond
                    c0    (for [[e vs] (qs/by-predicate db c0), v vs]   [e c0 v])
                    :else (for [[a em] (:pso db), [e vs] em, v vs]      [e a v]))
-           ;; AVET — key order [a v e]; [a v] is quad-store's point lookup
+           ;; AVET — key order [a v e]; [a v] is arrangement's point lookup
            :avet (cond
                    (and c0 c1) (for [e (qs/by-predicate-value db c0 c1)] [e c0 c1])
                    c0          (for [[e vs] (qs/by-predicate db c0), v vs] [e c0 v])
@@ -154,19 +162,20 @@
 
 (defn q
   "`datomic.q`-equivalent: `pattern` is `[s p o]` (nil = wildcard), routed to
-   the matching index via kqe. Returns a set of `{:s :p :o}` quads. NOTE:
-   triple-pattern only — multi-clause join / recursive-rule fixpoint is not
-   implemented (kqe's own documented scope), see README.
+   the matching index via `arrangement.query`. Returns a set of `{:s :p :o}`
+   quads. NOTE: triple-pattern only — multi-clause join / recursive-rule
+   fixpoint is not implemented (`arrangement.query`'s own documented scope),
+   see README.
 
-   `visible?` is REQUIRED, cascaded straight from `kqe.core/query`
+   `visible?` is REQUIRED, cascaded straight from `arrangement.query/query`
    (ADR-2607050500: Query is a first-class effect all the way up this
-   stack, not just at kqe's layer) -- pass `(constantly true)` to see
-   everything, as an explicit choice."
+   stack, not just at arrangement's layer) -- pass `(constantly true)` to
+   see everything, as an explicit choice."
   [db pattern visible?]
   (kqe/query db pattern visible?))
 
 (defn pull
-  "`datomic.pull`-equivalent for entity `s`: `{p #{o...}}` (quad-store has no
+  "`datomic.pull`-equivalent for entity `s`: `{p #{o...}}` (arrangement has no
    cardinality tracking, so every attribute is multi-valued — a caller
    expecting single-valued Datomic pull semantics must pick e.g. `first`)."
   [db s]
@@ -182,9 +191,9 @@
 
 ;; ── persistence: content-addressed, chained, verifiable ─────────────────────
 ;;
-;; state shape (opaque to commit-dag; this engine's own convention, encoded
+;; state shape (opaque to commit-dag; this peer library's own convention, encoded
 ;; with STRING keys per the codebase's IPLD-node convention):
-;;   {"indexed" Link|nil    -- the last-folded quad-store snapshot CID
+;;   {"indexed" Link|nil    -- the last-folded arrangement snapshot CID
 ;;    "novelty" [Link ...]} -- tx-block CIDs appended since, oldest first
 ;;
 ;; Pre-D1 chains store a BARE snapshot Link as `state` (the original commit!,
@@ -195,7 +204,7 @@
 
 (defn snapshot!
   "Full O(graph) commit: snapshot `db`'s 4 indexes into content-addressed
-   prolly-trees (`quad-store.core/commit!`, always with `prev` nil) and
+   prolly-trees (`arrangement.core/commit!`, always with `prev` nil) and
    append that snapshot CID (as `{\"indexed\" snap \"novelty\" []}`) onto the
    commit-dag chain rooted at `prev-chain-cid`. This is the SAME expensive
    rebuild the pre-D1 `commit!` did on every write; it now exists only as a
@@ -213,7 +222,7 @@
     (map? state)       state
     (ipld/link? state) {"indexed" state "novelty" []}
     (nil? state)       {"indexed" nil "novelty" []}
-    :else (throw (ex-info "kotobase-engine: unrecognized commit state shape"
+    :else (throw (ex-info "kotobase-peer: unrecognized commit state shape"
                           {:state state}))))
 
 (defn- state-at
@@ -294,7 +303,7 @@
   (cd/head get-fn chain-cid))
 
 (defn latest-snapshot-cid
-  "The INDEXED quad-store snapshot CID as of `chain-cid`'s current state —
+  "The INDEXED arrangement snapshot CID as of `chain-cid`'s current state —
    the last fold point, NOT including any pending novelty. nil when the
    chain is empty OR when nothing has been folded yet (an all-novelty chain,
    the common case for a fresh, low-write-volume shard between folds — this
@@ -309,7 +318,7 @@
 ;; that matters for scale: a FILTERED read. Instead of rebuilding the whole 4-index
 ;; db (the wasm worker's full-graph rehydrate that OOMs at 128MB), decode the
 ;; snapshot's index-roots, pick the ONE index tree the query needs, and prefix-seek
-;; it by the components. quad-store persists each index as `(pr-str [k1 k2 v]) → true`
+;; it by the components. arrangement persists each index as `(pr-str [k1 k2 v]) → true`
 ;; leaves (index-root), so a components prefix is a string prefix on that tree.
 
 ;; index → snapshot key + how its [k1 k2 v] maps back to a datom {:e :a :v}
@@ -329,7 +338,7 @@
 
 (defn cold-datoms
   "`datomic.datoms`-shaped rows read DIRECTLY from a persisted snapshot without
-  rehydrating the whole db. `snapshot-cid` is a quad-store commit CID
+  rehydrating the whole db. `snapshot-cid` is an arrangement commit CID
   (`latest-snapshot-cid`). opts = `{:index :components :limit}` as in `datoms`.
   Touches only the chosen index tree's blocks along the components prefix path
   (range-pruned via `prolly-tree.core/scan-prefix`), never the other three
@@ -396,7 +405,7 @@
   of being paid on every single one (`should-fold?`/`novelty-size` decide
   when to call this; correctness never depends on it running promptly).
 
-  Deterministic: prolly-tree/quad-store are content-addressed, so folding
+  Deterministic: prolly-tree/arrangement are content-addressed, so folding
   the identical (indexed, novelty) pair — from ANY writer, a server cron or
   a browser at idle — always produces the same snapshot CID. Concurrent
   folds of the same state are safe, redundant, and cheap (re-`put!`ing

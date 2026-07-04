@@ -1,14 +1,24 @@
-# kotobase-engine
+# kotobase-peer
 
-**The kotobase XRPC-surface engine, in real CLJC — verified on both JVM and
+**The kotobase peer library — Datomic's own term for the transact/q/pull
+library an application embeds — in real CLJC, verified on both JVM and
 ClojureScript.** Composes the already-landed Wave 1–3 primitives
-(`prolly-tree`, `quad-store`, `kqe`, `commit-dag`) into `transact`/`datoms`/
-`q`/`pull`, persisted as a content-addressed, verifiable commit chain whose references
-are real tag-42 IPLD links end to end (chain prev, snapshot state, index
-roots, tree children — one generic `ipld.core/links` walk reaches them all) — the
-piece that was still missing before production `kotobase.net` traffic can
-move off the wasm build of the deleted Rust engine (`kotobase.aozora.app`).
-See [ADR-2607022600](https://github.com/com-junkawasaki/root/blob/main/90-docs/adr/2607022600-kotoba-database-crates-cljc-migration-roadmap.md).
+(`prolly-tree`, `arrangement`, `commit-dag`) into `transact`/`datoms`/
+`q`/`pull`, persisted as a content-addressed, verifiable commit chain whose
+references are real tag-42 IPLD links end to end (chain prev, snapshot
+state, index roots, tree children — one generic `ipld.core/links` walk
+reaches them all) — the piece that was still missing before production
+`kotobase.net` traffic can move off the wasm build of the deleted Rust
+engine (`kotobase.aozora.app`). See
+[ADR-2607022600](https://github.com/com-junkawasaki/root/blob/main/90-docs/adr/2607022600-kotoba-database-crates-cljc-migration-roadmap.md).
+
+**Renamed from `kotobase-engine`** (ADR-2607050600): "kotobase" alone was
+already taken by the client-side `IStore` port (see below), and "engine"
+undersold what this actually is against the Datomic vocabulary the rest of
+this substrate deliberately mirrors (`kotoba : kotobase = Clojure :
+Datomic`, ADR-2607032500) — Datomic calls the library an application
+embeds for `transact`/`q`/`pull` a **peer**. `arrangement` (this repo
+depends on it) was `quad-store` + `kqe` until the same ADR merged them.
 
 **Portability**: `multiformats` and `dag-cbor` — the two foundational
 primitives every layer of this stack sits on — used to be JVM-only despite
@@ -16,13 +26,13 @@ living in `.cljc`-named files (a documented, known gap every repo in this
 chain carried). Both now have real `:cljs` branches (SHA-256 via
 `@noble/hashes`, portable CBOR byte buffers), `prolly-tree` had its own
 small hidden JVM-only call (`utf8-bytes`) fixed, and this repo's own source
-(`commit-dag`, `kotobase-engine`) was `.clj`, not `.cljc` — also fixed. The
-whole chain — `multiformats` → `dag-cbor` → `prolly-tree` → `quad-store` →
-`kqe` → `commit-dag` → `kotobase-engine` — is now verified end to end under
-real ClojureScript (via `nbb`, not just reasoned about), and JVM/cljs
-produce **byte-identical CIDs** for the same content at every layer. This
-matters specifically because content-addressing is only meaningful if two
-platforms computing "the same" data agree on its address — that's now
+was `.clj`, not `.cljc` — also fixed. The whole chain — `multiformats` →
+`dag-cbor` → `prolly-tree` → `arrangement` → `commit-dag` →
+`kotobase-peer` — is verified end to end under real ClojureScript (real
+`shadow-cljs`, not `nbb` — see ADR-2607022600 add.3), and JVM/cljs produce
+**byte-identical CIDs** for the same content at every layer. This matters
+specifically because content-addressing is only meaningful if two
+platforms computing "the same" data agree on its address — that's
 empirically checked, not assumed.
 
 ## Not `kotoba-lang/kotobase`, not `kotoba-lang/atproto`
@@ -37,16 +47,17 @@ Two adjacent, already-existing `kotoba-lang` repos have different jobs:
 - **`kotoba-lang/atproto`** is AT-Protocol *protocol* vocabulary (NSIDs, repo
   URI helpers, lexicon record shapes) shared by anything speaking AT
   Protocol — kotoba, app-aozora, future actors. It isn't kotobase-specific.
-- **`kotoba-lang/kotobase-engine`** (this repo) is the *server-side*
-  database engine itself — what actually executes a `transact`/`q`/`pull`/
-  `datoms` call and persists the result. It's what a Worker calling into
-  `kotoba-lang/kotobase`'s client, or implementing the routes
+- **`kotoba-lang/kotobase-peer`** (this repo) is the *server-side*
+  database peer library itself — what actually executes a `transact`/`q`/
+  `pull`/`datoms` call and persists the result. It's what a Worker calling
+  into `kotoba-lang/kotobase`'s client, or implementing the routes
   `kotoba-lang/atproto` describes, would run *behind* that wire.
 
 ## Use
 
 ```clojure
-(require '[kotobase-engine.core :as eng])
+(require '[kotobase-peer.core :as eng]
+         '[arrangement.core :as arr])
 
 (def store (atom {}))
 (def put!   (fn [cid bytes] (swap! store assoc cid bytes)))
@@ -73,7 +84,8 @@ Two adjacent, already-existing `kotoba-lang` repos have different jobs:
 ;; an in-memory db value to inspect before deciding whether/how to persist it
 (def db (eng/transact (eng/empty-db) [{:s "alice" :p "role" :o "admin"}]))
 (eng/datoms db)
-(eng/q db ["alice" nil nil])
+;; q's visible? is required (Query is a first-class effect, ADR-2607050500)
+(eng/q db ["alice" nil nil] (constantly true))
 (eng/pull db "alice")            ;=> {"role" #{"admin"}}
 ```
 
@@ -88,7 +100,7 @@ Datomic's log/index separation (memtable/SSTable in LSM-tree terms) into
 this content-addressed chain:
 
 - `commit-dag`'s opaque `state` is now `{"indexed" Link|nil "novelty"
-  [Link ...]}` — `"indexed"` is the last-folded quad-store snapshot CID,
+  [Link ...]}` — `"indexed"` is the last-folded arrangement snapshot CID,
   `"novelty"` is the ordered list of small tx-block CIDs appended since.
 - **`commit!`** appends one novelty tx block: O(|tx-data|), one `commit-
   dag/head` fetch (O(1) since [commit-dag#1](https://github.com/kotoba-lang/commit-dag/pull/1)), never touches a prolly-tree.
@@ -114,12 +126,12 @@ fully materialized hot `db` (backfill/migration tooling, tests).
 
 ## Composition decision (resolves a known gap from ADR-2607022600)
 
-`quad-store.core/commit!` and `commit-dag.core/commit!` both implement a
+`arrangement.core/commit!` and `commit-dag.core/commit!` both implement a
 notion of "commit," with different shapes (`{index-roots prev}` vs
 `{state prev seq}`) and neither aware of the other. Rather than modifying
-either upstream repo, `snapshot!` here calls `quad-store.core/commit!` with
-`prev` **always nil** — using it purely to snapshot the 4 indexes into
-content-addressed prolly-trees and return one CID — then wraps that
+either upstream repo, `snapshot!` here calls `arrangement.core/commit!`
+with `prev` **always nil** — using it purely to snapshot the 4 indexes
+into content-addressed prolly-trees and return one CID — then wraps that
 snapshot CID (inside the D1 `{indexed novelty}` state map) as commit-dag's
 opaque `state`, so chain history, `:seq`, and tamper/gap verification are
 entirely commit-dag's job. Neither library needed to change.
@@ -127,12 +139,15 @@ entirely commit-dag's job. Neither library needed to change.
 ## What is NOT in this landing
 
 - **Multi-clause Datalog join / recursive-rule fixpoint / SPARQL BGP** —
-  `kqe`'s own documented scope is triple-pattern only; unchanged here.
-- **CACAO / capability auth** — a Worker embedding this engine still needs
-  to verify CACAO and check write capability itself (`kotoba-lang/cacao`)
-  before calling `commit!`; this repo has no auth opinion.
+  `arrangement.query`'s own documented scope is triple-pattern only;
+  unchanged here.
+- **CACAO / capability auth** — a Worker embedding this peer library still
+  needs to verify CACAO and check write capability itself
+  (`kotoba-lang/cacao`) before calling `commit!`; this repo has no auth
+  opinion of its own (`q`'s required `visible?` is the structural seam a
+  caller uses to enforce one, not an opinion this repo holds).
 - **BlockStore backends** (R2, B2, Kubo) — `put!`/`get-fn` are the same
-  injection seam `prolly-tree`/`quad-store`/`commit-dag` already use; a
+  injection seam `prolly-tree`/`arrangement`/`commit-dag` already use; a
   Worker wires them to real storage. No Memory-only assumption is baked in,
   but no real backend ships here either.
 - **Snapshot-level tamper-evidence**: `verify-chain` checks the commit
@@ -151,7 +166,7 @@ npm run test:cljs            # real shadow-cljs build + node, not nbb
 ```
 
 ```
-Ran 17 tests containing 64 assertions.
+Ran 21 tests containing 73 assertions.
 0 failures, 0 errors.
 ```
 

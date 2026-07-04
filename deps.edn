@@ -1,18 +1,17 @@
 {:paths ["src"]
  ;; Composes the already-landed Wave 1-3 pieces (ADR-2607010930 + ADR-2607022600)
- ;; into the actual kotobase XRPC-surface engine: transact/datoms/q/pull over
- ;; quad-store's hot 4-index Arrangement (routed via kqe), persisted as a
- ;; content-addressed, verifiable commit-dag chain. multiformats/dag-cbor/
- ;; prolly-tree/quad-store all come in transitively via kqe's and commit-dag's
- ;; own deps.edn.
+ ;; into the actual kotobase peer library: transact/datoms/q/pull over
+ ;; arrangement's hot 4-covering-index Arrangement (query routing via
+ ;; arrangement.query, formerly the standalone kqe repo -- merged in,
+ ;; ADR-2607050600), persisted as a content-addressed, verifiable commit-dag
+ ;; chain. multiformats/dag-cbor/prolly-tree all come in transitively via
+ ;; arrangement's and commit-dag's own deps.edn.
  ;; datom (datom-clj): the canonical datom model — entity tx-map ↔ [e a v]
  ;; datom.core/eavt. The kotobase datom DATABASE consuming kotoba's shared datom
  ;; representation (kotoba : kotobase = Clojure : Datomic, ADR-2607032500).
- :deps {io.github.kotoba-lang/kqe        {:git/sha "a6136c0b1d0fb0d96a3d03cfc138a60faebbb4ca"}
-        ;; explicit now (was transitive-only via kqe) -- core.cljc directly
-        ;; requires quad-store.core, so it should be a direct dep, not a
-        ;; latent assumption about kqe's own deps.edn shape.
-        io.github.kotoba-lang/quad-store {:git/sha "04c1a3bc0219db0c063087bcc8f0f941db9fc19b"}
+ :deps {;; formerly two deps here (kqe + quad-store) -- kqe merged into
+        ;; arrangement (ADR-2607050600), so this is the one coordinate now.
+        io.github.kotoba-lang/arrangement {:git/sha "a73ec053f5d3b4fe4a9915d846b13ce41bceb8a2"}
         io.github.kotoba-lang/commit-dag {:git/sha "2d352c6d4703390ed2c18f32e5436d152d7e121d"}
         io.github.kotoba-lang/datom      {:git/sha "d27a5833d59d909367956705f2ec931399c891ee"}}
  :aliases
