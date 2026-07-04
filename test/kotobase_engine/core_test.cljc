@@ -116,10 +116,21 @@
 (deftest q-routes-through-kqe
   (let [db (eng/transact (eng/empty-db)
                           [{:s "alice" :p "role" :o "admin"}
-                           {:s "bob" :p "role" :o "user"}])]
-    (is (= #{{:s "alice" :p "role" :o "admin"}} (eng/q db ["alice" nil nil])))
-    (is (= #{{:s "alice" :p "role" :o "admin"}} (eng/q db [nil "role" "admin"])))
-    (is (= 2 (count (eng/q db [nil nil nil]))))))
+                           {:s "bob" :p "role" :o "user"}])
+        everything (constantly true)]
+    (is (= #{{:s "alice" :p "role" :o "admin"}} (eng/q db ["alice" nil nil] everything)))
+    (is (= #{{:s "alice" :p "role" :o "admin"}} (eng/q db [nil "role" "admin"] everything)))
+    (is (= 2 (count (eng/q db [nil nil nil] everything))))))
+
+(deftest q-visible-is-required
+  ;; a non-empty db: an omitted visible? must actually be invoked as a
+  ;; predicate (and fail) for this to be a meaningful cross-platform check --
+  ;; on an empty db, cljs's `filter` never calls the missing predicate at
+  ;; all, so the arity mismatch would silently NOT surface.
+  (let [db (eng/transact (eng/empty-db) [{:s "alice" :p "role" :o "admin"}])]
+    (is (thrown? #?(:clj clojure.lang.ArityException :cljs js/Error)
+                 (eng/q db [nil nil nil]))
+        "q cascades kqe's required visibility decision -- no permissive default")))
 
 (deftest pull-returns-entity-attrs
   (let [db (eng/transact (eng/empty-db) [{:s "alice" :p "role" :o "admin"}
@@ -259,7 +270,7 @@
             code -- zero migration step for already-deployed actors"
     (let [{:keys [put! get-fn]} (mem-store)
           db (eng/transact (eng/empty-db) [{:s "alice" :p "role" :o "admin"}])
-          snap-cid (qs/commit! put! db nil)
+          snap-cid (qs/commit! put! db nil qs/current-schema-version)
           pre-d1-chain (cd/commit! put! get-fn (ipld/link snap-cid) nil)]
       (is (= snap-cid (eng/latest-snapshot-cid get-fn pre-d1-chain)))
       (is (= 0 (eng/novelty-size get-fn pre-d1-chain)))

@@ -156,9 +156,14 @@
   "`datomic.q`-equivalent: `pattern` is `[s p o]` (nil = wildcard), routed to
    the matching index via kqe. Returns a set of `{:s :p :o}` quads. NOTE:
    triple-pattern only — multi-clause join / recursive-rule fixpoint is not
-   implemented (kqe's own documented scope), see README."
-  [db pattern]
-  (kqe/query db pattern))
+   implemented (kqe's own documented scope), see README.
+
+   `visible?` is REQUIRED, cascaded straight from `kqe.core/query`
+   (ADR-2607050500: Query is a first-class effect all the way up this
+   stack, not just at kqe's layer) -- pass `(constantly true)` to see
+   everything, as an explicit choice."
+  [db pattern visible?]
+  (kqe/query db pattern visible?))
 
 (defn pull
   "`datomic.pull`-equivalent for entity `s`: `{p #{o...}}` (quad-store has no
@@ -198,7 +203,7 @@
    for callers that already have a fully materialized hot `db` (backfill /
    migration tooling, tests). Most write paths want `commit!`, below."
   [put! get-fn db prev-chain-cid]
-  (let [snapshot-cid (qs/commit! put! db nil)]
+  (let [snapshot-cid (qs/commit! put! db nil qs/current-schema-version)]
     (cd/commit! put! get-fn
                 {"indexed" (ipld/link snapshot-cid) "novelty" []}
                 prev-chain-cid)))
@@ -403,7 +408,7 @@
          db (reduce (fn [db q] (qs/assert-quad db q ref?))
                     (hydrate-db get-fn (indexed-cid state))
                     novelty-quads)
-         new-snap-cid (qs/commit! put! db nil)
+         new-snap-cid (qs/commit! put! db nil qs/current-schema-version)
          new-state {"indexed" (ipld/link new-snap-cid) "novelty" []}]
      (cd/commit! put! get-fn new-state chain-cid))))
 
