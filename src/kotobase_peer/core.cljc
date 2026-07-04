@@ -5,8 +5,8 @@
 ;; from the already-landed Wave 1-3 primitives (ADR-2607010930 Phase 6 +
 ;; ADR-2607022600): arrangement (hot 4-covering-index Arrangement + query
 ;; routing + per-commit snapshot -- formerly two repos, quad-store and kqe,
-;; merged into one per ADR-2607050700), commit-dag (chain/verify). This is
-;; the piece
+;; merged into one per ADR-2607050700), chain (append-only chain/verify,
+;; renamed from commit-dag per ADR-2607050800). This is the piece
 ;; that implements the `ai.gftd.apps.kotobase.datomic.*` surface
 ;; (transact/datoms/q/pull) end to end, backed by content-addressed,
 ;; verifiable persistence, in CLJC.
@@ -15,7 +15,7 @@
 ;; a full hot db into 4 fresh prolly-trees on EVERY write -- O(graph). Confirmed
 ;; live 2026-07-03 as the root cause of a CF Worker CPU-limit collapse (error 1102)
 ;; during a 321-actor mass write. `commit!` is now a novelty-log APPEND (O(tx)):
-;; commit-dag's opaque `state` carries `{"indexed" <snapshot Link>|nil "novelty"
+;; chain's opaque `state` carries `{"indexed" <snapshot Link>|nil "novelty"
 ;; [<tx-block Link> ...]}`; a write puts one small tx block and prepends its link,
 ;; touching neither a prolly-tree nor the graph itself. `fold!` compacts novelty
 ;; into a fresh `indexed` snapshot (the same O(graph) work the old `commit!` always
@@ -27,11 +27,12 @@
 ;;
 ;; Composition decision (resolves the ADR-2607022600 "quad-store/commit! and
 ;; commit-dag are two unmerged implementations" gap -- quoting that ADR's own
-;; wording; the repo it refers to is arrangement post-ADR-2607050700 rename):
+;; wording verbatim; "quad-store" in the quote is arrangement post-ADR-2607050700
+;; rename, "commit-dag" in the quote is chain post-ADR-2607050800 rename):
 ;; arrangement/commit! is called
 ;; with `prev` always nil here — it is used ONLY to snapshot the 4 indexes into
 ;; content-addressed prolly-trees and return one CID for that snapshot. Chain
-;; history, `:seq`, and tamper/gap verification are commit-dag's job, wrapping
+;; history, `:seq`, and tamper/gap verification are chain's job, wrapping
 ;; the {indexed, novelty} state map as its opaque `state`. Neither library is
 ;; modified; this namespace is the seam between them.
 (ns kotobase-peer.core
@@ -41,7 +42,7 @@
             [prolly-tree.core :as pt]
             [arrangement.core :as qs]
             [arrangement.query :as kqe]
-            [commit-dag.core :as cd]
+            [chain.core :as cd]
             [datom.core :as dc]))   ; canonical datom model (kotoba : kotobase = Clojure : Datomic)
 
 (defn empty-db [] (qs/empty-db))
@@ -191,7 +192,7 @@
 
 ;; ── persistence: content-addressed, chained, verifiable ─────────────────────
 ;;
-;; state shape (opaque to commit-dag; this peer library's own convention, encoded
+;; state shape (opaque to chain; this peer library's own convention, encoded
 ;; with STRING keys per the codebase's IPLD-node convention):
 ;;   {"indexed" Link|nil    -- the last-folded arrangement snapshot CID
 ;;    "novelty" [Link ...]} -- tx-block CIDs appended since, oldest first
@@ -206,7 +207,7 @@
   "Full O(graph) commit: snapshot `db`'s 4 indexes into content-addressed
    prolly-trees (`arrangement.core/commit!`, always with `prev` nil) and
    append that snapshot CID (as `{\"indexed\" snap \"novelty\" []}`) onto the
-   commit-dag chain rooted at `prev-chain-cid`. This is the SAME expensive
+   chain rooted at `prev-chain-cid`. This is the SAME expensive
    rebuild the pre-D1 `commit!` did on every write; it now exists only as a
    primitive `fold!` calls internally, plus a one-shot cold-start entry point
    for callers that already have a fully materialized hot `db` (backfill /
@@ -227,7 +228,7 @@
 
 (defn- state-at
   "The normalized `{\"indexed\" ... \"novelty\" ...}` state at `chain-cid`
-   (an O(1) head fetch since commit-dag/head, ADR-2607032430's other half).
+   (an O(1) head fetch since chain/head, ADR-2607032430's other half).
    nil chain-cid (no prior commit) → the empty state."
   [get-fn chain-cid]
   (if (nil? chain-cid)
@@ -249,8 +250,8 @@
 (defn commit!
   "THE write path (ADR-2607032430 D1): append `tx-data` as one novelty tx
    block. O(|tx-data|) — reads only the previous state's {indexed, novelty}
-   LINKS (one O(1) head fetch via commit-dag, never the graph itself) and
-   writes one new small tx block plus one new commit-dag entry. Touches no
+   LINKS (one O(1) head fetch via chain, never the graph itself) and
+   writes one new small tx block plus one new chain entry. Touches no
    prolly-tree, rehydrates nothing. `tx-data` accepts the same shapes
    `transact` does (quad maps, `[:db/add e a v]`, bare `[e a v]` triples).
 
@@ -291,13 +292,13 @@
   "Full commit history rooted at `chain-cid`, oldest first. Each entry's
    `:state` is the `{indexed novelty}` map (or, for a pre-D1 commit, the
    bare snapshot Link `normalize-state` would expand — `chain`/`head` return
-   the RAW state as commit-dag stored it; callers that need the normalized
+   the RAW state as chain stored it; callers that need the normalized
    shape go through `state-at` / `hot-datoms` / `latest-snapshot-cid`)."
   [get-fn chain-cid]
   (cd/chain get-fn chain-cid))
 
 (defn head
-  "The commit-dag entry AT `chain-cid` (O(1) — see commit-dag/head). Returns
+  "The chain entry AT `chain-cid` (O(1) — see chain/head). Returns
    the RAW `:state` (not normalize-state-expanded); see `chain`'s docstring."
   [get-fn chain-cid]
   (cd/head get-fn chain-cid))
@@ -399,7 +400,7 @@
   "Compact `chain-cid`'s novelty into a fresh indexed snapshot: hydrate the
   current `indexed` snapshot, re-assert every novelty quad on top (append
   order), `qs/commit!` that as the new `indexed`, and append ONE new
-  commit-dag entry with an empty `novelty`. Cost: O(graph_shard) — the same
+  chain entry with an empty `novelty`. Cost: O(graph_shard) — the same
   full rebuild `snapshot!`/the pre-D1 `commit!` always paid, now amortized
   over however many `commit!` writes accumulated the folded novelty instead
   of being paid on every single one (`should-fold?`/`novelty-size` decide
@@ -422,7 +423,7 @@
      (cd/commit! put! get-fn new-state chain-cid))))
 
 (defn verify-chain
-  "True iff the commit-dag chain rooted at `chain-cid` is untampered and its
+  "True iff the chain rooted at `chain-cid` is untampered and its
    `:seq` values are gapless from 0. Does NOT verify the prolly-tree
    snapshots or tx blocks each commit's `:state` links to are themselves
    intact (that would require walking every index/tx-block — a follow-up)."

@@ -3,7 +3,7 @@
 **The kotobase peer library — Datomic's own term for the transact/q/pull
 library an application embeds — in real CLJC, verified on both JVM and
 ClojureScript.** Composes the already-landed Wave 1–3 primitives
-(`prolly-tree`, `arrangement`, `commit-dag`) into `transact`/`datoms`/
+(`prolly-tree`, `arrangement`, `chain`) into `transact`/`datoms`/
 `q`/`pull`, persisted as a content-addressed, verifiable commit chain whose
 references are real tag-42 IPLD links end to end (chain prev, snapshot
 state, index roots, tree children — one generic `ipld.core/links` walk
@@ -19,6 +19,12 @@ this substrate deliberately mirrors (`kotoba : kotobase = Clojure :
 Datomic`, ADR-2607032500) — Datomic calls the library an application
 embeds for `transact`/`q`/`pull` a **peer**. `arrangement` (this repo
 depends on it) was `quad-store` + `kqe` until the same ADR merged them.
+`chain` (also depended on) was `commit-dag` until a follow-up rename
+(ADR-2607050800) — "chain" names the parent-linked structure itself,
+matching that repo's own `chain`/`verify-chain`/`head` functions, without
+colliding with the unrelated, already-existing `kotoba-lang/log`
+(structured logging/telemetry) that "log" (Datomic's own term for this)
+would have collided with.
 
 **Portability**: `multiformats` and `dag-cbor` — the two foundational
 primitives every layer of this stack sits on — used to be JVM-only despite
@@ -27,7 +33,7 @@ chain carried). Both now have real `:cljs` branches (SHA-256 via
 `@noble/hashes`, portable CBOR byte buffers), `prolly-tree` had its own
 small hidden JVM-only call (`utf8-bytes`) fixed, and this repo's own source
 was `.clj`, not `.cljc` — also fixed. The whole chain — `multiformats` →
-`dag-cbor` → `prolly-tree` → `arrangement` → `commit-dag` →
+`dag-cbor` → `prolly-tree` → `arrangement` → `chain` →
 `kotobase-peer` — is verified end to end under real ClojureScript (real
 `shadow-cljs`, not `nbb` — see ADR-2607022600 add.3), and JVM/cljs produce
 **byte-identical CIDs** for the same content at every layer. This matters
@@ -99,11 +105,11 @@ before the graph itself was large by any absolute measure. The fix ports
 Datomic's log/index separation (memtable/SSTable in LSM-tree terms) into
 this content-addressed chain:
 
-- `commit-dag`'s opaque `state` is now `{"indexed" Link|nil "novelty"
+- `chain`'s opaque `state` is now `{"indexed" Link|nil "novelty"
   [Link ...]}` — `"indexed"` is the last-folded arrangement snapshot CID,
   `"novelty"` is the ordered list of small tx-block CIDs appended since.
-- **`commit!`** appends one novelty tx block: O(|tx-data|), one `commit-
-  dag/head` fetch (O(1) since [commit-dag#1](https://github.com/kotoba-lang/commit-dag/pull/1)), never touches a prolly-tree.
+- **`commit!`** appends one novelty tx block: O(|tx-data|), one `chain/
+  head` fetch (O(1) since [chain#1](https://github.com/kotoba-lang/chain/pull/1), the pre-rename `commit-dag#1`), never touches a prolly-tree.
 - **`hot-datoms`** merges `cold-datoms` on the indexed snapshot
   (range-pruned, untouched by graph size) with the bounded novelty tail
   (decoded and filtered in memory, reusing `datoms`'s own index logic) —
@@ -126,15 +132,16 @@ fully materialized hot `db` (backfill/migration tooling, tests).
 
 ## Composition decision (resolves a known gap from ADR-2607022600)
 
-`arrangement.core/commit!` and `commit-dag.core/commit!` both implement a
-notion of "commit," with different shapes (`{index-roots prev}` vs
+`arrangement.core/commit!` and `chain.core/commit!` (`commit-dag.core/
+commit!` before ADR-2607050800's rename) both implement a notion of
+"commit," with different shapes (`{index-roots prev}` vs
 `{state prev seq}`) and neither aware of the other. Rather than modifying
 either upstream repo, `snapshot!` here calls `arrangement.core/commit!`
 with `prev` **always nil** — using it purely to snapshot the 4 indexes
 into content-addressed prolly-trees and return one CID — then wraps that
-snapshot CID (inside the D1 `{indexed novelty}` state map) as commit-dag's
+snapshot CID (inside the D1 `{indexed novelty}` state map) as chain's
 opaque `state`, so chain history, `:seq`, and tamper/gap verification are
-entirely commit-dag's job. Neither library needed to change.
+entirely chain's job. Neither library needed to change.
 
 ## What is NOT in this landing
 
@@ -147,7 +154,7 @@ entirely commit-dag's job. Neither library needed to change.
   opinion of its own (`q`'s required `visible?` is the structural seam a
   caller uses to enforce one, not an opinion this repo holds).
 - **BlockStore backends** (R2, B2, Kubo) — `put!`/`get-fn` are the same
-  injection seam `prolly-tree`/`arrangement`/`commit-dag` already use; a
+  injection seam `prolly-tree`/`arrangement`/`chain` already use; a
   Worker wires them to real storage. No Memory-only assumption is baked in,
   but no real backend ships here either.
 - **Snapshot-level tamper-evidence**: `verify-chain` checks the commit

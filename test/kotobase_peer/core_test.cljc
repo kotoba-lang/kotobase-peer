@@ -3,7 +3,7 @@
                :cljs [cljs.test :refer [deftest is testing] :include-macros true])
             [clojure.set :as set]
             [ipld.core :as ipld]
-            [commit-dag.core :as cd]
+            [chain.core :as cd]
             [arrangement.core :as qs]
             [kotobase-peer.core :as eng]))
 
@@ -155,7 +155,7 @@
           b (:state (eng/head get-fn2 (eng/snapshot! put2! get-fn2 db nil)))]
       (is (= a b)))))
 
-(deftest commit-dag-chain-tracks-multiple-snapshots
+(deftest chain-tracks-multiple-snapshots
   (let [{:keys [put! get-fn]} (mem-store)
         db1 (eng/transact (eng/empty-db) [{:s "alice" :p "role" :o "admin"}])
         db2 (eng/transact db1 [{:s "bob" :p "role" :o "user"}])
