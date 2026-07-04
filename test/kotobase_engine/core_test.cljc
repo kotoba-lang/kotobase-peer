@@ -286,3 +286,40 @@
                                  ["keybackup/alice" :aozora.keyBackup/did "alice"]])]
       (is (= (set (eng/datoms via-raw)) (set (eng/datoms via-tx)))
           "the DB engine's entity datafication == kotoba's shared [e a v] model"))))
+
+;; ── ref? naturalizes to ipld/link? (ADR-2607050200, ADR-2607023200 §6-4) ─────
+
+(def ^:private bob-link
+  (ipld/link "bafyreiaakutsdtndrl7e7emcmkp5hjsaaq2vu6prfelbgaglprvtdon63m"))
+
+(deftest transact-auto-indexes-link-values-as-refs
+  (let [db (eng/transact (eng/empty-db)
+                          [{:s "alice" :p "knows" :o bob-link}
+                           {:s "alice" :p "name" :o "Alice"}])]
+    (testing "a Link-valued object is reverse-indexed by default -- no explicit ref? needed"
+      (is (= {"knows" #{"alice"}} (eng/refs db bob-link))))
+    (testing "a plain string is never mistaken for a ref"
+      (is (= {} (eng/refs db "Alice"))))
+    (testing "the Link survives into datoms' wire encoding, readable, no custom reader"
+      (is (= #{["knows" "[\"ipld/link\" \"bafyreiaakutsdtndrl7e7emcmkp5hjsaaq2vu6prfelbgaglprvtdon63m\"]"]
+               ["name" "\"Alice\""]}
+             (set (map (juxt :a :v_edn) (eng/datoms db))))))))
+
+(deftest link-ref-survives-fold-and-cold-read
+  (testing "a Link-valued datom, folded into a persisted snapshot and read back
+            cold, is still a real Link -- and refs/refs-to still finds it on the
+            rehydrated hot db (the full novelty -> fold -> cold-read round trip)"
+    (let [{:keys [put! get-fn]} (mem-store)
+          c0 (eng/commit! put! get-fn [{:s "alice" :p "knows" :o bob-link}] nil)
+          folded (eng/fold! put! get-fn c0)
+          snap (eng/latest-snapshot-cid get-fn folded)]
+      (testing "cold-datoms reconstructs the Link (not the raw edn-safe vector)"
+        (let [row (first (eng/cold-datoms get-fn snap {:index :eavt :components ["alice"]}))]
+          (is (= "[\"ipld/link\" \"bafyreiaakutsdtndrl7e7emcmkp5hjsaaq2vu6prfelbgaglprvtdon63m\"]"
+                 (:v_edn row)))))
+      (testing "hydrate-db reconstructs a real Link, so refs-to finds it again"
+        (let [db (eng/hydrate-db get-fn snap)]
+          (is (= {"knows" #{"alice"}} (qs/refs-to db bob-link)))))
+      (testing "hot-datoms (novelty path, via dag-cbor) agrees with the cold path"
+        (is (= (set (eng/hot-datoms get-fn c0))
+               (set (eng/cold-datoms get-fn snap nil))))))))

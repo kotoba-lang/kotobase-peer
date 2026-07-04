@@ -38,20 +38,28 @@
 
 (defn empty-db [] (qs/empty-db))
 
+(defn- ->quad-value
+  "Coerce one quad position: an `ipld.core/Link` passes through unchanged (so
+   it survives to `assert-quad`'s `ref?` check as a genuine Link, ADR-2607050200);
+   anything else stringifies as before (general typed-value support beyond
+   Link -- int/bytes/bool/list/map -- remains a follow-up, ADR-2607023200 §6-5)."
+  [v] (if (ipld/link? v) v (str v)))
+
 (defn- ->quad
-  "Coerce one tx-data item to a `{:s :p :o}` quad (all three coerced to strings,
-   matching quad-store's opaque-string scope). Accepts a `{:s :p :o}` map,
-   `[:db/add e a v]`, or a bare `[e a v]` triple."
+  "Coerce one tx-data item to a `{:s :p :o}` quad (`:s`/`:p` always coerced to
+   strings; `:o` passes an `ipld.core/Link` through unchanged, see
+   `->quad-value`). Accepts a `{:s :p :o}` map, `[:db/add e a v]`, or a bare
+   `[e a v]` triple."
   [item]
   (cond
     (and (map? item) (contains? item :s) (contains? item :p) (contains? item :o))
-    {:s (str (:s item)) :p (str (:p item)) :o (str (:o item))}
+    {:s (str (:s item)) :p (str (:p item)) :o (->quad-value (:o item))}
 
     (and (vector? item) (= 4 (count item)) (= :db/add (first item)))
-    (let [[_ e a v] item] {:s (str e) :p (str a) :o (str v)})
+    (let [[_ e a v] item] {:s (str e) :p (str a) :o (->quad-value v)})
 
     (and (sequential? item) (= 3 (count item)))
-    (let [[e a v] item] {:s (str e) :p (str a) :o (str v)})
+    (let [[e a v] item] {:s (str e) :p (str a) :o (->quad-value v)})
 
     :else
     (throw (ex-info "kotobase-engine: unrecognized tx-data item"
@@ -60,13 +68,15 @@
 (defn transact
   "Apply `tx-data` (a seq of `{:s :p :o}` quads, `[:db/add e a v]`, or `[e a v]`
    triples) to `db`. Returns the new (immutable) db value. `ref?` is passed
-   through to `quad-store.core/assert-quad` for reverse-reference indexing.
+   through to `quad-store.core/assert-quad` for reverse-reference indexing
+   (default `ipld.core/link?`, ADR-2607050200 -- a value asserted as a Link is
+   automatically reverse-indexed, see `refs`).
 
    A pure hot-db utility, independent of persistence strategy -- used
    internally by `fold!` (via `hydrate-db`'s reduce, not this fn directly) and
    available for anyone assembling/inspecting a hot db value directly (tests,
    migration/backfill tooling). The write path proper is `commit!`, below."
-  ([db tx-data] (transact db tx-data (constantly false)))
+  ([db tx-data] (transact db tx-data ipld/link?))
   ([db tx-data ref?]
    (reduce (fn [db item] (qs/assert-quad db (->quad item) ref?))
            db tx-data)))
@@ -94,14 +104,16 @@
   "Transact a seq of entity tx-maps into `db`: datafy through the canonical datom
    model (`entities->datoms`), then `transact`. The engine's entity-transaction
    expressed in kotoba's datom representation."
-  ([db entities] (transact-tx db entities (constantly false)))
+  ([db entities] (transact-tx db entities ipld/link?))
   ([db entities ref?] (transact db (entities->datoms entities) ref?)))
 
 (defn- v->edn
-  "Serialize a quad-store value (always a string) to the EDN string the
-   kotobase wire uses. Matches the shape the pre-existing DataScript-backed
-   `kotobase.engine` (app-aozora) produced, for wire compatibility."
-  [v] (pr-str v))
+  "Serialize a quad-store value to the EDN string the kotobase wire uses -- a
+   Link renders as `qs/link->edn`'s `[\"ipld/link\" cid]` form (readable, no
+   custom reader needed), anything else pr-str's directly as before. Matches
+   the shape the pre-existing DataScript-backed `kotobase.engine` (app-aozora)
+   produced, for wire compatibility."
+  [v] (pr-str (qs/link->edn v)))
 
 (defn datoms
   "`datomic.datoms`-shaped rows `{:e :a :v_edn :added}`, AppView-scan compatible
@@ -154,6 +166,14 @@
    expecting single-valued Datomic pull semantics must pick e.g. `first`)."
   [db s]
   (qs/entity-attrs db s))
+
+(defn refs
+  "`{p #{s...}}`: every entity `s` that references `ref` via predicate `p`
+   (VAET-style reverse lookup, ADR-2607050200). Only populated for quads
+   whose value was asserted as an `ipld.core/Link` — see `transact`'s default
+   `ref?`. `ref` is the same Link value the referencing quad's `:o` was."
+  [db ref]
+  (qs/refs-to db ref))
 
 ;; ── persistence: content-addressed, chained, verifiable ─────────────────────
 ;;
@@ -321,7 +341,7 @@
                       []
                       (pt/scan-prefix get-fn root-cid (or (components-prefix components) "")))
           rows      (for [[k _] entries
-                          :let [[e a v] (->eav (edn/read-string k))]]
+                          :let [[e a v] (->eav (mapv qs/edn->link (edn/read-string k)))]]
                       {:e e :a a :v_edn (v->edn v) :added true})
           rows      (cond->> rows limit (take limit))]
       (vec rows))))
@@ -337,7 +357,7 @@
   (if (nil? snapshot-cid)
     (qs/empty-db)
     (reduce (fn [db {:keys [e a v_edn]}]
-              (qs/assert-quad db {:s e :p a :o (edn/read-string v_edn)}))
+              (qs/assert-quad db {:s e :p a :o (qs/edn->link (edn/read-string v_edn))}))
             (qs/empty-db)
             (cold-datoms get-fn snapshot-cid {:index :eavt}))))
 
@@ -376,7 +396,7 @@
   a browser at idle — always produces the same snapshot CID. Concurrent
   folds of the same state are safe, redundant, and cheap (re-`put!`ing
   already-stored bytes is a no-op at the block-store layer)."
-  ([put! get-fn chain-cid] (fold! put! get-fn chain-cid (constantly false)))
+  ([put! get-fn chain-cid] (fold! put! get-fn chain-cid ipld/link?))
   ([put! get-fn chain-cid ref?]
    (let [state (state-at get-fn chain-cid)
          novelty-quads (mapcat #(read-tx-block get-fn %) (novelty-cids state))
