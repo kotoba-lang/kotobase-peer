@@ -75,8 +75,11 @@ Two adjacent, already-existing `kotoba-lang` repos have different jobs:
 (def c1 (eng/commit! put! get-fn [{:s "bob" :p "role" :o "user"}] c0))
 
 ;; read path: scale-safe, merges the last-folded snapshot with pending novelty
-(eng/hot-datoms get-fn c1)     ;=> [{:e "alice" ...} {:e "bob" ...} ...]
-(eng/hot-datoms get-fn c1 {:index :eavt :components ["alice"]})
+;; hot-datoms/cold-datoms/datoms' visible? is required (Query is a
+;; first-class effect, ADR-2607050500, same precedent as q's below) -- a
+;; post-filter over each {:e :a :v_edn :added} row, applied before :limit
+(eng/hot-datoms get-fn c1 (constantly true))     ;=> [{:e "alice" ...} {:e "bob" ...} ...]
+(eng/hot-datoms get-fn c1 {:index :eavt :components ["alice"]} (constantly true))
 
 ;; compaction: fold accumulated novelty into a fresh indexed snapshot
 (eng/should-fold? get-fn c1 32)  ;=> false (only 2 novelty commits so far)
@@ -89,8 +92,8 @@ Two adjacent, already-existing `kotoba-lang` repos have different jobs:
 ;; pure, hot-db primitives — for tests, backfill tooling, or anyone who wants
 ;; an in-memory db value to inspect before deciding whether/how to persist it
 (def db (eng/transact (eng/empty-db) [{:s "alice" :p "role" :o "admin"}]))
-(eng/datoms db)
-;; q's visible? is required (Query is a first-class effect, ADR-2607050500)
+(eng/datoms db (constantly true))
+;; q's visible? is required too (Query is a first-class effect, ADR-2607050500)
 (eng/q db ["alice" nil nil] (constantly true))
 (eng/pull db "alice")            ;=> {"role" #{"admin"}}
 ```
@@ -113,7 +116,10 @@ this content-addressed chain:
 - **`hot-datoms`** merges `cold-datoms` on the indexed snapshot
   (range-pruned, untouched by graph size) with the bounded novelty tail
   (decoded and filtered in memory, reusing `datoms`'s own index logic) —
-  the scale-safe read path.
+  the scale-safe read path. `hot-datoms`/`cold-datoms`/`datoms` all require
+  an explicit `visible?` (same `q` precedent, ADR-2607050500), forwarded
+  unchanged into both the snapshot and novelty halves so each row is
+  filtered exactly once regardless of which half it came from.
 - **`fold!`** compacts: hydrate the indexed snapshot, re-assert novelty on
   top, `snapshot!` the result, commit a fresh `{indexed novelty: []}`
   state. This is the SAME O(graph) work the old `commit!` always paid, now

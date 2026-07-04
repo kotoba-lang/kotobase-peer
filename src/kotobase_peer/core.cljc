@@ -128,19 +128,34 @@
   "`datomic.datoms`-shaped rows `{:e :a :v_edn :added}`, AppView-scan compatible
    (same wire shape as the DataScript-backed `kotobase.engine` this replaces).
 
-   1-arg → whole-db (:eavt full scan, unchanged). 2-arg honors an optional
-   `{:index :components :limit}` SERVER-SIDE via arrangement's index accessors, so
-   a filtered read (e.g. getBackup by entity, or by [attr value]) materialises
-   ONLY the matching entity/attr instead of the whole graph — the root fix for
-   the deployed wasm worker ignoring index/components_edn/limit and rehydrating
-   the full graph per read (ADR-2607022330 addendum 2).
+   `visible?` is REQUIRED (ADR-2607050500: Query is a first-class effect all
+   the way up this stack, `q`'s own precedent -- no permissive default). It is
+   applied as a post-filter over each candidate ROW, i.e. `(visible? {:e :a
+   :v_edn :added})` -- the same `datomic.datoms`-shaped map this fn returns,
+   NOT `arrangement.query`'s `{:s :p :o}` quad shape (`:e`/`:a` name the same
+   positions as `:s`/`:p`, but `:v_edn` is already the wire-encoded EDN string,
+   not the raw decoded value, and `:added` is present too) -- a caller
+   filtering by entity/attribute (the common case: can this actor see this
+   entity, is this attribute public) needs no decoding to do so; a caller
+   that must decide on the raw value can `clojure.edn/read-string` `:v_edn`
+   itself. Pass `(constantly true)` to see everything, as an explicit choice.
+
+   2-arg (`[db visible?]`) → whole-db (:eavt full scan, unchanged). 3-arg
+   additionally honors an optional `{:index :components :limit}` SERVER-SIDE
+   via arrangement's index accessors, so a filtered read (e.g. getBackup by
+   entity, or by [attr value]) materialises ONLY the matching entity/attr
+   instead of the whole graph — the root fix for the deployed wasm worker
+   ignoring index/components_edn/limit and rehydrating the full graph per read
+   (ADR-2607022330 addendum 2).
 
    `:index` ∈ #{:eavt :aevt :avet} (default :eavt); `:components` is an ordered
    prefix in that index's key order (:eavt=[e a v], :aevt/:avet=[a … ]); values
    are the opaque strings arrangement stores (the PDS's :db/id for e, `:ns/attr`
-   for a, the stored value string for v). `:limit` caps the row count."
-  ([db] (datoms db nil))
-  ([db {:keys [index components limit]}]
+   for a, the stored value string for v). `visible?` is applied BEFORE `:limit`
+   is taken, so `:limit` caps the row count the caller actually receives (all
+   of them visible), not the count of raw candidates scanned."
+  ([db visible?] (datoms db nil visible?))
+  ([db {:keys [index components limit]} visible?]
    (let [[c0 c1] components
          triples
          (case (or index :eavt)
@@ -158,8 +173,10 @@
                    (and c0 c1) (for [e (qs/by-predicate-value db c0 c1)] [e c0 c1])
                    c0          (for [[e vs] (qs/by-predicate db c0), v vs] [e c0 v])
                    :else       (for [[a em] (:pso db), [e vs] em, v vs]    [e a v])))
-         triples (cond->> triples limit (take limit))]
-     (vec (for [[e a v] triples] {:e e :a a :v_edn (v->edn v) :added true})))))
+         rows (for [[e a v] triples] {:e e :a a :v_edn (v->edn v) :added true})
+         rows (filter visible? rows)
+         rows (cond->> rows limit (take limit))]
+     (vec rows))))
 
 (defn q
   "`datomic.q`-equivalent: `pattern` is `[s p o]` (nil = wildcard), routed to
@@ -345,8 +362,15 @@
   (range-pruned via `prolly-tree.core/scan-prefix`), never the other three
   indexes — so a keyed read stays small regardless of graph size. `nil`
   snapshot-cid → `[]` (nothing folded yet; see `hot-datoms` for the
-  novelty-inclusive read). get-fn: `(get-fn cid) -> bytes`."
-  [get-fn snapshot-cid {:keys [index components limit]}]
+  novelty-inclusive read). get-fn: `(get-fn cid) -> bytes`.
+
+  `visible?` is REQUIRED, same contract as `datoms`'s (ADR-2607050500): a
+  post-filter over each candidate `{:e :a :v_edn :added}` row, applied BEFORE
+  `:limit` is taken (so `:limit` caps what the caller actually receives).
+  Pass `(constantly true)` to see everything, as an explicit choice. See
+  `hydrate-db`, below, for the one internal caller that deliberately must NOT
+  narrow this."
+  [get-fn snapshot-cid {:keys [index components limit]} visible?]
   (if (nil? snapshot-cid)
     []
     (let [{:keys [root ->eav]} (index-spec (or index :eavt))
@@ -358,6 +382,7 @@
           rows      (for [[k _] entries
                           :let [[e a v] (->eav (mapv qs/edn->link (edn/read-string k)))]]
                       {:e e :a a :v_edn (v->edn v) :added true})
+          rows      (filter visible? rows)
           rows      (cond->> rows limit (take limit))]
       (vec rows))))
 
@@ -367,14 +392,24 @@
   db is ~1× graph size. This is `fold!`'s internal starting point (hydrate
   the last-indexed snapshot, then re-assert novelty on top) — an O(graph_shard)
   operation, now paid once per fold instead of once per write. get-fn:
-  `(get-fn cid) -> bytes`; nil snapshot → empty db."
+  `(get-fn cid) -> bytes`; nil snapshot → empty db.
+
+  Deliberately calls `cold-datoms` with `(constantly true)`, NOT a caller-
+  supplied `visible?`: this fn reconstructs the COMPLETE hot db for an
+  internal structural purpose (`fold!`'s re-assert-novelty-then-resnapshot
+  step), not a scoped read for an external caller. Any narrower `visible?`
+  here would silently drop rows out of the rebuilt db — and since `fold!`
+  then commits that db as the new persisted snapshot, a narrowed hydrate
+  would bake permanent, silent data loss into the graph. Visibility belongs
+  at the read surface (`datoms`/`cold-datoms`/`hot-datoms` called directly
+  for a caller-facing read), never at this internal rehydration step."
   [get-fn snapshot-cid]
   (if (nil? snapshot-cid)
     (qs/empty-db)
     (reduce (fn [db {:keys [e a v_edn]}]
               (qs/assert-quad db {:s e :p a :o (qs/edn->link (edn/read-string v_edn))}))
             (qs/empty-db)
-            (cold-datoms get-fn snapshot-cid {:index :eavt}))))
+            (cold-datoms get-fn snapshot-cid {:index :eavt} (constantly true)))))
 
 (defn hot-datoms
   "THE scale-safe read path (ADR-2607032430 D1): `datoms`-shaped rows as of
@@ -385,15 +420,23 @@
   novelty quads, filter it the normal way) — exactly consistent with the
   snapshot path's semantics, no separate filter implementation to drift.
   Replaces `hydrate-db` + `datoms` for any caller that doesn't need a full
-  hot db value. `nil` chain-cid → `[]`."
-  ([get-fn chain-cid] (hot-datoms get-fn chain-cid nil))
-  ([get-fn chain-cid opts]
+  hot db value. `nil` chain-cid → `[]`.
+
+  `visible?` is REQUIRED (ADR-2607050500, same contract as `datoms`/
+  `cold-datoms`: a post-filter over each `{:e :a :v_edn :added}` row).
+  Forwarded UNCHANGED to both `cold-datoms` (for the snapshot half) and
+  `datoms` (for the novelty half) — each half is filtered exactly once, by
+  its own producer, before the two row seqs are concatenated, so nothing is
+  filtered twice and neither path (snapshot or novelty) is missed. Pass
+  `(constantly true)` to see everything, as an explicit choice."
+  ([get-fn chain-cid visible?] (hot-datoms get-fn chain-cid nil visible?))
+  ([get-fn chain-cid opts visible?]
    (if (nil? chain-cid)
      []
      (let [state (state-at get-fn chain-cid)
-           snap-rows (cold-datoms get-fn (indexed-cid state) opts)
+           snap-rows (cold-datoms get-fn (indexed-cid state) opts visible?)
            novelty-quads (mapcat #(read-tx-block get-fn %) (novelty-cids state))
-           novelty-rows (datoms (reduce qs/assert-quad (qs/empty-db) novelty-quads) opts)]
+           novelty-rows (datoms (reduce qs/assert-quad (qs/empty-db) novelty-quads) opts visible?)]
        (vec (concat snap-rows novelty-rows))))))
 
 (defn fold!
