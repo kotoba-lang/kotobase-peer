@@ -278,8 +278,8 @@
 
 (defn- normalize-state [state]
   (cond
-    (map? state)       state
     (ipld/link? state) {"indexed" state "novelty" []}
+    (map? state)       state
     (nil? state)       {"indexed" nil "novelty" []}
     :else (throw (ex-info "kotobase-peer: unrecognized commit state shape"
                           {:state state}))))
@@ -592,8 +592,13 @@
           (-> (js/Promise.all
                #js [(cold-datoms get-fn (indexed-cid state) opts visible? blind-fn decrypt-fn)
                     (pmap-async (fn [cid] (read-tx-block get-fn cid decrypt-fn)) (novelty-cids state))])
+              ;; `vec`, NOT `js->clj`: every element `js/Promise.all` resolves here is
+              ;; already realized ClojureScript data (a Link is an `ipld.core/Link`
+              ;; defrecord, which is iterable) -- `js->clj` walks anything iterable and
+              ;; would shred a Link back down into a bare `([:cid ...])` seq, silently
+              ;; losing its type (confirmed regression, ADR-2607051000 follow-up).
               (.then (fn [results]
-                       (let [[snap-rows novelty-quads-per-cid] (js->clj results)
+                       (let [[snap-rows novelty-quads-per-cid] (vec results)
                              novelty-quads (apply concat novelty-quads-per-cid)
                              novelty-rows (datoms (reduce qs/assert-quad (qs/empty-db) novelty-quads) opts visible?)]
                          (vec (concat snap-rows novelty-rows)))))))))))
@@ -644,7 +649,7 @@
              #js [(pmap-async (fn [cid] (read-tx-block get-fn cid decrypt-fn)) (novelty-cids state))
                   (hydrate-db get-fn (indexed-cid state) blind-fn decrypt-fn)])
             (.then (fn [results]
-                     (let [[novelty-quads-per-cid hydrated-db] (js->clj results)
+                     (let [[novelty-quads-per-cid hydrated-db] (vec results)
                            novelty-quads (apply concat novelty-quads-per-cid)
                            db (reduce (fn [db q] (qs/assert-quad db q ref?)) hydrated-db novelty-quads)]
                        (qs/commit! put! db nil qs/current-schema-version blind-fn encrypt-fn))))
