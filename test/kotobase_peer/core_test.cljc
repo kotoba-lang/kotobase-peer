@@ -1,6 +1,6 @@
 (ns kotobase-peer.core-test
   (:require #?(:clj [clojure.test :refer [deftest is testing]]
-               :cljs [cljs.test :refer [deftest is testing] :include-macros true])
+               :cljs [cljs.test :refer [deftest is testing async] :include-macros true])
             [clojure.set :as set]
             [ipld.core :as ipld]
             [chain.core :as cd]
@@ -16,19 +16,15 @@
      :get-fn (fn [cid] (get @store cid))
      :store store}))
 
-;; ── ADR-2607051000 test crypto (accepted 2026-07-06) ────────────────────────
-;; Real AES-256-GCM + HMAC-SHA256, not a mock -- JVM (javax.crypto) only for
-;; now. Worker/`crypto.subtle` support is an explicit, separately-tracked
-;; follow-up (ADR-2607061900's sequencing decision), so every test that calls
-;; `eng/snapshot!`/`eng/commit!`/`eng/cold-datoms`/`eng/hydrate-db`/
-;; `eng/hot-datoms`/`eng/fold!` (all of which now REQUIRE `blind-fn`/
-;; `encrypt-fn`/`decrypt-fn`, no silent default) is wrapped `#?(:clj ...)`
-;; below; the `:cljs` build simply doesn't compile them yet, same as
-;; `kotoba-lang/arrangement`'s own test suite handles this identically.
-;;
-;; The nonce is HMAC-derived (deterministic per plaintext), not random -- see
-;; `arrangement.core-test`'s identical helper for why: `snapshot!`/`fold!`'s
-;; content-addressing idempotency depends on it.
+;; ── ADR-2607051000 test crypto (accepted 2026-07-06; cljs/crypto.subtle
+;; sibling added per the ADR's Worker addendum) ───────────────────────────────
+;; Real AES-256-GCM + HMAC-SHA256, not a mock, on BOTH platforms: `javax.
+;; crypto` on the JVM (synchronous), `crypto.subtle` on cljs (Promise-based).
+;; Same algorithm choice, same deterministic-nonce construction, same key
+;; material on both sides -- only the calling convention differs. Identical
+;; helpers to `arrangement.core-test`'s (kept independent per-repo rather
+;; than shared, matching this codebase's existing test-helper duplication
+;; convention across repos).
 #?(:clj
    (do
      (def ^:private test-dek
@@ -58,6 +54,52 @@
          (.init mac test-blind-key)
          (let [digest (.doFinal mac (.getBytes (pr-str component) "UTF-8"))]
            (.encodeToString (Base64/getEncoder) digest))))))
+
+#?(:cljs
+   (do
+     (def ^:private subtle (.-subtle js/crypto))
+     (def ^:private test-dek-bytes (js/Uint8Array. (clj->js (vec (range 1 33)))))
+     (def ^:private test-blind-key-bytes (js/Uint8Array. (clj->js (vec (range 33 65)))))
+     (def ^:private test-nonce-key-bytes (js/Uint8Array. (clj->js (vec (range 65 97)))))
+
+     (defn- import-aes-key []
+       (.importKey subtle "raw" test-dek-bytes #js {:name "AES-GCM"} false #js ["encrypt" "decrypt"]))
+     (defn- import-hmac-key [key-bytes]
+       (.importKey subtle "raw" key-bytes #js {:name "HMAC" :hash "SHA-256"} false #js ["sign"]))
+
+     (defn- concat-bytes [^js a ^js b]
+       (let [out (js/Uint8Array. (+ (.-byteLength a) (.-byteLength b)))]
+         (.set out a 0)
+         (.set out b (.-byteLength a))
+         out))
+
+     (defn- bytes->base64 [^js buf]
+       (let [bytes (js/Uint8Array. buf)]
+         (js/btoa (.. js/Array -prototype -reduce
+                      (call bytes (fn [acc b] (str acc (.fromCharCode js/String b))) "")))))
+
+     (defn test-encrypt-fn [plaintext]
+       (-> (js/Promise.all #js [(import-hmac-key test-nonce-key-bytes) (import-aes-key)])
+           (.then (fn [[nonce-key aes-key]]
+                    (-> (.sign subtle #js {:name "HMAC"} nonce-key plaintext)
+                        (.then (fn [mac] (.slice (js/Uint8Array. mac) 0 12)))
+                        (.then (fn [nonce]
+                                 (-> (.encrypt subtle #js {:name "AES-GCM" :iv nonce :tagLength 128} aes-key plaintext)
+                                     (.then (fn [ct] (concat-bytes nonce (js/Uint8Array. ct))))))))))))
+
+     (defn test-decrypt-fn [^js blob]
+       (let [bytes (js/Uint8Array. blob)
+             nonce (.slice bytes 0 12)
+             ct (.slice bytes 12)]
+         (-> (import-aes-key)
+             (.then (fn [aes-key] (.decrypt subtle #js {:name "AES-GCM" :iv nonce :tagLength 128} aes-key ct)))
+             (.then (fn [pt] (js/Uint8Array. pt))))))
+
+     (defn test-blind-fn [component]
+       (-> (import-hmac-key test-blind-key-bytes)
+           (.then (fn [key] (.sign subtle #js {:name "HMAC"}
+                                   key (.encode (js/TextEncoder.) (pr-str component)))))
+           (.then bytes->base64)))))
 
 (deftest transact-and-datoms-roundtrip
   (testing "quad maps, [:db/add e a v], and bare [e a v] triples all normalize the same way"
@@ -507,3 +549,398 @@
          (testing "hot-datoms (novelty path, via dag-cbor) agrees with the cold path"
            (is (= (set (eng/hot-datoms get-fn c0 (constantly true) test-blind-fn test-decrypt-fn))
                   (set (eng/cold-datoms get-fn snap nil (constantly true) test-blind-fn test-decrypt-fn)))))))))
+
+;; ── cljs mirror of the JVM-only block above: same test names/assertions,
+;; Promise-based via `cljs.test/async` since `eng/snapshot!`/`eng/commit!`/
+;; `eng/cold-datoms`/`eng/hydrate-db`/`eng/hot-datoms`/`eng/fold!` all return
+;; a `js/Promise` on cljs (see `kotobase-peer.core`'s platform-split note).
+#?(:cljs
+   (do
+
+     (deftest cold-datoms-reads-filtered-from-snapshot
+       (async done
+         (let [{:keys [put! get-fn]} (mem-store)
+               db (eng/transact (eng/empty-db)
+                                 [["keybackup/zAlice" ":aozora.keyBackup/did" "did:key:zAlice"]
+                                  ["keybackup/zAlice" ":aozora.keyBackup/blob" "{blobA}"]
+                                  ["keybackup/zBob"   ":aozora.keyBackup/did" "did:key:zBob"]
+                                  ["acct/alice" ":atproto.account/handle" "alice.aozora.app"]])
+               everything (constantly true)]
+           (-> (eng/snapshot! put! get-fn db nil test-blind-fn test-encrypt-fn)
+               (.then (fn [chain-cid]
+                        (let [snap (eng/latest-snapshot-cid get-fn chain-cid)]
+                          (-> (js/Promise.all
+                               #js [(eng/cold-datoms get-fn snap {:index :eavt :components ["keybackup/zAlice"]} everything
+                                                      test-blind-fn test-decrypt-fn)
+                                    (eng/cold-datoms get-fn snap {:index :avet
+                                                                  :components [":aozora.keyBackup/did" "did:key:zBob"]}
+                                                      everything test-blind-fn test-decrypt-fn)
+                                    (eng/cold-datoms get-fn snap {:index :avet
+                                                                  :components [":aozora.keyBackup/did"]}
+                                                      everything test-blind-fn test-decrypt-fn)
+                                    (eng/cold-datoms get-fn snap {:index :avet
+                                                                  :components [":aozora.keyBackup/did"] :limit 1}
+                                                      everything test-blind-fn test-decrypt-fn)
+                                    (eng/cold-datoms get-fn snap {:index :eavt :components ["keybackup/nope"]} everything
+                                                      test-blind-fn test-decrypt-fn)
+                                    (eng/cold-datoms get-fn snap {:index :avet
+                                                                  :components [":aozora.keyBackup/did" "did:key:zNope"]}
+                                                      everything test-blind-fn test-decrypt-fn)])
+                              (.then (fn [results]
+                                       (let [[eavt-alice avet-point avet-attr avet-limit eavt-missing avet-missing]
+                                             (js->clj results)]
+                                         (testing "cold :eavt [e] equals the hot filter (the getBackup query)"
+                                           (is (= (set (eng/datoms db {:index :eavt :components ["keybackup/zAlice"]} everything))
+                                                  (set eavt-alice)))
+                                           (is (= 2 (count eavt-alice))))
+                                         (testing "cold :avet [attr value] point lookup returns one datom"
+                                           (is (= [{:e "keybackup/zBob" :a ":aozora.keyBackup/did"
+                                                    :v_edn "\"did:key:zBob\"" :added true}] avet-point)))
+                                         (testing "cold :avet [attr] returns all subjects for the attribute"
+                                           (is (= 2 (count avet-attr))))
+                                         (testing ":limit caps cold rows"
+                                           (is (= 1 (count avet-limit))))
+                                         (testing "missing entity/value → empty"
+                                           (is (= [] eavt-missing))
+                                           (is (= [] avet-missing)))
+                                         (done))))))))))))
+
+     (deftest cold-datoms-visible-is-required
+       ;; Cross-platform note: cljs does NOT throw an arity error for a
+       ;; single-fixed-arity fn called with too few args (JS's own permissive
+       ;; calling convention just binds the missing params `undefined`,
+       ;; unlike JVM Clojure's IFn, which always arity-checks) -- so the JVM
+       ;; test's arity-mismatch trick doesn't carry over as-is. What DOES
+       ;; carry over: passing `nil` for `visible?` (full arity otherwise) and
+       ;; letting `(filter nil rows)` itself throw when actually invoked --
+       ;; the real "no permissive default" guarantee, exercised through USE
+       ;; rather than an arity probe. Since `cold-datoms` is Promise-returning
+       ;; on cljs, that throw surfaces as a REJECTED promise, not a
+       ;; synchronous `thrown?`.
+       (async done
+         (let [{:keys [put! get-fn]} (mem-store)
+               db (eng/transact (eng/empty-db) [["alice" "role" "admin"]])]
+           (-> (eng/snapshot! put! get-fn db nil test-blind-fn test-encrypt-fn)
+               (.then (fn [chain-cid]
+                        (let [snap (eng/latest-snapshot-cid get-fn chain-cid)]
+                          (-> (eng/cold-datoms get-fn snap nil nil test-blind-fn test-decrypt-fn)
+                              (.then (fn [_] (is false "expected cold-datoms to reject when visible? is nil"))
+                                     (fn [_err] (is true "cold-datoms requires an explicit visibility decision -- no permissive default")))
+                              (.then (fn [_] (done)))))))))))
+
+     (deftest cold-datoms-visible-filters-rows
+       (async done
+         (let [{:keys [put! get-fn]} (mem-store)
+               db (eng/transact (eng/empty-db)
+                                 [["alice" "role" "admin"] ["bob" "role" "user"]])
+               alice-only (fn [{:keys [e]}] (= "alice" e))]
+           (-> (eng/snapshot! put! get-fn db nil test-blind-fn test-encrypt-fn)
+               (.then (fn [chain-cid]
+                        (let [snap (eng/latest-snapshot-cid get-fn chain-cid)]
+                          (-> (eng/cold-datoms get-fn snap nil alice-only test-blind-fn test-decrypt-fn)
+                              (.then (fn [rows]
+                                       (is (= [{:e "alice" :a "role" :v_edn "\"admin\"" :added true}] rows)
+                                           "visible? actually excludes rows read cold from the snapshot")
+                                       (done)))))))))))
+
+     (deftest hydrate-db-roundtrips-the-whole-db
+       (async done
+         (let [{:keys [put! get-fn]} (mem-store)
+               everything (constantly true)
+               db0 (eng/transact (eng/empty-db)
+                                  [["alice" "role" "admin"] ["alice" "name" "Alice"]
+                                   ["bob" "role" "user"]])]
+           (-> (eng/snapshot! put! get-fn db0 nil test-blind-fn test-encrypt-fn)
+               (.then (fn [c0]
+                        (let [s0 (eng/latest-snapshot-cid get-fn c0)]
+                          (-> (eng/hydrate-db get-fn s0 test-blind-fn test-decrypt-fn)
+                              (.then (fn [db1]
+                                       (is (= (set (eng/datoms db0 everything)) (set (eng/datoms db1 everything)))
+                                           "hydrated db == original")
+                                       (let [db2 (eng/transact db1 [["carol" "role" "guest"]])]
+                                         (-> (eng/snapshot! put! get-fn db2 c0 test-blind-fn test-encrypt-fn)
+                                             (.then (fn [c1]
+                                                      (let [s1 (eng/latest-snapshot-cid get-fn c1)]
+                                                        (-> (js/Promise.all
+                                                             #js [(eng/cold-datoms get-fn s1 {:index :aevt :components ["role"]} everything
+                                                                                    test-blind-fn test-decrypt-fn)
+                                                                  (eng/cold-datoms get-fn s1 {:index :avet :components ["role" "guest"]} everything
+                                                                                    test-blind-fn test-decrypt-fn)
+                                                                  (eng/hydrate-db get-fn nil test-blind-fn test-decrypt-fn)])
+                                                            (.then (fn [results]
+                                                                     (let [[role-rows guest-rows empty-db] (js->clj results)]
+                                                                       (testing "hydrate → assert → commit is a clean incremental write"
+                                                                         (is (= 3 (count role-rows)))
+                                                                         (is (= [{:e "carol" :a "role" :v_edn "\"guest\"" :added true}]
+                                                                                guest-rows)))
+                                                                       (testing "nil snapshot → empty db"
+                                                                         (is (= [] (eng/datoms empty-db everything))))
+                                                                       (done))))))))))))))))))))
+
+     (deftest commit-snapshots-are-content-addressed-and-deterministic
+       (async done
+         (let [db (eng/transact (eng/empty-db) [{:s "alice" :p "role" :o "admin"}])
+               {:keys [put! get-fn]} (mem-store)
+               {put2! :put! get-fn2 :get-fn} (mem-store)]
+           (-> (js/Promise.all
+                #js [(eng/snapshot! put! get-fn db nil test-blind-fn test-encrypt-fn)
+                     (eng/snapshot! put2! get-fn2 db nil test-blind-fn test-encrypt-fn)])
+               (.then (fn [results]
+                        (let [[c1 c2] (js->clj results)
+                              a (:state (eng/head get-fn c1))
+                              b (:state (eng/head get-fn2 c2))]
+                          (testing "committing the identical db content twice, from two independent
+                                    chains/stores, yields the same snapshot CID -- arrangement's own
+                                    content-addressing guarantee (preserved through encryption because
+                                    test-encrypt-fn's nonce is content-derived, not random), exercised
+                                    end to end through this namespace's snapshot! composition"
+                            (is (= a b)))
+                          (done))))))))
+
+     (deftest chain-tracks-multiple-snapshots
+       (async done
+         (let [{:keys [put! get-fn]} (mem-store)
+               db1 (eng/transact (eng/empty-db) [{:s "alice" :p "role" :o "admin"}])
+               db2 (eng/transact db1 [{:s "bob" :p "role" :o "user"}])]
+           (-> (eng/snapshot! put! get-fn db1 nil test-blind-fn test-encrypt-fn)
+               (.then (fn [c0]
+                        (-> (eng/snapshot! put! get-fn db2 c0 test-blind-fn test-encrypt-fn)
+                            (.then (fn [c1]
+                                     (let [history (eng/chain get-fn c1)]
+                                       (is (= 2 (count history)))
+                                       (is (= [0 1] (map :seq history)))
+                                       (is (not= (:state (first history)) (:state (second history)))
+                                           "different db content -> different snapshot CID")
+                                       (is (= (eng/latest-snapshot-cid get-fn c1)
+                                              (ipld/link-cid (get (:state (last history)) "indexed")))
+                                           "chain state is {\"indexed\" Link \"novelty\" []} wrapping the snapshot CID")
+                                       (is (true? (eng/verify-chain get-fn c1)))
+                                       (done)))))))))))
+
+     (deftest verify-chain-catches-a-store-that-lies
+       (async done
+         (let [{:keys [put! get-fn store]} (mem-store)
+               db (eng/transact (eng/empty-db) [{:s "alice" :p "role" :o "admin"}])]
+           (-> (eng/snapshot! put! get-fn db nil test-blind-fn test-encrypt-fn)
+               (.then (fn [c0]
+                        (let [db2 (eng/transact db [{:s "bob" :p "role" :o "user"}])]
+                          (-> (js/Promise.all
+                               #js [(eng/snapshot! put! get-fn db2 c0 test-blind-fn test-encrypt-fn)
+                                    (eng/snapshot! put! get-fn (eng/transact (eng/empty-db)
+                                                                             [{:s "mallory" :p "role" :o "evil"}])
+                                                   nil test-blind-fn test-encrypt-fn)])
+                              (.then (fn [results]
+                                       (let [[c1 other-cid] (js->clj results)]
+                                         (is (true? (eng/verify-chain get-fn c1)))
+                                         ;; splice a DIFFERENT (but validly dag-cbor-encoded) commit's
+                                         ;; bytes under c0's own cid key -- a dishonest/corrupted store,
+                                         ;; without changing c0 itself. verify-chain must catch this via
+                                         ;; CID re-derivation, not throw.
+                                         (swap! store assoc c0 (get @store other-cid))
+                                         (is (false? (eng/verify-chain get-fn c1)))
+                                         (done))))))))))))
+
+     (deftest commit-bang-appends-novelty-without-touching-snapshot
+       (async done
+         (let [{:keys [put! get-fn]} (mem-store)]
+           (-> (eng/commit! put! get-fn [{:s "alice" :p "role" :o "admin"}] nil test-encrypt-fn)
+               (.then (fn [c0]
+                        (testing "commit! on a fresh chain writes ONLY novelty -- nothing folded yet"
+                          (is (= 1 (eng/novelty-size get-fn c0)))
+                          (is (nil? (eng/latest-snapshot-cid get-fn c0))
+                              "nothing folded yet -- an all-novelty chain has no indexed snapshot")
+                          (-> (eng/hot-datoms get-fn c0 (constantly true) test-blind-fn test-decrypt-fn)
+                              (.then (fn [rows]
+                                       (is (= [{:e "alice" :a "role" :v_edn "\"admin\"" :added true}] rows)
+                                           "hot-datoms still sees the data via novelty merge")
+                                       (done)))))))))))
+
+     (deftest commit-bang-multiple-writes-accumulate-novelty
+       (async done
+         (let [{:keys [put! get-fn]} (mem-store)]
+           (-> (eng/commit! put! get-fn [{:s "alice" :p "role" :o "admin"}] nil test-encrypt-fn)
+               (.then (fn [c0] (eng/commit! put! get-fn [{:s "bob" :p "role" :o "user"}] c0 test-encrypt-fn)))
+               (.then (fn [c1] (eng/commit! put! get-fn [{:s "carol" :p "role" :o "guest"}] c1 test-encrypt-fn)))
+               (.then (fn [c2]
+                        (is (= 3 (eng/novelty-size get-fn c2)))
+                        (is (= [0 1 2] (map :seq (eng/chain get-fn c2))))
+                        (-> (eng/hot-datoms get-fn c2 (constantly true) test-blind-fn test-decrypt-fn)
+                            (.then (fn [rows]
+                                     (is (= #{{:e "alice" :a "role" :v_edn "\"admin\"" :added true}
+                                              {:e "bob" :a "role" :v_edn "\"user\"" :added true}
+                                              {:e "carol" :a "role" :v_edn "\"guest\"" :added true}}
+                                            (set rows))
+                                         "no loss/dup across three sequential novelty-append commits")
+                                     (done))))))))))
+
+     (deftest hot-datoms-merges-indexed-and-novelty
+       (async done
+         (let [{:keys [put! get-fn]} (mem-store)
+               everything (constantly true)]
+           (-> (eng/commit! put! get-fn [{:s "alice" :p "role" :o "admin"}] nil test-encrypt-fn)
+               (.then (fn [c0] (eng/commit! put! get-fn [{:s "bob" :p "role" :o "user"}] c0 test-encrypt-fn)))
+               (.then (fn [c1] (eng/fold! put! get-fn c1 test-blind-fn test-encrypt-fn test-decrypt-fn)))
+               (.then (fn [folded]
+                        (-> (eng/commit! put! get-fn [{:s "carol" :p "role" :o "guest"}] folded test-encrypt-fn)
+                            (.then (fn [c2]
+                                     (is (some? (eng/latest-snapshot-cid get-fn c2)) "folded snapshot carries forward")
+                                     (is (= 1 (eng/novelty-size get-fn c2)) "only the post-fold write is novelty")
+                                     (-> (js/Promise.all
+                                          #js [(eng/hot-datoms get-fn c2 everything test-blind-fn test-decrypt-fn)
+                                               (eng/hot-datoms get-fn c2 {:index :eavt :components ["carol"]} everything
+                                                               test-blind-fn test-decrypt-fn)
+                                               (eng/hot-datoms get-fn c2 {:index :eavt :components ["alice"]} everything
+                                                               test-blind-fn test-decrypt-fn)])
+                                         (.then (fn [results]
+                                                  (let [[all-rows carol-rows alice-rows] (js->clj results)]
+                                                    (is (= #{{:e "alice" :a "role" :v_edn "\"admin\"" :added true}
+                                                             {:e "bob" :a "role" :v_edn "\"user\"" :added true}
+                                                             {:e "carol" :a "role" :v_edn "\"guest\"" :added true}}
+                                                           (set all-rows))
+                                                        "reads see both the folded-in history AND the fresh novelty")
+                                                    (testing "filtered hot-datoms honors opts across the snapshot/novelty split"
+                                                      (is (= [{:e "carol" :a "role" :v_edn "\"guest\"" :added true}] carol-rows))
+                                                      (is (= [{:e "alice" :a "role" :v_edn "\"admin\"" :added true}] alice-rows)))
+                                                    (done))))))))))))))
+
+     (deftest hot-datoms-visible-is-required
+       ;; multi-arity (2-arg / 3-arg), so cljs DOES arity-check this one
+       ;; correctly (unlike cold-datoms's single-fixed-arity case above) --
+       ;; kept non-empty anyway for consistency with the rest of this suite.
+       (async done
+         (let [{:keys [put! get-fn]} (mem-store)]
+           (-> (eng/commit! put! get-fn [{:s "alice" :p "role" :o "admin"}] nil test-encrypt-fn)
+               (.then (fn [c0]
+                        (is (thrown? js/Error (eng/hot-datoms get-fn c0))
+                            "hot-datoms requires an explicit visibility decision -- no permissive default")
+                        (done)))))))
+
+     (deftest hot-datoms-visible-filters-rows
+       ;; alice+bob are folded into the indexed snapshot (cold half); carol is
+       ;; committed AFTER the fold, so she's pure novelty (hot half). A visible?
+       ;; that excludes one entity from EACH half proves visible? reaches both
+       ;; composed paths, not just one.
+       (async done
+         (let [{:keys [put! get-fn]} (mem-store)
+               alice-only (fn [{:keys [e]}] (= "alice" e))]
+           (-> (eng/commit! put! get-fn [{:s "alice" :p "role" :o "admin"}] nil test-encrypt-fn)
+               (.then (fn [c0] (eng/commit! put! get-fn [{:s "bob" :p "role" :o "user"}] c0 test-encrypt-fn)))
+               (.then (fn [c1] (eng/fold! put! get-fn c1 test-blind-fn test-encrypt-fn test-decrypt-fn)))
+               (.then (fn [folded] (eng/commit! put! get-fn [{:s "carol" :p "role" :o "guest"}] folded test-encrypt-fn)))
+               (.then (fn [c2] (eng/hot-datoms get-fn c2 alice-only test-blind-fn test-decrypt-fn)))
+               (.then (fn [rows]
+                        (is (= #{{:e "alice" :a "role" :v_edn "\"admin\"" :added true}} (set rows))
+                            "visible? excludes bob (cold/snapshot half) AND carol (hot/novelty half)")
+                        (done)))))))
+
+     (deftest fold-bang-compacts-novelty-and-preserves-data
+       (async done
+         (let [{:keys [put! get-fn]} (mem-store)
+               everything (constantly true)]
+           (-> (eng/commit! put! get-fn [{:s "alice" :p "role" :o "admin"}] nil test-encrypt-fn)
+               (.then (fn [c0] (eng/commit! put! get-fn [{:s "bob" :p "role" :o "user"}] c0 test-encrypt-fn)))
+               (.then (fn [c1]
+                        (-> (eng/hot-datoms get-fn c1 everything test-blind-fn test-decrypt-fn)
+                            (.then (fn [before-rows]
+                                     (-> (eng/fold! put! get-fn c1 test-blind-fn test-encrypt-fn test-decrypt-fn)
+                                         (.then (fn [folded]
+                                                  (is (= 0 (eng/novelty-size get-fn folded)) "fold resets the tail")
+                                                  (is (some? (eng/latest-snapshot-cid get-fn folded)))
+                                                  (-> (js/Promise.all
+                                                       #js [(eng/hot-datoms get-fn folded everything test-blind-fn test-decrypt-fn)
+                                                            (eng/cold-datoms get-fn (eng/latest-snapshot-cid get-fn folded) nil everything
+                                                                             test-blind-fn test-decrypt-fn)])
+                                                      (.then (fn [results]
+                                                               (let [[after-rows cold-rows] (js->clj results)
+                                                                     before (set before-rows)]
+                                                                 (is (= before (set after-rows))
+                                                                     "folding never loses or duplicates data")
+                                                                 (is (= before (set cold-rows))
+                                                                     "the fold really did index the data -- a cold-only read (no novelty) sees it")
+                                                                 (done)))))))))))))))))
+
+     (deftest fold-bang-is-deterministic-across-independent-stores
+       ;; folding the identical (indexed, novelty) history from two independent
+       ;; stores yields the same snapshot CID -- content-addressing holds
+       ;; through the fold (preserved through encryption by test-encrypt-fn's
+       ;; content-derived, not random, nonce), so concurrent/redundant folds
+       ;; converge safely
+       (async done
+         (letfn [(mk-fold []
+                   (let [{:keys [put! get-fn]} (mem-store)]
+                     (-> (eng/commit! put! get-fn [{:s "alice" :p "role" :o "admin"}] nil test-encrypt-fn)
+                         (.then (fn [c0] (eng/commit! put! get-fn [{:s "bob" :p "role" :o "user"}] c0 test-encrypt-fn)))
+                         (.then (fn [c1] (eng/fold! put! get-fn c1 test-blind-fn test-encrypt-fn test-decrypt-fn)))
+                         (.then (fn [folded] (eng/latest-snapshot-cid get-fn folded))))))]
+           (-> (js/Promise.all #js [(mk-fold) (mk-fold)])
+               (.then (fn [results]
+                        (let [[cid1 cid2] (js->clj results)]
+                          (is (= cid1 cid2))
+                          (done))))))))
+
+     (deftest should-fold-flags-at-threshold
+       (async done
+         (let [{:keys [put! get-fn]} (mem-store)]
+           (-> (eng/commit! put! get-fn [{:s "alice" :p "role" :o "admin"}] nil test-encrypt-fn)
+               (.then (fn [c0] (eng/commit! put! get-fn [{:s "bob" :p "role" :o "user"}] c0 test-encrypt-fn)))
+               (.then (fn [c1]
+                        (is (false? (eng/should-fold? get-fn c1 3)))
+                        (is (true? (eng/should-fold? get-fn c1 2)))
+                        (is (false? (eng/should-fold? get-fn c1)) "default threshold is well above 2")
+                        (done)))))))
+
+     (deftest normalize-state-reads-pre-d1-bare-link-chains
+       ;; a chain committed by the pre-D1 code (state = a bare snapshot Link,
+       ;; no {indexed novelty} wrapper) still reads correctly under the new
+       ;; code -- zero migration step for already-deployed actors
+       (async done
+         (let [{:keys [put! get-fn]} (mem-store)
+               everything (constantly true)
+               db (eng/transact (eng/empty-db) [{:s "alice" :p "role" :o "admin"}])]
+           (-> (qs/commit! put! db nil qs/current-schema-version test-blind-fn test-encrypt-fn)
+               (.then (fn [snap-cid]
+                        (let [pre-d1-chain (cd/commit! put! get-fn (ipld/link snap-cid) nil)]
+                          (is (= snap-cid (eng/latest-snapshot-cid get-fn pre-d1-chain)))
+                          (is (= 0 (eng/novelty-size get-fn pre-d1-chain)))
+                          (-> (eng/hot-datoms get-fn pre-d1-chain everything test-blind-fn test-decrypt-fn)
+                              (.then (fn [rows]
+                                       (is (= (set (eng/datoms db everything)) (set rows)))
+                                       (-> (eng/commit! put! get-fn [{:s "bob" :p "role" :o "user"}] pre-d1-chain test-encrypt-fn)
+                                           (.then (fn [c1]
+                                                    (is (= 1 (eng/novelty-size get-fn c1)))
+                                                    (-> (eng/hot-datoms get-fn c1 everything test-blind-fn test-decrypt-fn)
+                                                        (.then (fn [rows2]
+                                                                 (testing "committing new novelty on top of a pre-D1 chain works (mixed-era chain)"
+                                                                   (is (= (conj (set (eng/datoms db everything))
+                                                                                {:e "bob" :a "role" :v_edn "\"user\"" :added true})
+                                                                          (set rows2))))
+                                                                 (done)))))))))))))))))
+
+     (deftest link-ref-survives-fold-and-cold-read
+       ;; a Link-valued datom, folded into a persisted snapshot and read back
+       ;; cold, is still a real Link -- and refs/refs-to still finds it on the
+       ;; rehydrated hot db (the full novelty -> fold -> cold-read round trip)
+       (async done
+         (let [{:keys [put! get-fn]} (mem-store)]
+           (-> (eng/commit! put! get-fn [{:s "alice" :p "knows" :o bob-link}] nil test-encrypt-fn)
+               (.then (fn [c0]
+                        (-> (eng/fold! put! get-fn c0 test-blind-fn test-encrypt-fn test-decrypt-fn)
+                            (.then (fn [folded]
+                                     (let [snap (eng/latest-snapshot-cid get-fn folded)]
+                                       (-> (js/Promise.all
+                                            #js [(eng/cold-datoms get-fn snap {:index :eavt :components ["alice"]} (constantly true)
+                                                                   test-blind-fn test-decrypt-fn)
+                                                 (eng/hydrate-db get-fn snap test-blind-fn test-decrypt-fn)
+                                                 (eng/hot-datoms get-fn c0 (constantly true) test-blind-fn test-decrypt-fn)
+                                                 (eng/cold-datoms get-fn snap nil (constantly true) test-blind-fn test-decrypt-fn)])
+                                           (.then (fn [results]
+                                                    (let [[cold-rows db hot-rows cold-rows-2] (js->clj results)
+                                                          row (first cold-rows)]
+                                                      (testing "cold-datoms reconstructs the Link (not the raw edn-safe vector)"
+                                                        (is (= "[\"ipld/link\" \"bafyreiaakutsdtndrl7e7emcmkp5hjsaaq2vu6prfelbgaglprvtdon63m\"]"
+                                                               (:v_edn row))))
+                                                      (testing "hydrate-db reconstructs a real Link, so refs-to finds it again"
+                                                        (is (= {"knows" #{"alice"}} (qs/refs-to db bob-link))))
+                                                      (testing "hot-datoms (novelty path, via dag-cbor) agrees with the cold path"
+                                                        (is (= (set hot-rows) (set cold-rows-2))))
+                                                      (done)))))))))))))))))

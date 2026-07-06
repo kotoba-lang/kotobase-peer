@@ -12,7 +12,7 @@
  ;; representation (kotoba : kotobase = Clojure : Datomic, ADR-2607032500).
  :deps {;; formerly two deps here (kqe + quad-store) -- kqe merged into
         ;; arrangement (ADR-2607050700), so this is the one coordinate now.
-        io.github.kotoba-lang/arrangement {:git/sha "620e1a4354245b721479d32e681950b0c70971c9"}
+        io.github.kotoba-lang/arrangement {:git/sha "1c2a67725c178ecc4f2c6413e990b81c6164dede"}
         io.github.kotoba-lang/chain {:git/sha "60eafc3346d600b5f3d3ffd24022864841ab44ae"}
         io.github.kotoba-lang/datom      {:git/sha "d27a5833d59d909367956705f2ec931399c891ee"}}
  :aliases

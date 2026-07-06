@@ -46,6 +46,24 @@
             [chain.core :as cd]
             [datom.core :as dc]))   ; canonical datom model (kotoba : kotobase = Clojure : Datomic)
 
+;; ── platform split for the crypto-touching functions below (ADR-2607051000
+;; Worker addendum): `blind-fn`/`encrypt-fn`/`decrypt-fn` are synchronous on
+;; JVM, `js/Promise`-returning on cljs (Web Crypto's `crypto.subtle` has no
+;; synchronous AEAD/HMAC primitive — see `arrangement.core`'s identical
+;; platform-contract note, which this repo's crypto-touching fns inherit).
+;; `put!`/`get-fn` stay synchronous, unchanged, on both platforms — only the
+;; crypto step is async, resolved before any (still-synchronous) tree/chain
+;; write. Every fn below that touches `blind-fn`/`encrypt-fn`/`decrypt-fn`
+;; therefore returns its result directly on JVM, a `js/Promise` of it on
+;; cljs — this file's own sibling of `arrangement.core`'s split.
+#?(:cljs
+   (defn- pmap-async
+     "cljs only: map `f` (returns a `js/Promise`) over `coll` concurrently,
+     return one `js/Promise` of the resolved results, order-preserved."
+     [f coll]
+     (-> (js/Promise.all (into-array (map f coll)))
+         (.then (fn [arr] (vec arr))))))
+
 (defn empty-db [] (qs/empty-db))
 
 (defn- ->quad-value
@@ -242,12 +260,21 @@
 
    `blind-fn`/`encrypt-fn` (ADR-2607051000, accepted 2026-07-06) are REQUIRED
    and threaded straight to `arrangement.core/commit!` -- see its docstring
-   for their contract."
+   for their contract, including the sync-JVM/Promise-cljs platform split
+   this fn inherits (`arrangement.core/commit!` is itself a `js/Promise` on
+   cljs; `cd/commit!` below is unaffected/synchronous on both platforms)."
   [put! get-fn db prev-chain-cid blind-fn encrypt-fn]
-  (let [snapshot-cid (qs/commit! put! db nil qs/current-schema-version blind-fn encrypt-fn)]
-    (cd/commit! put! get-fn
-                {"indexed" (ipld/link snapshot-cid) "novelty" []}
-                prev-chain-cid)))
+  #?(:clj
+     (let [snapshot-cid (qs/commit! put! db nil qs/current-schema-version blind-fn encrypt-fn)]
+       (cd/commit! put! get-fn
+                   {"indexed" (ipld/link snapshot-cid) "novelty" []}
+                   prev-chain-cid))
+     :cljs
+     (-> (qs/commit! put! db nil qs/current-schema-version blind-fn encrypt-fn)
+         (.then (fn [snapshot-cid]
+                  (cd/commit! put! get-fn
+                              {"indexed" (ipld/link snapshot-cid) "novelty" []}
+                              prev-chain-cid))))))
 
 (defn- normalize-state [state]
   (cond
@@ -276,17 +303,25 @@
   "ADR-2607051000 (accepted 2026-07-06): the novelty tx block's whole quad
   payload is encrypted as one opaque ciphertext blob (`encrypt-fn`, REQUIRED,
   no silent default) -- `read-tx-block` is whole-block reads only, never a
-  keyed/prefix seek, so there's no blind-index concern here, just AEAD."
+  keyed/prefix seek, so there's no blind-index concern here, just AEAD.
+  Synchronous on JVM, a `js/Promise` of the block CID on cljs (see the
+  platform-split note above)."
   [put! quads encrypt-fn]
-  (ipld/put-node! put! {"ct" (encrypt-fn (ipld/encode {"quads" (mapv quad->wire quads)}))}))
+  #?(:clj (ipld/put-node! put! {"ct" (encrypt-fn (ipld/encode {"quads" (mapv quad->wire quads)}))})
+     :cljs (-> (encrypt-fn (ipld/encode {"quads" (mapv quad->wire quads)}))
+               (.then (fn [ct] (ipld/put-node! put! {"ct" ct}))))))
 
 (defn- read-tx-block
   "Inverse of `put-tx-block!`: decrypt the block's `\"ct\"` ciphertext
   (`decrypt-fn`, REQUIRED) back to the dag-cbor-encoded `{\"quads\" [...]}`
-  node, then decode it as before."
+  node, then decode it as before. Synchronous on JVM, a `js/Promise` of the
+  quads on cljs."
   [get-fn tx-cid decrypt-fn]
-  (let [{:strs [ct]} (ipld/get-node get-fn tx-cid)]
-    (mapv wire->quad (get (ipld/decode (decrypt-fn ct)) "quads"))))
+  #?(:clj (let [{:strs [ct]} (ipld/get-node get-fn tx-cid)]
+            (mapv wire->quad (get (ipld/decode (decrypt-fn ct)) "quads")))
+     :cljs (let [{:strs [ct]} (ipld/get-node get-fn tx-cid)]
+             (-> (decrypt-fn ct)
+                 (.then (fn [pt] (mapv wire->quad (get (ipld/decode pt) "quads"))))))))
 
 (defn commit!
   "THE write path (ADR-2607032430 D1): append `tx-data` as one novelty tx
@@ -305,13 +340,20 @@
 
    `encrypt-fn` (ADR-2607051000, accepted 2026-07-06) is REQUIRED and
    threaded straight to `put-tx-block!` -- see its docstring for the
-   contract."
+   contract, including the sync-JVM/Promise-cljs platform split (`put-tx-
+   block!` is itself a `js/Promise` of the tx CID on cljs)."
   [put! get-fn tx-data prev-chain-cid encrypt-fn]
   (let [quads (mapv ->quad tx-data)
-        state (state-at get-fn prev-chain-cid)
-        tx-cid (put-tx-block! put! quads encrypt-fn)
-        new-state (update state "novelty" (fnil conj []) (ipld/link tx-cid))]
-    (cd/commit! put! get-fn new-state prev-chain-cid)))
+        state (state-at get-fn prev-chain-cid)]
+    #?(:clj
+       (let [tx-cid (put-tx-block! put! quads encrypt-fn)
+             new-state (update state "novelty" (fnil conj []) (ipld/link tx-cid))]
+         (cd/commit! put! get-fn new-state prev-chain-cid))
+       :cljs
+       (-> (put-tx-block! put! quads encrypt-fn)
+           (.then (fn [tx-cid]
+                    (let [new-state (update state "novelty" (fnil conj []) (ipld/link tx-cid))]
+                      (cd/commit! put! get-fn new-state prev-chain-cid))))))))
 
 (defn novelty-size
   "How many not-yet-folded tx blocks sit on `chain-cid`'s current state —
@@ -388,11 +430,20 @@
   bytes to seek on -- unchanged from before in every other respect (still no
   `link->edn` call here, matching this fn's pre-existing behavior for
   Link-valued components, an orthogonal, pre-existing gap this ADR doesn't
-  touch)."
+  touch). Synchronous on JVM (returns the prefix string, or nil for empty
+  `components`); a `js/Promise` of the same on cljs."
   [components blind-fn]
-  (when (seq components)
-    (let [s (pr-str (mapv blind-fn components))]   ; e.g. ["blinded-a" "blinded-b"]
-      (str (subs s 0 (dec (count s))) " "))))      ; drop ] , add the slot separator
+  #?(:clj
+     (when (seq components)
+       (let [s (pr-str (mapv blind-fn components))]   ; e.g. ["blinded-a" "blinded-b"]
+         (str (subs s 0 (dec (count s))) " ")))       ; drop ] , add the slot separator
+     :cljs
+     (if (seq components)
+       (-> (pmap-async blind-fn components)
+           (.then (fn [blinded]
+                    (let [s (pr-str blinded)]
+                      (str (subs s 0 (dec (count s))) " ")))))
+       (js/Promise.resolve nil))))
 
 (defn cold-datoms
   "`datomic.datoms`-shaped rows read DIRECTLY from a persisted snapshot without
@@ -418,23 +469,47 @@
   token and can no longer be read back for the row's actual content (the
   design correction ADR-2607061800/2607061900's addendum made to
   ADR-2607051000's original, incorrect \"no separate value encryption
-  needed\" claim)."
+  needed\" claim). Synchronous on JVM; a `js/Promise` of the rows on cljs
+  (since `components-prefix`/`decrypt-fn` are themselves Promise-returning
+  there — `get-fn`/`pt/scan-prefix` stay synchronous on both platforms)."
   [get-fn snapshot-cid {:keys [index components limit]} visible? blind-fn decrypt-fn]
-  (if (nil? snapshot-cid)
-    []
-    (let [{:keys [root ->eav]} (index-spec (or index :eavt))
-          snap      (ipld/decode (get-fn snapshot-cid))
-          root-cid  (some-> (get-in snap ["index-roots" root]) ipld/link-cid)
-          entries   (if (nil? root-cid)
-                      []
-                      (pt/scan-prefix get-fn root-cid (or (components-prefix components blind-fn) "")))
-          rows      (for [[_ ciphertext] entries
-                          :let [[k1 k2 v3] (ipld/decode (decrypt-fn ciphertext))
-                                [e a v]    (->eav (mapv qs/edn->link [k1 k2 v3]))]]
-                      {:e e :a a :v_edn (v->edn v) :added true})
-          rows      (filter visible? rows)
-          rows      (cond->> rows limit (take limit))]
-      (vec rows))))
+  #?(:clj
+     (if (nil? snapshot-cid)
+       []
+       (let [{:keys [root ->eav]} (index-spec (or index :eavt))
+             snap      (ipld/decode (get-fn snapshot-cid))
+             root-cid  (some-> (get-in snap ["index-roots" root]) ipld/link-cid)
+             entries   (if (nil? root-cid)
+                         []
+                         (pt/scan-prefix get-fn root-cid (or (components-prefix components blind-fn) "")))
+             rows      (for [[_ ciphertext] entries
+                             :let [[k1 k2 v3] (ipld/decode (decrypt-fn ciphertext))
+                                   [e a v]    (->eav (mapv qs/edn->link [k1 k2 v3]))]]
+                         {:e e :a a :v_edn (v->edn v) :added true})
+             rows      (filter visible? rows)
+             rows      (cond->> rows limit (take limit))]
+         (vec rows)))
+     :cljs
+     (if (nil? snapshot-cid)
+       (js/Promise.resolve [])
+       (let [{:keys [root ->eav]} (index-spec (or index :eavt))
+             snap (ipld/decode (get-fn snapshot-cid))
+             root-cid (some-> (get-in snap ["index-roots" root]) ipld/link-cid)]
+         (-> (components-prefix components blind-fn)
+             (.then (fn [prefix]
+                      (let [entries (if (nil? root-cid)
+                                      []
+                                      (pt/scan-prefix get-fn root-cid (or prefix "")))]
+                        (pmap-async (fn [[_ ciphertext]]
+                                      (.then (decrypt-fn ciphertext) ipld/decode))
+                                    entries))))
+             (.then (fn [triples]
+                      (let [rows (for [[k1 k2 v3] triples
+                                       :let [[e a v] (->eav (mapv qs/edn->link [k1 k2 v3]))]]
+                                   {:e e :a a :v_edn (v->edn v) :added true})
+                            rows (filter visible? rows)
+                            rows (cond->> rows limit (take limit))]
+                        (vec rows)))))))))
 
 (defn hydrate-db
   "Rebuild the full hot 4-index `db` from a persisted snapshot. Reads ONE
@@ -456,14 +531,23 @@
 
   `blind-fn`/`decrypt-fn` (ADR-2607051000, accepted 2026-07-06) are REQUIRED
   and threaded straight to `cold-datoms` -- see its docstring for their
-  contract."
+  contract, including the sync-JVM/Promise-cljs platform split (`cold-
+  datoms` is itself a `js/Promise` of the rows on cljs)."
   [get-fn snapshot-cid blind-fn decrypt-fn]
-  (if (nil? snapshot-cid)
-    (qs/empty-db)
-    (reduce (fn [db {:keys [e a v_edn]}]
-              (qs/assert-quad db {:s e :p a :o (qs/edn->link (edn/read-string v_edn))}))
-            (qs/empty-db)
-            (cold-datoms get-fn snapshot-cid {:index :eavt} (constantly true) blind-fn decrypt-fn))))
+  (letfn [(build [rows]
+            (reduce (fn [db {:keys [e a v_edn]}]
+                      (qs/assert-quad db {:s e :p a :o (qs/edn->link (edn/read-string v_edn))}))
+                    (qs/empty-db)
+                    rows))]
+    #?(:clj
+       (if (nil? snapshot-cid)
+         (qs/empty-db)
+         (build (cold-datoms get-fn snapshot-cid {:index :eavt} (constantly true) blind-fn decrypt-fn)))
+       :cljs
+       (if (nil? snapshot-cid)
+         (js/Promise.resolve (qs/empty-db))
+         (-> (cold-datoms get-fn snapshot-cid {:index :eavt} (constantly true) blind-fn decrypt-fn)
+             (.then build))))))
 
 (defn hot-datoms
   "THE scale-safe read path (ADR-2607032430 D1): `datoms`-shaped rows as of
@@ -487,17 +571,32 @@
   `blind-fn`/`decrypt-fn` (ADR-2607051000, accepted 2026-07-06) are REQUIRED:
   `blind-fn`/`decrypt-fn` go to `cold-datoms` (the snapshot half);
   `decrypt-fn` also goes to `read-tx-block` (the novelty half, whole-block
-  decrypt, no blinding needed there)."
+  decrypt, no blinding needed there). Synchronous on JVM; a `js/Promise` of
+  the rows on cljs (the snapshot and novelty halves resolve concurrently
+  there, via `js/Promise.all`, since they're independent)."
   ([get-fn chain-cid visible? blind-fn decrypt-fn]
    (hot-datoms get-fn chain-cid nil visible? blind-fn decrypt-fn))
   ([get-fn chain-cid opts visible? blind-fn decrypt-fn]
-   (if (nil? chain-cid)
-     []
-     (let [state (state-at get-fn chain-cid)
-           snap-rows (cold-datoms get-fn (indexed-cid state) opts visible? blind-fn decrypt-fn)
-           novelty-quads (mapcat #(read-tx-block get-fn % decrypt-fn) (novelty-cids state))
-           novelty-rows (datoms (reduce qs/assert-quad (qs/empty-db) novelty-quads) opts visible?)]
-       (vec (concat snap-rows novelty-rows))))))
+   #?(:clj
+      (if (nil? chain-cid)
+        []
+        (let [state (state-at get-fn chain-cid)
+              snap-rows (cold-datoms get-fn (indexed-cid state) opts visible? blind-fn decrypt-fn)
+              novelty-quads (mapcat #(read-tx-block get-fn % decrypt-fn) (novelty-cids state))
+              novelty-rows (datoms (reduce qs/assert-quad (qs/empty-db) novelty-quads) opts visible?)]
+          (vec (concat snap-rows novelty-rows))))
+      :cljs
+      (if (nil? chain-cid)
+        (js/Promise.resolve [])
+        (let [state (state-at get-fn chain-cid)]
+          (-> (js/Promise.all
+               #js [(cold-datoms get-fn (indexed-cid state) opts visible? blind-fn decrypt-fn)
+                    (pmap-async (fn [cid] (read-tx-block get-fn cid decrypt-fn)) (novelty-cids state))])
+              (.then (fn [results]
+                       (let [[snap-rows novelty-quads-per-cid] (js->clj results)
+                             novelty-quads (apply concat novelty-quads-per-cid)
+                             novelty-rows (datoms (reduce qs/assert-quad (qs/empty-db) novelty-quads) opts visible?)]
+                         (vec (concat snap-rows novelty-rows)))))))))))
 
 (defn fold!
   "Compact `chain-cid`'s novelty into a fresh indexed snapshot: hydrate the
@@ -524,18 +623,34 @@
 
   `blind-fn`/`encrypt-fn`/`decrypt-fn` are REQUIRED and threaded to
   `hydrate-db` (blind-fn, decrypt-fn), `read-tx-block` (decrypt-fn), and
-  `arrangement.core/commit!` (blind-fn, encrypt-fn)."
+  `arrangement.core/commit!` (blind-fn, encrypt-fn). Synchronous on JVM; a
+  `js/Promise` of the new chain CID on cljs (the novelty-quads read and the
+  snapshot hydrate resolve concurrently there, via `js/Promise.all`, since
+  they're independent)."
   ([put! get-fn chain-cid blind-fn encrypt-fn decrypt-fn]
    (fold! put! get-fn chain-cid ipld/link? blind-fn encrypt-fn decrypt-fn))
   ([put! get-fn chain-cid ref? blind-fn encrypt-fn decrypt-fn]
-   (let [state (state-at get-fn chain-cid)
-         novelty-quads (mapcat #(read-tx-block get-fn % decrypt-fn) (novelty-cids state))
-         db (reduce (fn [db q] (qs/assert-quad db q ref?))
-                    (hydrate-db get-fn (indexed-cid state) blind-fn decrypt-fn)
-                    novelty-quads)
-         new-snap-cid (qs/commit! put! db nil qs/current-schema-version blind-fn encrypt-fn)
-         new-state {"indexed" (ipld/link new-snap-cid) "novelty" []}]
-     (cd/commit! put! get-fn new-state chain-cid))))
+   (let [state (state-at get-fn chain-cid)]
+     #?(:clj
+        (let [novelty-quads (mapcat #(read-tx-block get-fn % decrypt-fn) (novelty-cids state))
+              db (reduce (fn [db q] (qs/assert-quad db q ref?))
+                         (hydrate-db get-fn (indexed-cid state) blind-fn decrypt-fn)
+                         novelty-quads)
+              new-snap-cid (qs/commit! put! db nil qs/current-schema-version blind-fn encrypt-fn)
+              new-state {"indexed" (ipld/link new-snap-cid) "novelty" []}]
+          (cd/commit! put! get-fn new-state chain-cid))
+        :cljs
+        (-> (js/Promise.all
+             #js [(pmap-async (fn [cid] (read-tx-block get-fn cid decrypt-fn)) (novelty-cids state))
+                  (hydrate-db get-fn (indexed-cid state) blind-fn decrypt-fn)])
+            (.then (fn [results]
+                     (let [[novelty-quads-per-cid hydrated-db] (js->clj results)
+                           novelty-quads (apply concat novelty-quads-per-cid)
+                           db (reduce (fn [db q] (qs/assert-quad db q ref?)) hydrated-db novelty-quads)]
+                       (qs/commit! put! db nil qs/current-schema-version blind-fn encrypt-fn))))
+            (.then (fn [new-snap-cid]
+                     (let [new-state {"indexed" (ipld/link new-snap-cid) "novelty" []}]
+                       (cd/commit! put! get-fn new-state chain-cid)))))))))
 
 (defn verify-chain
   "True iff the chain rooted at `chain-cid` is untampered and its
