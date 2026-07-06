@@ -238,9 +238,13 @@
    rebuild the pre-D1 `commit!` did on every write; it now exists only as a
    primitive `fold!` calls internally, plus a one-shot cold-start entry point
    for callers that already have a fully materialized hot `db` (backfill /
-   migration tooling, tests). Most write paths want `commit!`, below."
-  [put! get-fn db prev-chain-cid]
-  (let [snapshot-cid (qs/commit! put! db nil qs/current-schema-version)]
+   migration tooling, tests). Most write paths want `commit!`, below.
+
+   `blind-fn`/`encrypt-fn` (ADR-2607051000, accepted 2026-07-06) are REQUIRED
+   and threaded straight to `arrangement.core/commit!` -- see its docstring
+   for their contract."
+  [put! get-fn db prev-chain-cid blind-fn encrypt-fn]
+  (let [snapshot-cid (qs/commit! put! db nil qs/current-schema-version blind-fn encrypt-fn)]
     (cd/commit! put! get-fn
                 {"indexed" (ipld/link snapshot-cid) "novelty" []}
                 prev-chain-cid)))
@@ -268,11 +272,21 @@
 (defn- quad->wire [{:keys [s p o]}] {"s" s "p" p "o" o})
 (defn- wire->quad [{:strs [s p o]}] {:s s :p p :o o})
 
-(defn- put-tx-block! [put! quads]
-  (ipld/put-node! put! {"quads" (mapv quad->wire quads)}))
+(defn- put-tx-block!
+  "ADR-2607051000 (accepted 2026-07-06): the novelty tx block's whole quad
+  payload is encrypted as one opaque ciphertext blob (`encrypt-fn`, REQUIRED,
+  no silent default) -- `read-tx-block` is whole-block reads only, never a
+  keyed/prefix seek, so there's no blind-index concern here, just AEAD."
+  [put! quads encrypt-fn]
+  (ipld/put-node! put! {"ct" (encrypt-fn (ipld/encode {"quads" (mapv quad->wire quads)}))}))
 
-(defn- read-tx-block [get-fn tx-cid]
-  (mapv wire->quad (get (ipld/get-node get-fn tx-cid) "quads")))
+(defn- read-tx-block
+  "Inverse of `put-tx-block!`: decrypt the block's `\"ct\"` ciphertext
+  (`decrypt-fn`, REQUIRED) back to the dag-cbor-encoded `{\"quads\" [...]}`
+  node, then decode it as before."
+  [get-fn tx-cid decrypt-fn]
+  (let [{:strs [ct]} (ipld/get-node get-fn tx-cid)]
+    (mapv wire->quad (get (ipld/decode (decrypt-fn ct)) "quads"))))
 
 (defn commit!
   "THE write path (ADR-2607032430 D1): append `tx-data` as one novelty tx
@@ -287,11 +301,15 @@
    confirmed live 2026-07-03 as the root cause of a CF Worker CPU-limit
    collapse (error 1102) partway through a 321-actor mass write. Call
    `fold!` periodically (see `should-fold?`) to bound novelty size and keep
-   `hot-datoms` reads fast; correctness never depends on folding promptly."
-  [put! get-fn tx-data prev-chain-cid]
+   `hot-datoms` reads fast; correctness never depends on folding promptly.
+
+   `encrypt-fn` (ADR-2607051000, accepted 2026-07-06) is REQUIRED and
+   threaded straight to `put-tx-block!` -- see its docstring for the
+   contract."
+  [put! get-fn tx-data prev-chain-cid encrypt-fn]
   (let [quads (mapv ->quad tx-data)
         state (state-at get-fn prev-chain-cid)
-        tx-cid (put-tx-block! put! quads)
+        tx-cid (put-tx-block! put! quads encrypt-fn)
         new-state (update state "novelty" (fnil conj []) (ipld/link tx-cid))]
     (cd/commit! put! get-fn new-state prev-chain-cid)))
 
@@ -346,8 +364,11 @@
 ;; that matters for scale: a FILTERED read. Instead of rebuilding the whole 4-index
 ;; db (the wasm worker's full-graph rehydrate that OOMs at 128MB), decode the
 ;; snapshot's index-roots, pick the ONE index tree the query needs, and prefix-seek
-;; it by the components. arrangement persists each index as `(pr-str [k1 k2 v]) → true`
-;; leaves (index-root), so a components prefix is a string prefix on that tree.
+;; it by the components. arrangement persists each index as
+;; `(pr-str [blind(k1) blind(k2) blind(v)]) → encrypt([k1 k2 v])` leaves
+;; (index-root, ADR-2607051000 accepted 2026-07-06), so a components prefix
+;; is a blinded string prefix on that tree, and a matched leaf's value must
+;; be decrypted to recover the real triple (the key is one-way, unrecoverable).
 
 ;; index → snapshot key + how its [k1 k2 v] maps back to a datom {:e :a :v}
 (def ^:private index-spec
@@ -358,11 +379,20 @@
 (defn- components-prefix
   "String prefix into a `(pr-str [k1 k2 v])` leaf key for an ordered component
   vector. `[\"a\" \"b\"]` → `[\"a\" \"b\" ` (up to the space before the next
-  slot), so it matches every key whose first components are exactly those."
-  [components]
+  slot), so it matches every key whose first components are exactly those.
+
+  ADR-2607051000 (accepted 2026-07-06): each component is run through
+  `blind-fn` (REQUIRED, the SAME keyed MAC `arrangement.core/index-root` used
+  to build the key) before printing, so a caller who already knows the
+  plaintext component independently re-derives the identical blinded prefix
+  bytes to seek on -- unchanged from before in every other respect (still no
+  `link->edn` call here, matching this fn's pre-existing behavior for
+  Link-valued components, an orthogonal, pre-existing gap this ADR doesn't
+  touch)."
+  [components blind-fn]
   (when (seq components)
-    (let [s (pr-str (vec components))]            ; e.g. ["a" "b"]
-      (str (subs s 0 (dec (count s))) " "))))     ; drop ] , add the slot separator
+    (let [s (pr-str (mapv blind-fn components))]   ; e.g. ["blinded-a" "blinded-b"]
+      (str (subs s 0 (dec (count s))) " "))))      ; drop ] , add the slot separator
 
 (defn cold-datoms
   "`datomic.datoms`-shaped rows read DIRECTLY from a persisted snapshot without
@@ -379,8 +409,17 @@
   `:limit` is taken (so `:limit` caps what the caller actually receives).
   Pass `(constantly true)` to see everything, as an explicit choice. See
   `hydrate-db`, below, for the one internal caller that deliberately must NOT
-  narrow this."
-  [get-fn snapshot-cid {:keys [index components limit]} visible?]
+  narrow this.
+
+  `blind-fn`/`decrypt-fn` (ADR-2607051000, accepted 2026-07-06) are REQUIRED:
+  `blind-fn` re-derives the seek prefix from known `:components` (see
+  `components-prefix`); `decrypt-fn` opens each matched leaf's ENCRYPTED
+  VALUE to recover the real `[k1 k2 v]` triple -- the key is a one-way blind
+  token and can no longer be read back for the row's actual content (the
+  design correction ADR-2607061800/2607061900's addendum made to
+  ADR-2607051000's original, incorrect \"no separate value encryption
+  needed\" claim)."
+  [get-fn snapshot-cid {:keys [index components limit]} visible? blind-fn decrypt-fn]
   (if (nil? snapshot-cid)
     []
     (let [{:keys [root ->eav]} (index-spec (or index :eavt))
@@ -388,9 +427,10 @@
           root-cid  (some-> (get-in snap ["index-roots" root]) ipld/link-cid)
           entries   (if (nil? root-cid)
                       []
-                      (pt/scan-prefix get-fn root-cid (or (components-prefix components) "")))
-          rows      (for [[k _] entries
-                          :let [[e a v] (->eav (mapv qs/edn->link (edn/read-string k)))]]
+                      (pt/scan-prefix get-fn root-cid (or (components-prefix components blind-fn) "")))
+          rows      (for [[_ ciphertext] entries
+                          :let [[k1 k2 v3] (ipld/decode (decrypt-fn ciphertext))
+                                [e a v]    (->eav (mapv qs/edn->link [k1 k2 v3]))]]
                       {:e e :a a :v_edn (v->edn v) :added true})
           rows      (filter visible? rows)
           rows      (cond->> rows limit (take limit))]
@@ -412,14 +452,18 @@
   then commits that db as the new persisted snapshot, a narrowed hydrate
   would bake permanent, silent data loss into the graph. Visibility belongs
   at the read surface (`datoms`/`cold-datoms`/`hot-datoms` called directly
-  for a caller-facing read), never at this internal rehydration step."
-  [get-fn snapshot-cid]
+  for a caller-facing read), never at this internal rehydration step.
+
+  `blind-fn`/`decrypt-fn` (ADR-2607051000, accepted 2026-07-06) are REQUIRED
+  and threaded straight to `cold-datoms` -- see its docstring for their
+  contract."
+  [get-fn snapshot-cid blind-fn decrypt-fn]
   (if (nil? snapshot-cid)
     (qs/empty-db)
     (reduce (fn [db {:keys [e a v_edn]}]
               (qs/assert-quad db {:s e :p a :o (qs/edn->link (edn/read-string v_edn))}))
             (qs/empty-db)
-            (cold-datoms get-fn snapshot-cid {:index :eavt} (constantly true)))))
+            (cold-datoms get-fn snapshot-cid {:index :eavt} (constantly true) blind-fn decrypt-fn))))
 
 (defn hot-datoms
   "THE scale-safe read path (ADR-2607032430 D1): `datoms`-shaped rows as of
@@ -438,14 +482,20 @@
   `datoms` (for the novelty half) — each half is filtered exactly once, by
   its own producer, before the two row seqs are concatenated, so nothing is
   filtered twice and neither path (snapshot or novelty) is missed. Pass
-  `(constantly true)` to see everything, as an explicit choice."
-  ([get-fn chain-cid visible?] (hot-datoms get-fn chain-cid nil visible?))
-  ([get-fn chain-cid opts visible?]
+  `(constantly true)` to see everything, as an explicit choice.
+
+  `blind-fn`/`decrypt-fn` (ADR-2607051000, accepted 2026-07-06) are REQUIRED:
+  `blind-fn`/`decrypt-fn` go to `cold-datoms` (the snapshot half);
+  `decrypt-fn` also goes to `read-tx-block` (the novelty half, whole-block
+  decrypt, no blinding needed there)."
+  ([get-fn chain-cid visible? blind-fn decrypt-fn]
+   (hot-datoms get-fn chain-cid nil visible? blind-fn decrypt-fn))
+  ([get-fn chain-cid opts visible? blind-fn decrypt-fn]
    (if (nil? chain-cid)
      []
      (let [state (state-at get-fn chain-cid)
-           snap-rows (cold-datoms get-fn (indexed-cid state) opts visible?)
-           novelty-quads (mapcat #(read-tx-block get-fn %) (novelty-cids state))
+           snap-rows (cold-datoms get-fn (indexed-cid state) opts visible? blind-fn decrypt-fn)
+           novelty-quads (mapcat #(read-tx-block get-fn % decrypt-fn) (novelty-cids state))
            novelty-rows (datoms (reduce qs/assert-quad (qs/empty-db) novelty-quads) opts visible?)]
        (vec (concat snap-rows novelty-rows))))))
 
@@ -463,15 +513,27 @@
   the identical (indexed, novelty) pair — from ANY writer, a server cron or
   a browser at idle — always produces the same snapshot CID. Concurrent
   folds of the same state are safe, redundant, and cheap (re-`put!`ing
-  already-stored bytes is a no-op at the block-store layer)."
-  ([put! get-fn chain-cid] (fold! put! get-fn chain-cid ipld/link?))
-  ([put! get-fn chain-cid ref?]
+  already-stored bytes is a no-op at the block-store layer). NOTE
+  (ADR-2607051000, accepted 2026-07-06): this determinism now additionally
+  depends on `encrypt-fn` deriving its nonce deterministically from the
+  plaintext rather than randomly -- a random-nonce `encrypt-fn` would make
+  even identical (indexed, novelty) pairs fold to DIFFERENT snapshot CIDs,
+  silently losing the \"cheap redundant fold\" property this paragraph
+  otherwise promises. Callers should supply a deterministic `encrypt-fn`
+  (e.g. nonce = HMAC(nonce-key, plaintext)) if this property matters to them.
+
+  `blind-fn`/`encrypt-fn`/`decrypt-fn` are REQUIRED and threaded to
+  `hydrate-db` (blind-fn, decrypt-fn), `read-tx-block` (decrypt-fn), and
+  `arrangement.core/commit!` (blind-fn, encrypt-fn)."
+  ([put! get-fn chain-cid blind-fn encrypt-fn decrypt-fn]
+   (fold! put! get-fn chain-cid ipld/link? blind-fn encrypt-fn decrypt-fn))
+  ([put! get-fn chain-cid ref? blind-fn encrypt-fn decrypt-fn]
    (let [state (state-at get-fn chain-cid)
-         novelty-quads (mapcat #(read-tx-block get-fn %) (novelty-cids state))
+         novelty-quads (mapcat #(read-tx-block get-fn % decrypt-fn) (novelty-cids state))
          db (reduce (fn [db q] (qs/assert-quad db q ref?))
-                    (hydrate-db get-fn (indexed-cid state))
+                    (hydrate-db get-fn (indexed-cid state) blind-fn decrypt-fn)
                     novelty-quads)
-         new-snap-cid (qs/commit! put! db nil qs/current-schema-version)
+         new-snap-cid (qs/commit! put! db nil qs/current-schema-version blind-fn encrypt-fn)
          new-state {"indexed" (ipld/link new-snap-cid) "novelty" []}]
      (cd/commit! put! get-fn new-state chain-cid))))
 

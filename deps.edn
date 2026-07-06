@@ -12,7 +12,10 @@
  ;; representation (kotoba : kotobase = Clojure : Datomic, ADR-2607032500).
  :deps {;; formerly two deps here (kqe + quad-store) -- kqe merged into
         ;; arrangement (ADR-2607050700), so this is the one coordinate now.
-        io.github.kotoba-lang/arrangement {:git/sha "3633c547c6f5c34872246129d73438978831d559"}
+        ;; TEMP pin to feat/2607051000-ciphertext-over-cid pending PR #1 merge
+        ;; (kotoba-lang/arrangement) -- MUST be updated to that PR's merged
+        ;; main SHA before this repo's own PR lands (see this repo's PR body).
+        io.github.kotoba-lang/arrangement {:git/sha "930fafa8c26392a43c843b9d727b6ec95afee11a"}
         io.github.kotoba-lang/chain {:git/sha "60eafc3346d600b5f3d3ffd24022864841ab44ae"}
         io.github.kotoba-lang/datom      {:git/sha "d27a5833d59d909367956705f2ec931399c891ee"}}
  :aliases
