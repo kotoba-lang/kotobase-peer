@@ -18,6 +18,7 @@ jobs:
         with:
           cli: latest
       - run: clojure -M:test
+      - run: clojure -M:lint
 
   test-cljs:
     name: shadow-cljs node-test (real ClojureScript, not just .cljc-named)

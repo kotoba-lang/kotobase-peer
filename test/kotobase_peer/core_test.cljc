@@ -137,7 +137,7 @@
   ;; be a meaningful cross-platform check.
   (let [db (eng/transact (eng/empty-db) [["alice" "role" "admin"]])]
     (is (thrown? #?(:clj clojure.lang.ArityException :cljs js/Error)
-                 (eng/datoms db))
+                 #_:clj-kondo/ignore (eng/datoms db))
         "datoms requires an explicit visibility decision -- no permissive default")))
 
 (deftest datoms-visible-filters-rows
@@ -238,7 +238,7 @@
            chain-cid (eng/snapshot! put! get-fn db nil test-blind-fn test-encrypt-fn)
            snap (eng/latest-snapshot-cid get-fn chain-cid)]
        (is (thrown? clojure.lang.ArityException
-                    (eng/cold-datoms get-fn snap nil))
+                    #_:clj-kondo/ignore (eng/cold-datoms get-fn snap nil))
            "cold-datoms requires an explicit visibility decision -- no permissive default"))))
 
 #?(:clj
@@ -294,7 +294,7 @@
   ;; all, so the arity mismatch would silently NOT surface.
   (let [db (eng/transact (eng/empty-db) [{:s "alice" :p "role" :o "admin"}])]
     (is (thrown? #?(:clj clojure.lang.ArityException :cljs js/Error)
-                 (eng/q db [nil nil nil]))
+                 #_:clj-kondo/ignore (eng/q db [nil nil nil]))
         "q cascades arrangement.query's required visibility decision -- no permissive default")))
 
 (deftest query-joins-across-clauses
@@ -313,7 +313,7 @@
 (deftest query-visible-is-required
   (let [db (eng/transact (eng/empty-db) [{:s "alice" :p "role" :o "admin"}])]
     (is (thrown? #?(:clj clojure.lang.ArityException :cljs js/Error)
-                 (eng/query db {:find '[?s] :where '[[?s "role" "admin"]]})))))
+                 #_:clj-kondo/ignore (eng/query db {:find '[?s] :where '[[?s "role" "admin"]]})))))
 
 (deftest query-negation-end-to-end
   ;; ADR-2607061200 Stage 2, reachable through kotobase-peer.core/query, not
@@ -844,7 +844,7 @@
      (let [{:keys [put! get-fn]} (mem-store)
            c0 (eng/commit! put! get-fn [{:s "alice" :p "role" :o "admin"}] nil test-encrypt-fn)]
        (is (thrown? clojure.lang.ArityException
-                    (eng/hot-datoms get-fn c0))
+                    #_:clj-kondo/ignore (eng/hot-datoms get-fn c0))
            "hot-datoms requires an explicit visibility decision -- no permissive default"))))
 
 #?(:clj
@@ -1412,7 +1412,7 @@
        (let [{:keys [put! get-fn]} (mem-store)]
          (-> (eng/commit! put! get-fn [{:s "alice" :p "role" :o "admin"}] nil test-encrypt-fn)
              (.then (fn [c0]
-                      (is (thrown? js/Error (eng/hot-datoms get-fn c0))
+                      (is (thrown? js/Error #_:clj-kondo/ignore (eng/hot-datoms get-fn c0))
                           "hot-datoms requires an explicit visibility decision -- no permissive default")
                       (done))))))))
 
