@@ -379,6 +379,24 @@
            (eng/query db {:find '[?y] :where '[(ancestor "alice" ?y)] :rules ancestor-rules} hide-bob-carol))
         "bob->carol is hidden from this caller -- the recursive fixpoint can't derive past bob")))
 
+(deftest query-language-extensions-end-to-end
+  ;; ADR-2607061200 query-language follow-up (:in, function clauses, or),
+  ;; reachable through kotobase-peer.core/query, not just
+  ;; arrangement.datalog/q directly. Built via arrangement.core/assert-quad
+  ;; directly (not eng/transact) to keep :age as a real number -- kotobase-
+  ;; peer.core's own ->quad-value stringifies every non-Link value (a
+  ;; separate, pre-existing, orthogonal limitation this test isn't about).
+  (let [db (-> (qs/empty-db)
+               (qs/assert-quad {:s "alice" :p "age" :o 30})
+               (qs/assert-quad {:s "bob" :p "age" :o 15})
+               (qs/assert-quad {:s "carol" :p "age" :o 45}))
+        everything (constantly true)]
+    (is (= #{["alice"] ["carol"]}
+           (eng/query db {:find '[?s] :in '[?min-age] :where '[[?s "age" ?age] [(> ?age ?min-age)]]}
+                      everything [18])))
+    (is (= #{["alice"] ["carol"]}
+           (eng/query db {:find '[?s] :where '[(or [?s "age" 30] [?s "age" 45])]} everything)))))
+
 (deftest pull-returns-entity-attrs
   (let [db (eng/transact (eng/empty-db) [{:s "alice" :p "role" :o "admin"}
                                           {:s "alice" :p "name" :o "Alice"}])]
@@ -454,9 +472,9 @@
                                 {"role" {:db/valueType :string :db/cardinality :one}
                                  "age"  {:db/valueType :long}
                                  "email" {:db/valueType :string :db/unique :identity}})]
-    (is (= {"role" {:value-type "string" :cardinality "one" :unique nil}
-            "age" {:value-type "long" :cardinality "many" :unique nil}
-            "email" {:value-type "string" :cardinality "many" :unique "identity"}}
+    (is (= {"role" {:value-type "string" :cardinality "one" :unique nil :tuple-types nil}
+            "age" {:value-type "long" :cardinality "many" :unique nil :tuple-types nil}
+            "email" {:value-type "string" :cardinality "many" :unique "identity" :tuple-types nil}}
            (eng/schema-of db)))))
 
 (deftest plain-transact-is-unaffected-by-schema-no-migration-needed
@@ -508,6 +526,71 @@
     (testing "the SAME entity re-asserting its own unique value is not a violation"
       (is (= #{"a@x.com"}
              (get (eng/pull (eng/transact-with-schema db1 [{:s "alice" :p "email" :o "a@x.com"}] {}) "alice") "email"))))))
+
+;; ── value-type extension: uuid/instant/keyword/symbol/bytes/tuple ──────────
+;; (ADR-2607061200 follow-up)
+
+(deftest inline-schema-declaration-actually-validates-not-a-silent-noop
+  ;; regression test for a real bug: passing {:db/valueType ...} directly
+  ;; to transact-with-schema (never pre-installed via install-schema)
+  ;; used to silently skip value-type validation entirely.
+  (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                        #"schema violation"
+                        (eng/transact-with-schema (eng/empty-db)
+                                                  [{:s "bob" :p "age" :o "not-a-number"}]
+                                                  {"age" {:db/valueType :long}}))))
+
+(deftest uuid-value-type
+  (let [db0 (eng/install-schema (eng/empty-db) {"id" {:db/valueType :uuid}})
+        the-id #uuid "0f1e86a9-aa89-414e-8368-d4e95e9fcd4c"]
+    (testing "validates against the ORIGINAL value's type; storage still stringifies (same convention as long/etc.)"
+      (is (= #{(str the-id)} (get (eng/pull (eng/transact-with-schema db0 [{:s "a" :p "id" :o the-id}] {}) "a") "id"))))
+    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                          #"schema violation"
+                          (eng/transact-with-schema db0 [{:s "a" :p "id" :o "not-a-uuid"}] {})))))
+
+(deftest instant-value-type
+  (let [db0 (eng/install-schema (eng/empty-db) {"born" {:db/valueType :instant}})]
+    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                          #"schema violation"
+                          (eng/transact-with-schema db0 [{:s "a" :p "born" :o "not-a-date"}] {})))))
+
+(deftest keyword-and-symbol-value-types
+  (let [db0 (eng/install-schema (eng/empty-db) {"status" {:db/valueType :keyword} "op" {:db/valueType :symbol}})
+        db1 (eng/transact-with-schema db0 [{:s "a" :p "status" :o :active} {:s "a" :p "op" :o 'foo}] {})]
+    (is (= #{(str :active)} (get (eng/pull db1 "a") "status")))
+    (is (= #{(str 'foo)} (get (eng/pull db1 "a") "op")))
+    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                          #"schema violation"
+                          (eng/transact-with-schema db0 [{:s "a" :p "status" :o "active"}] {})))))
+
+(deftest tuple-value-type
+  (let [db0 (eng/install-schema (eng/empty-db)
+                                {"coords" {:db/valueType :tuple :db/tupleTypes [:double :double]}})]
+    (is (= #{(str [1.0 2.0])} (get (eng/pull (eng/transact-with-schema db0 [{:s "a" :p "coords" :o [1.0 2.0]}] {}) "a") "coords")))
+    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                          #"tuple arity mismatch"
+                          (eng/transact-with-schema db0 [{:s "a" :p "coords" :o [1.0 2.0 3.0]}] {})))
+    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                          #"schema violation"
+                          (eng/transact-with-schema db0 [{:s "a" :p "coords" :o [1.0 "not-a-double"]}] {})))))
+
+;; ── entity: lazy navigational entity API (ADR-2607061200 follow-up) ────────
+
+(deftest entity-is-pulls-flat-2-arg-form
+  (let [db (eng/transact (eng/empty-db) [{:s "alice" :p "role" :o "admin"} {:s "alice" :p "name" :o "Alice"}])]
+    (is (= (eng/pull db "alice") (eng/entity db "alice")))))
+
+(deftest entity-attr-navigates-into-a-ref-values-own-entity
+  (let [db (eng/transact (eng/empty-db)
+                          [{:s "alice" :p "name" :o "Alice"}
+                           {:s "bob" :p "manager" :o "alice"}
+                           {:s "bob" :p "name" :o "Bob"}])]
+    (is (= #{{"name" #{"Alice"}}} (eng/entity-attr db (eng/entity db "bob") "manager")))))
+
+(deftest entity-attr-on-a-value-that-was-never-a-subject-is-empty
+  (let [db (eng/transact (eng/empty-db) [{:s "bob" :p "hobby" :o "chess"}])]
+    (is (= #{{}} (eng/entity-attr db (eng/entity db "bob") "hobby")))))
 
 ;; ── tx-report / with (ADR-2607061200 "3 pillars" follow-up) ─────────────────
 

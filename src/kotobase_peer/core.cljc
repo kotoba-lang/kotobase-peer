@@ -125,8 +125,10 @@
   "Meta-schema attributes describing OTHER attributes -- these never need a
   schema entry of their own. Declaring them about some attribute name IS
   how that attribute gets its first schema entry; a database with zero
-  schema installed can still bootstrap its first one."
-  #{"db/valueType" "db/cardinality" "db/unique" "db/doc"})
+  schema installed can still bootstrap its first one. `db/tupleTypes`
+  (ADR-2607061200 value-type follow-up) declares a `:tuple` attribute's
+  fixed per-position value types."
+  #{"db/valueType" "db/cardinality" "db/unique" "db/doc" "db/tupleTypes"})
 
 (defn- raw-triple
   "Like `->quad`, but the `:o`/`v` position is NOT coerced (Link-passthrough
@@ -151,11 +153,26 @@
     :else
     (throw (ex-info "kotobase-peer: unrecognized tx-data item" {:item item}))))
 
+(defn- schema-value->wire
+  "One `install-schema` declaration value -> its wire string. A keyword
+  stores by `name` (`:string` -> \"string\"); `db/tupleTypes`'s vector of
+  per-position types stores comma-joined (`[:string :long]` -> \"string,
+  long\") rather than a stringified EDN vector -- simpler to parse back
+  (`str/split`) than round-tripping through `edn/read-string`, and this
+  substrate's other schema fields are already single plain strings."
+  [v]
+  (cond
+    (vector? v) (str/join "," (map #(if (keyword? %) (name %) (str %)) v))
+    (keyword? v) (name v)
+    :else (str v)))
+
 (defn install-schema
   "Assert schema declarations as ordinary datoms (see the ns section
   comment above): `schema` is `{attr-name {:db/valueType t :db/cardinality
-  c :db/unique u :db/doc \"...\"}}` (each key optional; values may be
-  keywords -- `:string`, `:one`, `:identity`, etc. -- or plain strings).
+  c :db/unique u :db/doc \"...\" :db/tupleTypes [t1 t2 ...]}}` (each key
+  optional; values may be keywords -- `:string`, `:one`, `:identity`,
+  etc. -- or plain strings; `:db/tupleTypes` is a vector of per-position
+  value-types, only meaningful when `:db/valueType` is `:tuple`).
   `db/doc` is purely informational, never validated by `transact-with-
   schema`."
   ([db schema] (install-schema db schema ipld/link?))
@@ -165,28 +182,44 @@
                    [k v] decl
                    :let [k-name (subs (str k) 1)]        ; :db/valueType -> "db/valueType"
                    :when (contains? bootstrap-attrs k-name)]
-               [attr k-name (if (keyword? v) (name v) (str v))])
+               [attr k-name (schema-value->wire v)])
              ref?)))
 
 (defn schema-of
-  "Derive `{attr-name {:value-type _ :cardinality _ :unique _}}` from
-  whatever `db/valueType`/`db/cardinality`/`db/unique` datoms already
-  exist in `db` (see `install-schema`) -- schema is just data the db
-  already has, not a side-channel a caller must separately track.
-  `:cardinality` defaults to `\"many\"` (arrangement's own native
-  cardinality-agnostic behavior, ADR-2607061200 pillar note) when an
-  attribute has SOME schema entry but no explicit `db/cardinality`."
+  "Derive `{attr-name {:value-type _ :cardinality _ :unique _ :tuple-
+  types _}}` from whatever `db/valueType`/`db/cardinality`/`db/unique`/
+  `db/tupleTypes` datoms already exist in `db` (see `install-schema`) --
+  schema is just data the db already has, not a side-channel a caller
+  must separately track. `:cardinality` defaults to `\"many\"`
+  (arrangement's own native cardinality-agnostic behavior, ADR-2607061200
+  pillar note) when an attribute has SOME schema entry but no explicit
+  `db/cardinality`. `:tuple-types` is a vector of value-type strings
+  (parsed back from `db/tupleTypes`'s comma-joined wire string), or `nil`."
   [db]
   (into {}
         (keep (fn [[ent attrs]]
                 (let [vt (first (get attrs "db/valueType"))
                       card (first (get attrs "db/cardinality"))
-                      uniq (first (get attrs "db/unique"))]
-                  (when (or vt card uniq)
-                    [ent {:value-type vt :cardinality (or card "many") :unique uniq}]))))
+                      uniq (first (get attrs "db/unique"))
+                      tuple-types-str (first (get attrs "db/tupleTypes"))]
+                  (when (or vt card uniq tuple-types-str)
+                    [ent {:value-type vt :cardinality (or card "many") :unique uniq
+                          :tuple-types (some-> tuple-types-str (str/split #","))}]))))
         (:spo db)))
 
-(defn- validate-value-type! [attr value-type v]
+(defn- validate-value-type!
+  "`value-type` -> the check run against the ORIGINAL value `v` (before
+  `->quad`'s string coercion -- see `raw-triple`). `tuple-types` (a
+  vector of per-position value-type strings, from `db/tupleTypes`) is
+  only consulted when `value-type` is `\"tuple\"`.
+
+  `\"bigdec\"`/`\"bigint\"` are deliberately NOT included: cljs/JS has no
+  true arbitrary-precision decimal/integer type, so a check that's
+  meaningful on JVM (`decimal?`) would ALWAYS fail on cljs/nbb -- a
+  cross-platform correctness mismatch this codebase avoids elsewhere
+  (see e.g. `avg`'s forced double division in `arrangement.datalog`),
+  not an oversight."
+  [attr value-type v tuple-types]
   (case value-type
     "string"  (when-not (string? v)
                 (throw (ex-info "kotobase-peer: schema violation -- expected a string" {:attr attr :value v})))
@@ -198,7 +231,50 @@
                 (throw (ex-info "kotobase-peer: schema violation -- expected a boolean" {:attr attr :value v})))
     "ref"     (when-not (ipld/link? v)
                 (throw (ex-info "kotobase-peer: schema violation -- expected a ref (ipld/Link)" {:attr attr :value v})))
+    "uuid"    (when-not (uuid? v)
+                (throw (ex-info "kotobase-peer: schema violation -- expected a uuid" {:attr attr :value v})))
+    "instant" (when-not (inst? v)
+                (throw (ex-info "kotobase-peer: schema violation -- expected an instant" {:attr attr :value v})))
+    "keyword" (when-not (keyword? v)
+                (throw (ex-info "kotobase-peer: schema violation -- expected a keyword" {:attr attr :value v})))
+    "symbol"  (when-not (symbol? v)
+                (throw (ex-info "kotobase-peer: schema violation -- expected a symbol" {:attr attr :value v})))
+    "bytes"   (when-not #?(:clj (bytes? v) :cljs (instance? js/Uint8Array v))
+                (throw (ex-info "kotobase-peer: schema violation -- expected bytes" {:attr attr :value v})))
+    "tuple"   (do
+                (when-not (vector? v)
+                  (throw (ex-info "kotobase-peer: schema violation -- expected a tuple (vector)" {:attr attr :value v})))
+                (when-not (= (count tuple-types) (count v))
+                  (throw (ex-info "kotobase-peer: schema violation -- tuple arity mismatch"
+                                  {:attr attr :expected (count tuple-types) :got (count v)})))
+                (dorun (map (fn [t elem] (validate-value-type! attr t elem nil)) tuple-types v)))
     nil))
+
+(defn- normalize-inline-schema
+  "Caller-passed inline schema declarations (`install-schema`'s own
+  `{:db/valueType t :db/cardinality c :db/unique u :db/tupleTypes
+  [t1 ...]}` shape) -> the SAME `{:value-type _ :cardinality _ :unique _
+  :tuple-types _}` shape `schema-of` derives from already-installed
+  datoms, so `transact-with-schema`'s `(merge (schema-of db) schema)`
+  actually reconciles the two instead of one shape silently shadowing
+  the other with mismatched keys.
+
+  This fixes a real bug: an inline `{:db/valueType :long}` passed
+  directly to `transact-with-schema` (never pre-installed via
+  `install-schema`) was previously a SILENT no-op for value-type
+  validation -- `effective-schema`'s entry for that attr ended up in the
+  caller's raw `:db/valueType`-keyed shape, and `(get-in ... [p
+  :value-type])` looked for a key (`:value-type`) that was never there,
+  returning `nil` and skipping the check entirely."
+  [schema]
+  (into {}
+        (map (fn [[attr decl]]
+               [attr {:value-type (some-> (:db/valueType decl) name)
+                      :cardinality (or (some-> (:db/cardinality decl) name) "many")
+                      :unique (some-> (:db/unique decl) name)
+                      :tuple-types (some->> (:db/tupleTypes decl)
+                                            (mapv #(if (keyword? %) (name %) (str %))))}]))
+        schema))
 
 (defn transact-with-schema
   "Like `transact`, but OPT-IN schema enforcement (plain `transact` is
@@ -228,7 +304,7 @@
   happened."
   ([db tx-data schema] (transact-with-schema db tx-data ipld/link? schema))
   ([db tx-data ref? schema]
-   (let [effective-schema (merge (schema-of db) schema)]
+   (let [effective-schema (merge (schema-of db) (normalize-inline-schema schema))]
      (reduce
       (fn [db item]
         (let [[s p o] (raw-triple item)]
@@ -236,7 +312,7 @@
             (throw (ex-info "kotobase-peer: unknown attribute -- no schema declared (see install-schema)"
                             {:attr p})))
           (when-let [vt (get-in effective-schema [p :value-type])]
-            (validate-value-type! p vt o))
+            (validate-value-type! p vt o (get-in effective-schema [p :tuple-types])))
           (when (= "identity" (get-in effective-schema [p :unique]))
             (let [quad-o (->quad-value o)
                   existing (qs/by-predicate-value db p quad-o)]
@@ -373,22 +449,25 @@
   (kqe/query db pattern visible?))
 
 (defn query
-  "`datomic.api/q`-equivalent: `{:find [?var ...] :where [[e a v] ...] :rules
-   [...]}` conjunctive multi-clause join over `arrangement.datalog/q`
-   (ADR-2607061200 staged Datalog roadmap). All 4 stages are implemented --
-   `:where` clauses may be `(not [e a v])` or `(rule-name ?arg ...)`, `:find`
-   elements may be `(count ?v)`/`(count-distinct ?v)`/`(sum ?v)`/`(avg ?v)`/
-   `(min ?v)`/`(max ?v)` alongside plain variables, and `:rules` may define
-   recursive relations (`[[(rule-name ?param ...) clause ...] ...]`,
-   evaluated to a least fixpoint via semi-naive iteration). See
-   `arrangement.datalog`'s ns docstring for the full grammar and for why
-   both negation and recursion are safe against `visible?` (a redacted fact
-   and an absent fact are indistinguishable to `not`, and this holds
-   recursively into every rule body -- enforced in arrangement, this fn is
-   a straight passthrough). Returns a set of `:find`-ordered vectors.
-   `visible?` is REQUIRED, same convention as `q` above."
-  [db find+where visible?]
-  (datalog/q db find+where visible?))
+  "`datomic.api/q`-equivalent: `{:find [?var ...] :in [?param ...] :where
+   [[e a v] ...] :rules [...]}` conjunctive multi-clause join over
+   `arrangement.datalog/q` (ADR-2607061200 staged Datalog roadmap + query-
+   language follow-up). `:where` clauses may be `(not [e a v])`,
+   `(rule-name ?arg ...)`, `[(fn-sym arg...)]` / `[(fn-sym arg...)
+   result-var]` (a whitelisted predicate/function call), or
+   `(or clause ...)` / `(or-join [?shared ...] clause ...)`. `:find`
+   elements may be `(count ?v)`/`(count-distinct ?v)`/`(sum ?v)`/
+   `(avg ?v)`/`(min ?v)`/`(max ?v)` alongside plain variables, and
+   `:rules` may define recursive relations (`[[(rule-name ?param ...)
+   clause ...] ...]`, evaluated to a least fixpoint via semi-naive
+   iteration). `inputs` (optional 4th arg, positional, matching `:in`'s
+   order) supplies extra query parameters. See `arrangement.datalog`'s
+   ns docstring for the full grammar and for why negation/recursion/
+   `or` are all safe against `visible?` (enforced in arrangement, this
+   fn is a straight passthrough). Returns a set of `:find`-ordered
+   vectors. `visible?` is REQUIRED, same convention as `q` above."
+  ([db find+where visible?] (datalog/q db find+where visible?))
+  ([db find+where visible? inputs] (datalog/q db find+where visible? inputs)))
 
 ;; ── pull: a Datomic-shaped pull-pattern language over entity-attrs/refs-to ──
 ;; (one of the "3 pillars" this landing adds -- ADR-2607061200's own note
@@ -466,6 +545,40 @@
                                       with `'...`."
   ([db s] (qs/entity-attrs db s))
   ([db s pattern] (pull1 db s pattern #{})))
+
+;; ── entity: lazy navigational entity API (ADR-2607061200 follow-up) ────────
+;; Datomic's `entity` returns an object that behaves like a Clojure map but
+;; transparently navigates ref-valued attributes into further entity
+;; objects on access. Reimplementing that fully (a custom type overriding
+;; `get`/keyword-invoke to be lazy) would need per-platform protocol
+;; dispatch this codebase has ALREADY hit real portability limits on --
+;; nbb/SCI cannot dispatch a custom deftype's implementation of a built-in
+;; protocol at all (confirmed empirically, `io-ipld`/`org-ietf-cbor`'s own
+;; deftype->defrecord history), and a `defrecord`'s map/field behavior is
+;; fixed, not overridable to be lazy. So `entity` here is DELIBERATELY a
+;; plain map (identical to `pull`'s 2-arg flat form, under Datomic's own
+;; name) plus a separate, explicit `entity-attr` for the one thing that
+;; makes `entity` more than `pull` -- navigating INTO a ref value's own
+;; entity on demand, without needing a pull pattern known up front.
+
+(defn entity
+  "Datomic's `entity`: `pull`'s flat 2-arg form (`{p #{o...}}`) under
+   Datomic's own name, for a caller specifically looking for it. See the
+   ns section comment above for why this is a plain map, not a custom
+   lazy-navigating type -- use `entity-attr` to navigate a ref-valued
+   attribute's values into their own nested entities on demand."
+  [db s]
+  (qs/entity-attrs db s))
+
+(defn entity-attr
+  "Navigate FROM an already-`entity`/`pull`-ed map at `attr` INTO each of
+   its values as their OWN `entity` -- the explicit lazy-navigation step
+   `entity` itself doesn't take eagerly (see ns section comment). Returns
+   `#{{...} ...}`, one nested entity map per value; a value that was
+   never itself asserted as an entity's own subject simply resolves to
+   `{}` (harmless -- same convention `pull`'s nested-ref form uses)."
+  [db entity-map attr]
+  (into #{} (map #(entity db %)) (get entity-map attr #{})))
 
 (defn refs
   "`{p #{s...}}`: every entity `s` that references `ref` via predicate `p`
