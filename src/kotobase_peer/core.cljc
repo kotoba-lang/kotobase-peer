@@ -212,11 +212,17 @@
 
 (defn query
   "`datomic.api/q`-equivalent: `{:find [?var ...] :where [[e a v] ...]}`
-   conjunctive multi-clause join over `arrangement.datalog/q`
-   (ADR-2607061200, stage 1 of the staged Datalog roadmap -- negation,
-   aggregation, and recursive rules are tracked follow-ups, not here).
-   Returns a set of `:find`-ordered vectors. `visible?` is REQUIRED, same
-   convention as `q` above."
+   conjunctive multi-clause join over `arrangement.datalog/q` (ADR-2607061200
+   staged Datalog roadmap). Stage 1 (join) + Stage 2 (negation, aggregation)
+   are implemented -- `:where` clauses may be `(not [e a v])`, `:find`
+   elements may be `(count ?v)`/`(count-distinct ?v)`/`(sum ?v)`/`(avg ?v)`/
+   `(min ?v)`/`(max ?v)` alongside plain variables. Recursive rules (`:rules`
+   + fixpoint, Stage 3/4) remain a separate, unscheduled follow-up. See
+   `arrangement.datalog`'s ns docstring for the full grammar and for why
+   negation is safe against `visible?` (a redacted fact and an absent fact
+   are indistinguishable to `not` -- this is enforced in arrangement, this
+   fn is a straight passthrough). Returns a set of `:find`-ordered vectors.
+   `visible?` is REQUIRED, same convention as `q` above."
   [db find+where visible?]
   (datalog/q db find+where visible?))
 

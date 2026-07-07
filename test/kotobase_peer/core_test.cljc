@@ -315,6 +315,46 @@
     (is (thrown? #?(:clj clojure.lang.ArityException :cljs js/Error)
                  (eng/query db {:find '[?s] :where '[[?s "role" "admin"]]})))))
 
+(deftest query-negation-end-to-end
+  ;; ADR-2607061200 Stage 2, reachable through kotobase-peer.core/query, not
+  ;; just arrangement.datalog/q directly (query is a straight passthrough).
+  (let [db (eng/transact (eng/empty-db)
+                          [{:s "alice" :p "role" :o "admin"}
+                           {:s "alice" :p "name" :o "Alice"}
+                           {:s "bob" :p "role" :o "user"}
+                           {:s "bob" :p "name" :o "Bob"}])
+        everything (constantly true)]
+    (is (= #{["bob"]}
+           (eng/query db {:find '[?s]
+                          :where '[[?s "name" _]
+                                   (not [?s "role" "admin"])]}
+                      everything)))))
+
+(deftest query-negation-still-respects-visible-through-the-peer-layer
+  (let [db (eng/transact (eng/empty-db)
+                          [{:s "alice" :p "role" :o "admin"}
+                           {:s "alice" :p "name" :o "Alice"}
+                           {:s "bob" :p "role" :o "user"}
+                           {:s "bob" :p "name" :o "Bob"}
+                           {:s "carol" :p "role" :o "admin"}
+                           {:s "carol" :p "name" :o "Carol"}])
+        hide-carols-admin-fact (fn [{:keys [s p o]}] (not (and (= s "carol") (= p "role") (= o "admin"))))]
+    (is (= #{["bob"] ["carol"]}
+           (eng/query db {:find '[?s]
+                          :where '[[?s "name" _]
+                                   (not [?s "role" "admin"])]}
+                      hide-carols-admin-fact))
+        "carol's admin fact is hidden from this caller -- indistinguishable from bob's genuine non-admin status")))
+
+(deftest query-aggregation-end-to-end
+  (let [db (eng/transact (eng/empty-db)
+                          [{:s "alice" :p "role" :o "admin"}
+                           {:s "bob" :p "role" :o "user"}
+                           {:s "carol" :p "role" :o "admin"}])
+        everything (constantly true)]
+    (is (= #{["admin" 2] ["user" 1]}
+           (eng/query db {:find '[?role (count ?s)] :where '[[?s "role" ?role]]} everything)))))
+
 (deftest pull-returns-entity-attrs
   (let [db (eng/transact (eng/empty-db) [{:s "alice" :p "role" :o "admin"}
                                           {:s "alice" :p "name" :o "Alice"}])]
