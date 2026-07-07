@@ -355,6 +355,30 @@
     (is (= #{["admin" 2] ["user" 1]}
            (eng/query db {:find '[?role (count ?s)] :where '[[?s "role" ?role]]} everything)))))
 
+(deftest query-recursive-rule-end-to-end
+  ;; ADR-2607061200 Stage 3/4, reachable through kotobase-peer.core/query.
+  (let [db (eng/transact (eng/empty-db)
+                          [{:s "alice" :p "parent" :o "bob"}
+                           {:s "bob" :p "parent" :o "carol"}
+                           {:s "carol" :p "parent" :o "dave"}])
+        everything (constantly true)
+        ancestor-rules '[[(ancestor ?x ?y) [?x "parent" ?y]]
+                         [(ancestor ?x ?y) [?x "parent" ?z] (ancestor ?z ?y)]]]
+    (is (= #{["bob"] ["carol"] ["dave"]}
+           (eng/query db {:find '[?y] :where '[(ancestor "alice" ?y)] :rules ancestor-rules} everything)))))
+
+(deftest query-recursive-rule-still-respects-visible-through-the-peer-layer
+  (let [db (eng/transact (eng/empty-db)
+                          [{:s "alice" :p "parent" :o "bob"}
+                           {:s "bob" :p "parent" :o "carol"}
+                           {:s "carol" :p "parent" :o "dave"}])
+        hide-bob-carol (fn [{:keys [s p o]}] (not (and (= s "bob") (= p "parent") (= o "carol"))))
+        ancestor-rules '[[(ancestor ?x ?y) [?x "parent" ?y]]
+                         [(ancestor ?x ?y) [?x "parent" ?z] (ancestor ?z ?y)]]]
+    (is (= #{["bob"]}
+           (eng/query db {:find '[?y] :where '[(ancestor "alice" ?y)] :rules ancestor-rules} hide-bob-carol))
+        "bob->carol is hidden from this caller -- the recursive fixpoint can't derive past bob")))
+
 (deftest pull-returns-entity-attrs
   (let [db (eng/transact (eng/empty-db) [{:s "alice" :p "role" :o "admin"}
                                           {:s "alice" :p "name" :o "Alice"}])]
