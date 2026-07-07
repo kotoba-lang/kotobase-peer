@@ -1551,3 +1551,65 @@
                                                     (testing "hot-datoms (novelty path, via dag-cbor) agrees with the cold path"
                                                       (is (= (set hot-rows) (set cold-rows-2))))
                                                     (done))))))))))))))))
+
+;; ── datom retraction Phase 1 (ADR-2607071610) ────────────────────────────────
+
+(deftest transact-applies-retraction-forms
+  (let [everything (constantly true)
+        db (eng/transact (eng/empty-db)
+                         [["e1" ":a/x" "v1"] ["e1" ":a/y" "v2"] ["e2" ":a/x" "v3"]])]
+    (testing "[:db/retract e a v] removes exactly one datom"
+      (let [db' (eng/transact db [[:db/retract "e1" ":a/x" "v1"]])]
+        (is (= 2 (count (eng/datoms db' {:index :eavt} everything))))
+        (is (= [] (eng/datoms db' {:index :eavt :components ["e1" ":a/x"]} everything)))))
+    (testing "[:db/retractEntity e] removes the whole entity"
+      (let [db' (eng/transact db [[:db/retractEntity "e1"]])]
+        (is (= [] (eng/datoms db' {:index :eavt :components ["e1"]} everything)))
+        (is (= 1 (count (eng/datoms db' {:index :eavt} everything))))))
+    (testing "retract then re-assert wins in order"
+      (let [db' (eng/transact db [[:db/retractEntity "e1"] ["e1" ":a/x" "v9"]])]
+        (is (= [{:e "e1" :a ":a/x" :v_edn "\"v9\"" :added true}]
+               (eng/datoms db' {:index :eavt :components ["e1"]} everything)))))))
+
+#?(:clj
+   (deftest commit-retraction-cancels-across-blocks-and-fold
+     ;; assert in block 1 → retract in block 2 → current reads drop it, both
+     ;; before AND after fold (ADR-2607071610 Phase 1: current-state 正しさ)
+     (let [{:keys [put! get-fn]} (mem-store)
+           everything (constantly true)
+           c1 (eng/commit! put! get-fn
+                           [["post/1" ":yoro.post/text" "hello"]
+                            ["post/1" ":yoro.post/author" "did:key:zA"]
+                            ["post/2" ":yoro.post/text" "keep"]]
+                           nil test-encrypt-fn)
+           c2 (eng/commit! put! get-fn [[:db/retract "post/1" ":yoro.post/text" "hello"]]
+                           c1 test-encrypt-fn)]
+       (testing "hot-datoms: novelty retract cancels earlier novelty assert"
+         (let [rows (eng/hot-datoms get-fn c2 everything test-blind-fn test-decrypt-fn)]
+           (is (= #{["post/1" ":yoro.post/author"] ["post/2" ":yoro.post/text"]}
+                  (set (map (juxt :e :a) rows))))))
+       (testing "retract survives fold (snapshot actually shrinks)"
+         (let [c3 (eng/fold! put! get-fn c2 test-blind-fn test-encrypt-fn test-decrypt-fn)
+               rows (eng/hot-datoms get-fn c3 everything test-blind-fn test-decrypt-fn)]
+           (is (= #{["post/1" ":yoro.post/author"] ["post/2" ":yoro.post/text"]}
+                  (set (map (juxt :e :a) rows))))))
+       (testing "retract cancels a row already IN the indexed snapshot"
+         (let [cf (eng/fold! put! get-fn c1 test-blind-fn test-encrypt-fn test-decrypt-fn)
+               cr (eng/commit! put! get-fn [[:db/retractEntity "post/1"]] cf test-encrypt-fn)
+               rows (eng/hot-datoms get-fn cr everything test-blind-fn test-decrypt-fn)]
+           (is (= #{["post/2" ":yoro.post/text"]}
+                  (set (map (juxt :e :a) rows))))
+           (testing "and the NEXT fold bakes the shrink into the snapshot"
+             (let [cff (eng/fold! put! get-fn cr test-blind-fn test-encrypt-fn test-decrypt-fn)
+                   rows (eng/hot-datoms get-fn cff everything test-blind-fn test-decrypt-fn)]
+               (is (= #{["post/2" ":yoro.post/text"]}
+                      (set (map (juxt :e :a) rows)))))))))))
+
+#?(:clj
+   (deftest old-blocks-without-op-stay-valid
+     ;; wire compat: plain 3-key quads (all pre-ADR blocks) read back as asserts
+     (let [{:keys [put! get-fn]} (mem-store)
+           everything (constantly true)
+           c1 (eng/commit! put! get-fn [["e" ":a/x" "v"]] nil test-encrypt-fn)
+           rows (eng/hot-datoms get-fn c1 everything test-blind-fn test-decrypt-fn)]
+       (is (= [{:e "e" :a ":a/x" :v_edn "\"v\"" :added true}] (vec rows))))))

@@ -81,11 +81,25 @@
    `[e a v]` triple."
   [item]
   (cond
+    ;; entity-level retraction (ADR-2607071610): {:s .. :op :retract-entity}
+    ;; carries no :p/:o
+    (and (map? item) (= :retract-entity (:op item)) (contains? item :s))
+    {:s (str (:s item)) :op :retract-entity}
+
     (and (map? item) (contains? item :s) (contains? item :p) (contains? item :o))
-    {:s (str (:s item)) :p (str (:p item)) :o (->quad-value (:o item))}
+    (cond-> {:s (str (:s item)) :p (str (:p item)) :o (->quad-value (:o item))}
+      (:op item) (assoc :op (:op item)))
 
     (and (vector? item) (= 4 (count item)) (= :db/add (first item)))
     (let [[_ e a v] item] {:s (str e) :p (str a) :o (->quad-value v)})
+
+    ;; attr-level retraction (ADR-2607071610)
+    (and (vector? item) (= 4 (count item)) (= :db/retract (first item)))
+    (let [[_ e a v] item] {:s (str e) :p (str a) :o (->quad-value v) :op :retract})
+
+    ;; entity-level retraction (ADR-2607071610)
+    (and (vector? item) (= 2 (count item)) (= :db/retractEntity (first item)))
+    {:s (str (second item)) :op :retract-entity}
 
     (and (sequential? item) (= 3 (count item)))
     (let [[e a v] item] {:s (str e) :p (str a) :o (->quad-value v)})
@@ -93,6 +107,46 @@
     :else
     (throw (ex-info "kotobase-peer: unrecognized tx-data item"
                      {:item item}))))
+
+(defn- retract-entity*
+  "Retract every quad whose subject is `s` from the hot db (spo lookup —
+  O(|entity|), ADR-2607071610 :retract-entity)."
+  [db s ref?]
+  (reduce-kv (fn [db p os]
+               (reduce (fn [db o] (qs/retract-quad db {:s s :p p :o o} ref?)) db os))
+             db (get-in db [:spo s] {})))
+
+(defn- apply-quad
+  "Apply one :op-tagged quad to the hot db (ADR-2607071610). Missing :op =
+  :assert — old novelty blocks and plain quads stay valid unchanged."
+  [db {:keys [op] :as q} ref?]
+  (case (or op :assert)
+    :assert         (qs/assert-quad db q ref?)
+    :retract        (qs/retract-quad db q ref?)
+    :retract-entity (retract-entity* db (:s q) ref?)))
+
+(defn- retraction-filters
+  "Set-based snapshot-half cancellation for `hot-datoms` (ADR-2607071610):
+  which [s p o] triples / s entities do the novelty blocks retract? Order-
+  safe because re-asserts after a retract live in the novelty half, whose
+  ordered replay re-emits them."
+  [quads]
+  (reduce (fn [acc {:keys [s p o op]}]
+            (case op
+              :retract        (update acc :triples conj [s p o])
+              :retract-entity (update acc :entities conj s)
+              acc))
+          {:triples #{} :entities #{}} quads))
+
+(defn- remove-retracted
+  "Drop cold/snapshot rows cancelled by novelty retractions."
+  [{:keys [triples entities]} rows]
+  (if (and (empty? triples) (empty? entities))
+    rows
+    (remove (fn [{:keys [e a v_edn]}]
+              (or (contains? entities e)
+                  (contains? triples [e a (qs/edn->link (edn/read-string v_edn))])))
+            rows)))
 
 (defn transact
   "Apply `tx-data` (a seq of `{:s :p :o}` quads, `[:db/add e a v]`, or `[e a v]`
@@ -107,7 +161,7 @@
    migration/backfill tooling). The write path proper is `commit!`, below."
   ([db tx-data] (transact db tx-data ipld/link?))
   ([db tx-data ref?]
-   (reduce (fn [db item] (qs/assert-quad db (->quad item) ref?))
+   (reduce (fn [db item] (apply-quad db (->quad item) ref?))
            db tx-data)))
 
 ;; ── schema: Datomic-style "schema is just datoms too" ───────────────────────
@@ -649,8 +703,14 @@
 (defn- indexed-cid [state] (some-> (get state "indexed") ipld/link-cid))
 (defn- novelty-cids [state] (mapv ipld/link-cid (get state "novelty" [])))
 
-(defn- quad->wire [{:keys [s p o]}] {"s" s "p" p "o" o})
-(defn- wire->quad [{:strs [s p o]}] {:s s :p p :o o})
+(defn- quad->wire [{:keys [s p o op]}]
+  ;; "op" appears only on non-assert quads — asserts (and every pre-
+  ;; ADR-2607071610 block) keep the exact 3-key wire shape (backward compat)
+  (cond-> {"s" s "p" p "o" o}
+    (and op (not= :assert op)) (assoc "op" (name op))))
+(defn- wire->quad [{:strs [s p o op]}]
+  (cond-> {:s s :p p :o o}
+    op (assoc :op (keyword op))))
 
 (defn- put-tx-block!
   "ADR-2607051000 (accepted 2026-07-06): the novelty tx block's whole quad
@@ -682,7 +742,9 @@
    LINKS (one O(1) head fetch via chain, never the graph itself) and
    writes one new small tx block plus one new chain entry. Touches no
    prolly-tree, rehydrates nothing. `tx-data` accepts the same shapes
-   `transact` does (quad maps, `[:db/add e a v]`, bare `[e a v]` triples).
+   `transact` does (quad maps, `[:db/add e a v]`, bare `[e a v]` triples,
+   and the retraction forms `[:db/retract e a v]` / `[:db/retractEntity e]`
+   — ADR-2607071610).
 
    This REPLACES the pre-D1 `commit!` (now `snapshot!`), which took an
    already-hydrated hot db and paid a full O(graph) rebuild on every call —
@@ -1078,7 +1140,7 @@
     #?(:clj
        (let [base (hydrate-db get-fn (indexed-cid state) blind-fn decrypt-fn)
              novelty-quads (mapcat #(read-tx-block get-fn % decrypt-fn) (novelty-cids state))]
-         (reduce qs/assert-quad base novelty-quads))
+         (reduce (fn [db q] (apply-quad db q ipld/link?)) base novelty-quads))
        :cljs
        (-> (js/Promise.all
             #js [(hydrate-db get-fn (indexed-cid state) blind-fn decrypt-fn)
@@ -1086,7 +1148,7 @@
            (.then (fn [results]
                     (let [[base novelty-quads-per-cid] (vec results)
                           novelty-quads (apply concat novelty-quads-per-cid)]
-                      (reduce qs/assert-quad base novelty-quads))))))))
+                      (reduce (fn [db q] (apply-quad db q ipld/link?)) base novelty-quads))))))))
 
 (defn- newly-added-tx-cids
   "Walk `chain-cid`'s full history: for each commit whose OWN novelty list
@@ -1123,10 +1185,13 @@
   [get-fn chain-cid since-seq decrypt-fn]
   (let [tx-cids (newly-added-tx-cids get-fn chain-cid since-seq)]
     #?(:clj
-       (reduce qs/assert-quad (qs/empty-db) (mapcat #(read-tx-block get-fn % decrypt-fn) tx-cids))
+       (reduce (fn [db q] (apply-quad db q ipld/link?)) (qs/empty-db)
+               (mapcat #(read-tx-block get-fn % decrypt-fn) tx-cids))
        :cljs
        (-> (pmap-async (fn [cid] (read-tx-block get-fn cid decrypt-fn)) tx-cids)
-           (.then (fn [quads-per-cid] (reduce qs/assert-quad (qs/empty-db) (apply concat quads-per-cid))))))))
+           (.then (fn [quads-per-cid]
+                    (reduce (fn [db q] (apply-quad db q ipld/link?)) (qs/empty-db)
+                            (apply concat quads-per-cid))))))))
 
 (defn- spo->quads [db]
   (for [[e attrs] (:spo db), [a vs] attrs, v vs] {:s e :p a :o v}))
@@ -1134,21 +1199,20 @@
 (defn history
   "A hot db containing every quad EVER asserted via any commit rooted at
    `chain-cid`, across its WHOLE history from genesis to tip -- Datomic's
-   `history`, scoped HONESTLY to what this substrate can actually track:
-   assertions only, no retraction visibility. `commit!`'s novelty tx-
-   block format has no add/retract flag at all -- two separate `commit!`
-   calls asserting different values for the same `(s, p)` pair BOTH
-   remain visible via `hot-datoms`/`as-of` too today (`arrangement.core`
-   has no cardinality tracking of its own, ADR-2607061200 pillar note),
-   so `history` does NOT yet distinguish itself from the current view by
-   \"catching\" a retraction the current view has lost -- that would
-   require a schema-aware, retraction-EMITTING variant of `commit!`
-   itself (`transact-with-schema`'s cardinality `:one` retraction only
-   ever happens in-memory, on a hot db value that's never persisted
-   through `commit!`'s tx-block format), which is a natural follow-up,
-   not yet built. What `history` DOES give today: a complete, literal
-   audit trail across `fold!` compactions -- data folded away from
-   `hot-datoms`' novelty view remains fully reconstructable here.
+   `history`: every assertion that ever reached the chain, union'd across
+   fold compactions. NOTE (ADR-2607071610): novelty blocks now MAY carry
+   explicit retraction ops (`[:db/retract e a v]`/`[:db/retractEntity e]`
+   through `commit!`); the CURRENT view (`hot-datoms`/`hydrate-chain`/
+   `fold!`) applies them, while `history` remains the assertion-audit —
+   a datom retracted later still appears here (that is the point of an
+   audit view). Datomic-style `:added false` row surfacing is Phase 2 of
+   that ADR. Separately, two `commit!` calls asserting different values
+   for the same `(s, p)` pair both remain visible (`arrangement.core`
+   has no cardinality tracking of its own, ADR-2607061200 pillar note;
+   `transact-with-schema`'s cardinality `:one` retraction happens on hot
+   db values). What `history` gives: a complete, literal audit trail
+   across `fold!` compactions -- data folded away from `hot-datoms`'
+   novelty view remains fully reconstructable here.
 
    Built from `(since get-fn chain-cid -1 decrypt-fn)` (every novelty
    tx-block ever appended, across the whole chain -- `-1` because every
@@ -1208,7 +1272,12 @@
         (let [state (state-at get-fn chain-cid)
               snap-rows (cold-datoms get-fn (indexed-cid state) opts visible? blind-fn decrypt-fn)
               novelty-quads (mapcat #(read-tx-block get-fn % decrypt-fn) (novelty-cids state))
-              novelty-rows (datoms (reduce qs/assert-quad (qs/empty-db) novelty-quads) opts visible?)]
+              ;; ADR-2607071610: novelty retractions must also cancel rows the
+              ;; INDEXED snapshot contributed (asserted before the last fold)
+              snap-rows (remove-retracted (retraction-filters novelty-quads) snap-rows)
+              novelty-rows (datoms (reduce (fn [db q] (apply-quad db q ipld/link?))
+                                           (qs/empty-db) novelty-quads)
+                                   opts visible?)]
           (vec (concat snap-rows novelty-rows))))
       :cljs
       (if (nil? chain-cid)
@@ -1225,7 +1294,10 @@
               (.then (fn [results]
                        (let [[snap-rows novelty-quads-per-cid] (vec results)
                              novelty-quads (apply concat novelty-quads-per-cid)
-                             novelty-rows (datoms (reduce qs/assert-quad (qs/empty-db) novelty-quads) opts visible?)]
+                             snap-rows (remove-retracted (retraction-filters novelty-quads) snap-rows)
+                             novelty-rows (datoms (reduce (fn [db q] (apply-quad db q ipld/link?))
+                                                          (qs/empty-db) novelty-quads)
+                                                  opts visible?)]
                          (vec (concat snap-rows novelty-rows)))))))))))
 
 (defn fold!
@@ -1263,7 +1335,7 @@
    (let [state (state-at get-fn chain-cid)]
      #?(:clj
         (let [novelty-quads (mapcat #(read-tx-block get-fn % decrypt-fn) (novelty-cids state))
-              db (reduce (fn [db q] (qs/assert-quad db q ref?))
+              db (reduce (fn [db q] (apply-quad db q ref?))
                          (hydrate-db get-fn (indexed-cid state) blind-fn decrypt-fn)
                          novelty-quads)
               new-snap-cid (qs/commit! put! db nil qs/current-schema-version blind-fn encrypt-fn)
@@ -1276,7 +1348,7 @@
             (.then (fn [results]
                      (let [[novelty-quads-per-cid hydrated-db] (vec results)
                            novelty-quads (apply concat novelty-quads-per-cid)
-                           db (reduce (fn [db q] (qs/assert-quad db q ref?)) hydrated-db novelty-quads)]
+                           db (reduce (fn [db q] (apply-quad db q ref?)) hydrated-db novelty-quads)]
                        (qs/commit! put! db nil qs/current-schema-version blind-fn encrypt-fn))))
             (.then (fn [new-snap-cid]
                      (let [new-state {"indexed" (ipld/link new-snap-cid) "novelty" []}]
