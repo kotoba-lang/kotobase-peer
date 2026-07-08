@@ -592,6 +592,39 @@
   (let [db (eng/transact (eng/empty-db) [{:s "bob" :p "hobby" :o "chess"}])]
     (is (= #{{}} (eng/entity-attr db (eng/entity db "bob") "hobby")))))
 
+;; ── entid / ident: :db/ident as a plain attribute, no schema-enforced
+;; uniqueness (Datomic ships :db/unique :db.unique/identity on :db/ident
+;; itself; this substrate has no unique-attribute enforcement yet, so these
+;; tests only assert the well-formed case) ───────────────────────────────────
+
+(deftest entid-passes-through-a-plain-non-keyword-id
+  (is (= "alice" (eng/entid (eng/empty-db) "alice"))))
+
+(deftest entid-resolves-a-keyword-ident-via-a-real-transact-shaped-attr
+  ;; ":db/ident" (colon-prefixed) matches what entities->datoms actually
+  ;; produces for a real {:db/id "e" :db/ident :my/thing} tx-edn item -- see
+  ;; ->quad's (str a) coercion, not this test file's OWN convention
+  ;; elsewhere of bare unprefixed :p strings for low-level transact calls.
+  (let [db (eng/transact (eng/empty-db) [{:s "alice" :p ":db/ident" :o ":person/alice"}
+                                          {:s "alice" :p ":name" :o "Alice"}])]
+    (is (= "alice" (eng/entid db :person/alice)))))
+
+(deftest entid-returns-nil-for-an-ident-nothing-asserts
+  (let [db (eng/transact (eng/empty-db) [{:s "alice" :p ":name" :o "Alice"}])]
+    (is (nil? (eng/entid db :person/nobody)))))
+
+(deftest ident-is-the-inverse-of-entid
+  (let [db (eng/transact (eng/empty-db) [{:s "alice" :p ":db/ident" :o ":person/alice"}])]
+    (is (= :person/alice (eng/ident db "alice")))))
+
+(deftest ident-is-nil-when-no-db-ident-is-asserted
+  (let [db (eng/transact (eng/empty-db) [{:s "alice" :p ":name" :o "Alice"}])]
+    (is (nil? (eng/ident db "alice")))))
+
+(deftest ident-is-nil-when-db-ident-value-is-not-keyword-shaped
+  (let [db (eng/transact (eng/empty-db) [{:s "alice" :p ":db/ident" :o "not-a-keyword"}])]
+    (is (nil? (eng/ident db "alice")))))
+
 ;; ── tx-report / with (ADR-2607061200 "3 pillars" follow-up) ─────────────────
 
 (deftest transact-with-report-shape
