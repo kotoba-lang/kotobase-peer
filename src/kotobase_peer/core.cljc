@@ -459,10 +459,17 @@
    ignoring index/components_edn/limit and rehydrating the full graph per read
    (ADR-2607022330 addendum 2).
 
-   `:index` ∈ #{:eavt :aevt :avet} (default :eavt); `:components` is an ordered
-   prefix in that index's key order (:eavt=[e a v], :aevt/:avet=[a … ]); values
-   are the opaque strings arrangement stores (the PDS's :db/id for e, `:ns/attr`
-   for a, the stored value string for v). `visible?` is applied BEFORE `:limit`
+   `:index` ∈ #{:eavt :aevt :avet :vaet} (default :eavt); `:components` is an
+   ordered prefix in that index's key order (:eavt=[e a v], :aevt/:avet=
+   [a …], :vaet=[v a …] -- reverse-reference only, populated for ref-valued
+   quads, see the :vaet case below); values are the opaque strings
+   arrangement stores (the PDS's :db/id for e, `:ns/attr` for a, the stored
+   value string for v). `kotoba-lang/kotobase-client`'s own `datoms` has
+   always documented `:vaet` as a valid index (see its docstring) -- this
+   fn previously had no matching `case` clause AND no default, so any
+   caller actually sending `:vaet` (a documented, not hypothetical, request
+   shape) crashed with an unhandled-case exception instead of a graceful
+   error. Confirmed 2026-07-08, fixed here. `visible?` is applied BEFORE `:limit`
    is taken, so `:limit` caps the row count the caller actually receives (all
    of them visible), not the count of raw candidates scanned."
   ([db visible?] (datoms db nil visible?))
@@ -483,7 +490,19 @@
            :avet (cond
                    (and c0 c1) (for [e (qs/by-predicate-value db c0 c1)] [e c0 c1])
                    c0          (for [[e vs] (qs/by-predicate db c0), v vs] [e c0 v])
-                   :else       (for [[a em] (:pso db), [e vs] em, v vs]    [e a v])))
+                   :else       (for [[a em] (:pso db), [e vs] em, v vs]    [e a v]))
+           ;; VAET — key order [v a e]; [v a] is arrangement's point lookup
+           ;; (`refs-to`, reverse-reference). Populated ONLY for quads whose
+           ;; value was asserted as a truthy `ref?` (`transact`'s own default:
+           ;; `ipld.core/link?`) -- same scope `refs`/`entity-attr` already
+           ;; document. `:components` narrows first by value (`c0`), then by
+           ;; attribute (`c1`) -- reverse order from AEVT/AVET's own
+           ;; attribute-first components, matching Datomic's own VAET key
+           ;; order (value, then attribute, then entity).
+           :vaet (cond
+                   (and c0 c1) (for [e (get (qs/refs-to db c0) c1 #{})] [e c1 c0])
+                   c0          (for [[a es] (qs/refs-to db c0), e es]   [e a c0])
+                   :else       (for [[o pm] (:ocp db), [a es] pm, e es] [e a o])))
          rows (for [[e a v] triples] {:e e :a a :v_edn (v->edn v) :added true})
          rows (filter visible? rows)
          rows (cond->> rows limit (take limit))]
@@ -1027,7 +1046,15 @@
 (def ^:private index-spec
   {:eavt {:root "spo" :->eav (fn [[s p o]] [s p o])}   ; spo: [s p o]
    :aevt {:root "pso" :->eav (fn [[p s o]] [s p o])}   ; pso: [p s o]
-   :avet {:root "pos" :->eav (fn [[p o s]] [s p o])}}) ; pos: [p o s]
+   :avet {:root "pos" :->eav (fn [[p o s]] [s p o])}   ; pos: [p o s]
+   ;; ocp (VAET, reverse-reference only) IS already persisted in every
+   ;; snapshot's index-roots (arrangement.core/commit! writes all 4 roots
+   ;; unconditionally) -- this entry was simply never added, so a cold
+   ;; :vaet read had no index-spec match at all (nil :root/:->eav ->
+   ;; `cold-datoms` would NPE on `(get-in snap ["index-roots" nil])`
+   ;; instead of scanning anything). Confirmed 2026-07-08, fixed here;
+   ;; no migration needed, existing snapshots already have this root.
+   :vaet {:root "ocp" :->eav (fn [[o p s]] [s p o])}}) ; ocp: [o p s]
 
 (defn- components-prefix
   "String prefix into a `(pr-str [k1 k2 v])` leaf key for an ordered component
@@ -1035,22 +1062,37 @@
   slot), so it matches every key whose first components are exactly those.
 
   ADR-2607051000 (accepted 2026-07-06): each component is run through
-  `blind-fn` (REQUIRED, the SAME keyed MAC `arrangement.core/index-root` used
-  to build the key) before printing, so a caller who already knows the
-  plaintext component independently re-derives the identical blinded prefix
-  bytes to seek on -- unchanged from before in every other respect (still no
-  `link->edn` call here, matching this fn's pre-existing behavior for
-  Link-valued components, an orthogonal, pre-existing gap this ADR doesn't
-  touch). Synchronous on JVM (returns the prefix string, or nil for empty
+  `link->edn` THEN `blind-fn` (REQUIRED, the SAME keyed MAC
+  `arrangement.core/index-root` used to build the key -- `index-root`'s own
+  key construction is `(blind-fn (link->edn component))` for every
+  position, see its docstring), so a caller who already knows the
+  plaintext component independently re-derives the identical blinded
+  prefix bytes to seek on.
+
+  The `link->edn` step was MISSING here until 2026-07-08 (\"an orthogonal,
+  pre-existing gap this ADR doesn't touch\", per this docstring's own prior
+  wording) -- harmless for every index THIS fn was actually exercised
+  against before then (`:eavt`/`:aevt`/`:avet` components are always
+  plain strings in practice: entity ids, attribute names, scalar values --
+  `link->edn` on a non-Link value is already a no-op passthrough, so
+  omitting the call never changed the result). `:vaet` (added 2026-07-08)
+  is the first index whose OWN seek components are genuinely Link-typed
+  by design (VAET's whole point is reverse-reference lookup on ref
+  values) -- for those, skipping `link->edn` produced a seek prefix
+  blinded from the wrong input, silently matching nothing. Confirmed live
+  via `cold-datoms`'s own `:vaet` test, fixed here rather than deferred
+  again now that a real caller (`:vaet`) actually needs it.
+
+  Synchronous on JVM (returns the prefix string, or nil for empty
   `components`); a `js/Promise` of the same on cljs."
   [components blind-fn]
   #?(:clj
      (when (seq components)
-       (let [s (pr-str (mapv blind-fn components))]   ; e.g. ["blinded-a" "blinded-b"]
+       (let [s (pr-str (mapv (comp blind-fn qs/link->edn) components))]   ; e.g. ["blinded-a" "blinded-b"]
          (str (subs s 0 (dec (count s))) " ")))       ; drop ] , add the slot separator
      :cljs
      (if (seq components)
-       (-> (pmap-async blind-fn components)
+       (-> (pmap-async (fn [c] (blind-fn (qs/link->edn c))) components)
            (.then (fn [blinded]
                     (let [s (pr-str blinded)]
                       (str (subs s 0 (dec (count s))) " ")))))

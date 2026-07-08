@@ -991,6 +991,32 @@
                ["name" "\"Alice\""]}
              (set (map (juxt :a :v_edn) (eng/datoms db (constantly true)))))))))
 
+(deftest datoms-vaet-index-reverse-reference-lookup
+  ;; :vaet was previously an unhandled `case` branch with NO default -- any
+  ;; caller actually sending it (kotobase-client's own `datoms` docstring
+  ;; has always documented :vaet as a valid index) got an unhandled-case
+  ;; exception instead of rows or a graceful error. Confirmed 2026-07-08,
+  ;; fixed by wiring the already-existing `:ocp` index (arrangement's own
+  ;; VAET-equivalent, populated for ref-valued quads -- see `refs`/`refs-to`).
+  (let [db (eng/transact (eng/empty-db)
+                          [{:s "alice" :p "knows" :o bob-link}
+                           {:s "carol" :p "knows" :o bob-link}
+                           {:s "alice" :p "name" :o "Alice"}])
+        everything (constantly true)]
+    (testing "no components -> full VAET scan, only ref-valued quads show up"
+      (let [rows (eng/datoms db {:index :vaet} everything)]
+        (is (= 2 (count rows)))
+        (is (every? #(= "knows" (:a %)) rows))
+        (is (= #{"alice" "carol"} (set (map :e rows))))))
+    (testing "[value] narrows to that value's reverse refs"
+      (is (= 2 (count (eng/datoms db {:index :vaet :components [bob-link]} everything)))))
+    (testing "[value attr] point-looks-up the exact entities"
+      (let [rows (eng/datoms db {:index :vaet :components [bob-link "knows"]} everything)]
+        (is (= #{"alice" "carol"} (set (map :e rows))))
+        (is (every? #(= "knows" (:a %)) rows))))
+    (testing "a value never asserted as a ref has no VAET entries (a plain string, e.g., is never mistaken for a ref -- same convention `refs` already documents)"
+      (is (= [] (eng/datoms db {:index :vaet :components ["Alice"]} everything))))))
+
 #?(:clj
    (deftest link-ref-survives-fold-and-cold-read
      (testing "a Link-valued datom, folded into a persisted snapshot and read back
@@ -1005,6 +1031,14 @@
                                               test-blind-fn test-decrypt-fn))]
              (is (= "[\"ipld/link\" \"bafyreiaakutsdtndrl7e7emcmkp5hjsaaq2vu6prfelbgaglprvtdon63m\"]"
                     (:v_edn row)))))
+         (testing "cold-datoms :vaet finds the reverse reference too -- ocp IS
+                   persisted in every snapshot's index-roots already (arrangement's
+                   own commit! writes all 4 roots unconditionally), this index-spec
+                   entry was simply never added until 2026-07-08"
+           (let [row (first (eng/cold-datoms get-fn snap {:index :vaet :components [bob-link]} (constantly true)
+                                              test-blind-fn test-decrypt-fn))]
+             (is (= "alice" (:e row)))
+             (is (= "knows" (:a row)))))
          (testing "hydrate-db reconstructs a real Link, so refs-to finds it again"
            (let [db (eng/hydrate-db get-fn snap test-blind-fn test-decrypt-fn)]
              (is (= {"knows" #{"alice"}} (qs/refs-to db bob-link)))))
@@ -1572,13 +1606,21 @@
                                                                  test-blind-fn test-decrypt-fn)
                                                (eng/hydrate-db get-fn snap test-blind-fn test-decrypt-fn)
                                                (eng/hot-datoms get-fn c0 (constantly true) test-blind-fn test-decrypt-fn)
-                                               (eng/cold-datoms get-fn snap nil (constantly true) test-blind-fn test-decrypt-fn)])
+                                               (eng/cold-datoms get-fn snap nil (constantly true) test-blind-fn test-decrypt-fn)
+                                               (eng/cold-datoms get-fn snap {:index :vaet :components [bob-link]} (constantly true)
+                                                                 test-blind-fn test-decrypt-fn)])
                                          (.then (fn [results]
-                                                  (let [[cold-rows db hot-rows cold-rows-2] (vec results)
-                                                        row (first cold-rows)]
+                                                  (let [[cold-rows db hot-rows cold-rows-2 vaet-rows] (vec results)
+                                                        row (first cold-rows)
+                                                        vaet-row (first vaet-rows)]
                                                     (testing "cold-datoms reconstructs the Link (not the raw edn-safe vector)"
                                                       (is (= "[\"ipld/link\" \"bafyreiaakutsdtndrl7e7emcmkp5hjsaaq2vu6prfelbgaglprvtdon63m\"]"
                                                              (:v_edn row))))
+                                                    (testing "cold-datoms :vaet finds the reverse reference too -- ocp IS
+                                                              persisted in every snapshot's index-roots already, this
+                                                              index-spec entry was simply never added until 2026-07-08"
+                                                      (is (= "alice" (:e vaet-row)))
+                                                      (is (= "knows" (:a vaet-row))))
                                                     (testing "hydrate-db reconstructs a real Link, so refs-to finds it again"
                                                       (is (= {"knows" #{"alice"}} (qs/refs-to db bob-link))))
                                                     (testing "hot-datoms (novelty path, via dag-cbor) agrees with the cold path"
