@@ -642,6 +642,44 @@
   [db ref]
   (qs/refs-to db ref))
 
+(defn entid
+  "Datomic's `entid`: resolve a caller-given id-or-ident to the entity id.
+   A plain (non-keyword) `id` passes through UNCHANGED -- this substrate's
+   entity ids are already caller-chosen strings (`:db/id \"e1\"`, a CID, …),
+   never Datomic's auto-assigned longs, so there is no numeric-id
+   resolution step to perform (unlike real Datomic, where a bare id is
+   already the thing `entid` returns and the interesting case is only the
+   ident branch below -- same shape here).
+
+   A keyword `id` is resolved via `:db/ident`, asserted on an entity via
+   ordinary `transact` (`{:db/id \"e1\" :db/ident :my.ns/thing}`) exactly
+   like any other attribute -- `:db/ident` needs no special engine support,
+   the same \"schema is just data the db already has\" posture
+   `install-schema`/`schema-of` (above) take for attribute schema. Finds
+   the entity `e` such that `[e :db/ident id]` is asserted via a plain
+   triple-pattern `q`. Nothing in this substrate enforces `:db/ident`
+   uniqueness (Datomic itself would via a `:db/unique :db.unique/identity`
+   schema declaration on `:db/ident`, which this substrate has no
+   ENFORCEMENT mechanism for yet, only the schema-as-data description) --
+   if more than one entity happens to assert the same ident, which one
+   `entid` returns is unspecified (`q`'s result is a set, iteration order
+   not guaranteed). Returns nil if no entity has that ident asserted."
+  [db id]
+  (if (keyword? id)
+    (some :s (q db [nil ":db/ident" (str id)] (constantly true)))
+    id))
+
+(defn ident
+  "Datomic's `ident`: the inverse of `entid` for keyword idents -- the
+   `:db/ident` keyword `s` has asserted on itself, or nil if it has none
+   (including if the value there isn't actually a keyword-shaped string,
+   e.g. someone asserted `:db/ident \"plain string\"` instead of a real
+   keyword -- treated as \"no ident\" rather than a partial/lossy result)."
+  [db s]
+  (let [v (first (get (entity db s) ":db/ident"))]
+    (when (and (string? v) (str/starts-with? v ":"))
+      (edn/read-string v))))
+
 ;; ── persistence: content-addressed, chained, verifiable ─────────────────────
 ;;
 ;; state shape (opaque to chain; this peer library's own convention, encoded
