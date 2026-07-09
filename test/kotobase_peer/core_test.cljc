@@ -958,6 +958,19 @@
                     (set (eng/hot-datoms get-fn c1 everything test-blind-fn test-decrypt-fn))))))))))
 
 ;; ── canonical datom model (datom-clj) — ADR-2607032500 ───────────────────────
+(deftest tx-map->datoms-single-entity-contract
+  ;; entities->datoms (tested below) is a collection-flattening wrapper over
+  ;; the same dc/eavt call -- this covers tx-map->datoms's own single-entity
+  ;; contract directly, which had no direct test evidence.
+  (testing "one entity tx-map -> its own [e a v] datoms, :db/id -> e"
+    (is (= [["e1" :ns/a "v1"] ["e1" :ns/b "v2"]]
+           (eng/tx-map->datoms {:db/id "e1" :ns/a "v1" :ns/b "v2"}))))
+  (testing "an entity with only :db/id (no other attrs) -> no datoms"
+    (is (= [] (eng/tx-map->datoms {:db/id "e1"}))))
+  (testing "entities->datoms on a single-element seq == tx-map->datoms on that one entity"
+    (let [ent {:db/id "e1" :ns/a "v1" :ns/b "v2"}]
+      (is (= (eng/tx-map->datoms ent) (eng/entities->datoms [ent]))))))
+
 (deftest datafy-via-canonical-datom-model
   (testing "entities->datoms uses datom.core/eavt: :db/id → e, other pairs → [e a v]"
     (is (= [["e1" :ns/a "v1"] ["e1" :ns/b "v2"]]
