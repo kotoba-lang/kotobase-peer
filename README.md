@@ -155,6 +155,23 @@ entirely chain's job. Neither library needed to change.
 - `query` — Datomic-shaped `{:find [?var ...] :where [[e a v] ...]}`
   conjunctive multi-clause join, via `arrangement.datalog/q`
   (ADR-2607061200, stage 1 of a staged Datalog roadmap).
+- `refs`/`refs-to` — `{predicate #{subjects}}` reverse-reference lookup for
+  a given Link value (VAET-style point lookup, ADR-2607050200) — only
+  populated for quads whose value was asserted as a real `ipld.core/Link`.
+- `datoms`/`hot-datoms`/`cold-datoms`'s `:index` — one of `:eavt` / `:aevt`
+  / `:avet` / `:vaet` (added 2026-07-08). `:vaet` is `refs`/`refs-to`'s own
+  reverse-reference index (value → attribute → set-of-subjects), the same
+  data reachable through the general `datoms` scan shape instead of the
+  point-lookup accessor.
+- `entid`/`ident` — Datomic's id↔keyword-ident resolution pair. `entid`
+  passes a non-keyword id through unchanged (this substrate's entity ids
+  are caller-chosen strings, not Datomic's auto-assigned longs) and
+  resolves a keyword id via whatever entity has that `:db/ident` asserted
+  on it (plain `transact`, no special engine support — schema is data,
+  same posture `install-schema`/`schema-of` take). `ident` is the inverse:
+  an entity's own asserted `:db/ident`, or nil. No uniqueness enforcement
+  on `:db/ident` (documented limitation, not a bug) — see `entid`'s own
+  docstring.
 
 ## What is NOT in this landing
 
@@ -182,14 +199,14 @@ entirely chain's job. Neither library needed to change.
 ## Test
 
 ```bash
-clojure -M:test              # JVM
-npm run test:cljs            # real shadow-cljs build + node, not nbb
+clojure -M:test              # JVM      -- 94 tests / 196 assertions
+npm run test:cljs            # cljs     -- 85 tests / 180 assertions (real shadow-cljs build + node, not nbb)
 ```
 
-```
-Ran 21 tests containing 73 assertions.
-0 failures, 0 errors.
-```
+Both 0 failures, 0 errors. Counts differ slightly because some assertions
+are platform-specific (`#?(:clj ...)`/`#?(:cljs ...)` branches in the test
+suite itself, e.g. JVM-vs-cljs error-shape checks) — not a coverage gap,
+the underlying behavior is exercised on both platforms.
 
 ## License
 
