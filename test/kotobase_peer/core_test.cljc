@@ -953,6 +953,124 @@
            folded (eng/fold! put! get-fn c1 ipld/link? nil test-blind-fn test-encrypt-fn test-decrypt-fn)]
        (is (= 0 (eng/novelty-size get-fn folded)) "nil max-novelty still fully compacts"))))
 
+;; ── kotoba-lang/kotobase-peer#16: front/back persistent-queue novelty ──────
+
+#?(:clj
+   (deftest legacy-flat-vector-novelty-state-reads-and-migrates-correctly
+     (testing "a chain hand-constructed with the ORIGINAL (pre-#16) flat-vector
+               \"novelty\" state shape -- exactly what every already-deployed
+               chain has on disk -- reads correctly through every public
+               accessor, and a NEW commit! on top of it migrates to the
+               front/back shape without losing or reordering anything"
+       ;; put-tx-block! is private -- commit two entries the normal (public)
+       ;; way so real, correctly-shaped tx-blocks land in the store, then pull
+       ;; their links back out via plain ipld/get-node (public) to build a
+       ;; hand-constructed LEGACY-shaped {"indexed" .. "novelty" [...]} state
+       ;; from them, exactly what an already-deployed pre-#16 chain has on
+       ;; disk today.
+       (let [{:keys [put! get-fn]} (mem-store)
+             c0 (eng/commit! put! get-fn [{:s "alice" :p "role" :o "admin"}] nil test-encrypt-fn)
+             c1 (eng/commit! put! get-fn [{:s "bob" :p "role" :o "user"}] c0 test-encrypt-fn)
+             {:keys [state]} (cd/head get-fn c1)
+             walk-chain (fn walk-chain [head-link]
+                          (loop [cid (some-> head-link ipld/link-cid) acc []]
+                            (if (nil? cid)
+                              acc
+                              (let [{:strs [e rest]} (ipld/get-node get-fn cid)]
+                                (recur (some-> rest ipld/link-cid) (conj acc e))))))
+             tx-links (into (walk-chain (get state "novelty-front"))
+                            (rseq (walk-chain (get state "novelty-back"))))
+             legacy-state {"indexed" nil "novelty" tx-links}
+             legacy-chain-cid (cd/commit! put! get-fn legacy-state nil)
+             everything (constantly true)]
+         (testing "reads work on the untouched legacy chain"
+           (is (= 2 (eng/novelty-size get-fn legacy-chain-cid)))
+           (is (= #{{:e "alice" :a "role" :v_edn "\"admin\"" :added true}
+                    {:e "bob" :a "role" :v_edn "\"user\"" :added true}}
+                  (set (eng/hot-datoms get-fn legacy-chain-cid everything test-blind-fn test-decrypt-fn)))))
+         (testing "a new commit! migrates it to front/back, preserving chronological order and all data"
+           (let [migrated (eng/commit! put! get-fn [{:s "carol" :p "role" :o "guest"}] legacy-chain-cid test-encrypt-fn)]
+             (is (= 3 (eng/novelty-size get-fn migrated)) "migration preserves the 2 legacy entries + the 1 new one")
+             (is (= #{{:e "alice" :a "role" :v_edn "\"admin\"" :added true}
+                      {:e "bob" :a "role" :v_edn "\"user\"" :added true}
+                      {:e "carol" :a "role" :v_edn "\"guest\"" :added true}}
+                    (set (eng/hot-datoms get-fn migrated everything test-blind-fn test-decrypt-fn))))
+             (testing "folding the migrated chain indexes everything, in the original chronological order"
+               (let [folded (eng/fold! put! get-fn migrated test-blind-fn test-encrypt-fn test-decrypt-fn)]
+                 (is (= 0 (eng/novelty-size get-fn folded)))
+                 (is (= #{{:e "alice" :a "role" :v_edn "\"admin\"" :added true}
+                          {:e "bob" :a "role" :v_edn "\"user\"" :added true}
+                          {:e "carol" :a "role" :v_edn "\"guest\"" :added true}}
+                        (set (eng/cold-datoms get-fn (eng/latest-snapshot-cid get-fn folded) nil everything
+                                              test-blind-fn test-decrypt-fn))))))))))))
+
+#?(:clj
+   (deftest bounded-fold-across-front-exhaustion-preserves-chronological-retraction-order
+     (testing "the counterexample from kotoba-lang/kotobase-peer#16's design-review
+               comment, made concrete: assert X, retract X, assert X (3 writes,
+               chronological order) -- if replayed out of order (e.g. newest-
+               first), the final state would be WRONG (the newest assert would
+               get incorrectly cancelled by the older retraction). This test
+               forces the exact scenario a naive/incorrect design would get
+               wrong: bound the first fold to 1 entry (drains front down to a
+               state where a LATER bounded fold must reverse back into a fresh
+               front), so the assert/retract/assert sequence straddles that
+               front-exhaustion boundary, and asserts the final state is still
+               X asserted (chronologically correct), not X retracted."
+       (let [{:keys [put! get-fn]} (mem-store)
+             c0 (eng/commit! put! get-fn [{:s "x" :p "flag" :o "on"}] nil test-encrypt-fn)               ; #1 assert X
+             c1 (eng/commit! put! get-fn [[:db/retract "x" "flag" "on"]] c0 test-encrypt-fn)              ; #2 retract X
+             c2 (eng/commit! put! get-fn [{:s "x" :p "flag" :o "on"}] c1 test-encrypt-fn)                 ; #3 assert X (newest)
+             everything (constantly true)]
+         (is (= 3 (eng/novelty-size get-fn c2)))
+         (let [folded-1 (eng/fold! put! get-fn c2 ipld/link? 1 test-blind-fn test-encrypt-fn test-decrypt-fn)]
+           (is (= 2 (eng/novelty-size get-fn folded-1)) "bounded fold #1 (n=1) drains exactly the oldest entry")
+           (let [folded-2 (eng/fold! put! get-fn folded-1 ipld/link? 1 test-blind-fn test-encrypt-fn test-decrypt-fn)]
+             (is (= 1 (eng/novelty-size get-fn folded-2)) "bounded fold #2 (n=1) drains the next oldest")
+             (let [folded-3 (eng/fold! put! get-fn folded-2 ipld/link? 1 test-blind-fn test-encrypt-fn test-decrypt-fn)]
+               (is (= 0 (eng/novelty-size get-fn folded-3)) "bounded fold #3 (n=1) drains the last entry")
+               (is (= #{{:e "x" :a "flag" :v_edn "\"on\"" :added true}}
+                      (set (eng/hot-datoms get-fn folded-3 everything test-blind-fn test-decrypt-fn)))
+                   "final state is X asserted (the chronologically newest write wins) -- NOT retracted, which is what a newest-first (incorrect) fold order would have produced"))))))))
+
+#?(:clj
+   (deftest push-after-take-oldest-refreshes-front-and-stays-chronologically-correct
+        (testing "push (commit!) interleaved with a bounded take that exhausts
+                  front and reverses back -- a fresh push after that reversal
+                  must land in the (now-empty) back, and a later full read must
+                  still return everything in correct chronological order"
+          (let [{:keys [put! get-fn]} (mem-store)
+                c0 (eng/commit! put! get-fn [{:s "a" :p "n" :o 1}] nil test-encrypt-fn)
+                c1 (eng/commit! put! get-fn [{:s "b" :p "n" :o 2}] c0 test-encrypt-fn)
+                c2 (eng/commit! put! get-fn [{:s "c" :p "n" :o 3}] c1 test-encrypt-fn)
+                everything (constantly true)
+                ;; bound=2 against 3 novelty entries: front (built at push-time,
+                ;; all 3 in front since no fold happened yet) has exactly 3, so
+                ;; take-oldest-novelty's ">= n" branch applies here, not the
+                ;; front-exhaustion/reverse-back branch -- exercise THAT branch
+                ;; by folding down to 1 remaining, then taking 1 more (draining
+                ;; front to empty), THEN pushing again before reading everything.
+                folded-1 (eng/fold! put! get-fn c2 ipld/link? 2 test-blind-fn test-encrypt-fn test-decrypt-fn)
+                _ (is (= 1 (eng/novelty-size get-fn folded-1)))
+                folded-2 (eng/fold! put! get-fn folded-1 ipld/link? 1 test-blind-fn test-encrypt-fn test-decrypt-fn)
+                _ (is (= 0 (eng/novelty-size get-fn folded-2)) "front now fully drained")
+                c3 (eng/commit! put! get-fn [{:s "d" :p "n" :o 4}] folded-2 test-encrypt-fn)]
+            (is (= 1 (eng/novelty-size get-fn c3)) "the post-drain push landed correctly")
+            (is (= #{{:e "a" :a "n" :v_edn "\"1\"" :added true}
+                     {:e "b" :a "n" :v_edn "\"2\"" :added true}
+                     {:e "c" :a "n" :v_edn "\"3\"" :added true}
+                     {:e "d" :a "n" :v_edn "\"4\"" :added true}}
+                   (set (eng/hot-datoms get-fn c3 everything test-blind-fn test-decrypt-fn)))
+                "hot-datoms after the post-drain push sees everything: a/b/c already folded (cold) PLUS d, the new novelty entry (hot), correctly merged")
+            (let [final-folded (eng/fold! put! get-fn c3 test-blind-fn test-encrypt-fn test-decrypt-fn)]
+              (is (= #{{:e "a" :a "n" :v_edn "\"1\"" :added true}
+                       {:e "b" :a "n" :v_edn "\"2\"" :added true}
+                       {:e "c" :a "n" :v_edn "\"3\"" :added true}
+                       {:e "d" :a "n" :v_edn "\"4\"" :added true}}
+                     (set (eng/cold-datoms get-fn (eng/latest-snapshot-cid get-fn final-folded) nil everything
+                                           test-blind-fn test-decrypt-fn)))
+                  "everything pushed across the whole sequence is present after a final full fold"))))))
+
 #?(:clj
    (deftest fold-bang-is-deterministic-across-independent-stores
      (testing "folding the identical (indexed, novelty) history from two independent
@@ -1686,6 +1804,87 @@
              (.then (fn [folded]
                       (is (= 0 (eng/novelty-size get-fn folded)) "nil max-novelty still fully compacts")
                       (done))))))))
+
+;; ── kotoba-lang/kotobase-peer#16: front/back persistent-queue novelty ──────
+
+#?(:cljs
+   (deftest legacy-flat-vector-novelty-state-reads-and-migrates-correctly
+     ;; see the :clj version's docstring -- same scenario, promise-chained.
+     ;; cd/head, cd/commit!, and every new push-novelty!/take-oldest-novelty
+     ;; helper are synchronous on cljs too (no crypto involved, only cid/
+     ;; link plumbing) -- only commit!/fold! themselves need .then.
+     (async done
+       (let [{:keys [put! get-fn]} (mem-store)
+             everything (constantly true)
+             walk-chain (fn walk-chain [head-link]
+                          (loop [cid (some-> head-link ipld/link-cid) acc []]
+                            (if (nil? cid)
+                              acc
+                              (let [{:strs [e rest]} (ipld/get-node get-fn cid)]
+                                (recur (some-> rest ipld/link-cid) (conj acc e))))))]
+         (-> (eng/commit! put! get-fn [{:s "alice" :p "role" :o "admin"}] nil test-encrypt-fn)
+             (.then (fn [c0] (eng/commit! put! get-fn [{:s "bob" :p "role" :o "user"}] c0 test-encrypt-fn)))
+             (.then (fn [c1]
+                      (let [{:keys [state]} (cd/head get-fn c1)
+                            tx-links (into (walk-chain (get state "novelty-front"))
+                                           (rseq (walk-chain (get state "novelty-back"))))
+                            legacy-state {"indexed" nil "novelty" tx-links}
+                            legacy-chain-cid (cd/commit! put! get-fn legacy-state nil)]
+                        (is (= 2 (eng/novelty-size get-fn legacy-chain-cid)) "reads work on the untouched legacy chain")
+                        (-> (eng/hot-datoms get-fn legacy-chain-cid everything test-blind-fn test-decrypt-fn)
+                            (.then (fn [rows]
+                                     (is (= #{{:e "alice" :a "role" :v_edn "\"admin\"" :added true}
+                                              {:e "bob" :a "role" :v_edn "\"user\"" :added true}}
+                                            (set rows)))
+                                     (-> (eng/commit! put! get-fn [{:s "carol" :p "role" :o "guest"}] legacy-chain-cid test-encrypt-fn)
+                                         (.then (fn [migrated]
+                                                  (is (= 3 (eng/novelty-size get-fn migrated))
+                                                      "migration preserves the 2 legacy entries + the 1 new one")
+                                                  (-> (eng/hot-datoms get-fn migrated everything test-blind-fn test-decrypt-fn)
+                                                      (.then (fn [rows2]
+                                                               (is (= #{{:e "alice" :a "role" :v_edn "\"admin\"" :added true}
+                                                                        {:e "bob" :a "role" :v_edn "\"user\"" :added true}
+                                                                        {:e "carol" :a "role" :v_edn "\"guest\"" :added true}}
+                                                                      (set rows2)))
+                                                               (-> (eng/fold! put! get-fn migrated test-blind-fn test-encrypt-fn test-decrypt-fn)
+                                                                   (.then (fn [folded]
+                                                                            (is (= 0 (eng/novelty-size get-fn folded)))
+                                                                            (-> (eng/cold-datoms get-fn (eng/latest-snapshot-cid get-fn folded) nil everything
+                                                                                                 test-blind-fn test-decrypt-fn)
+                                                                                (.then (fn [cold-rows]
+                                                                                         (is (= #{{:e "alice" :a "role" :v_edn "\"admin\"" :added true}
+                                                                                                  {:e "bob" :a "role" :v_edn "\"user\"" :added true}
+                                                                                                  {:e "carol" :a "role" :v_edn "\"guest\"" :added true}}
+                                                                                                (set cold-rows))
+                                                                                             "folding the migrated chain indexes everything, in the original chronological order")
+                                                                                         (done))))))))))))))))))))))))
+
+#?(:cljs
+   (deftest bounded-fold-across-front-exhaustion-preserves-chronological-retraction-order
+     ;; see the :clj version's docstring -- same counterexample scenario.
+     (async done
+       (let [{:keys [put! get-fn]} (mem-store)
+             everything (constantly true)]
+         (-> (eng/commit! put! get-fn [{:s "x" :p "flag" :o "on"}] nil test-encrypt-fn)
+             (.then (fn [c0] (eng/commit! put! get-fn [[:db/retract "x" "flag" "on"]] c0 test-encrypt-fn)))
+             (.then (fn [c1] (eng/commit! put! get-fn [{:s "x" :p "flag" :o "on"}] c1 test-encrypt-fn)))
+             (.then (fn [c2]
+                      (is (= 3 (eng/novelty-size get-fn c2)))
+                      (-> (eng/fold! put! get-fn c2 ipld/link? 1 test-blind-fn test-encrypt-fn test-decrypt-fn)
+                          (.then (fn [folded-1]
+                                   (is (= 2 (eng/novelty-size get-fn folded-1)))
+                                   (-> (eng/fold! put! get-fn folded-1 ipld/link? 1 test-blind-fn test-encrypt-fn test-decrypt-fn)
+                                       (.then (fn [folded-2]
+                                                (is (= 1 (eng/novelty-size get-fn folded-2)))
+                                                (-> (eng/fold! put! get-fn folded-2 ipld/link? 1 test-blind-fn test-encrypt-fn test-decrypt-fn)
+                                                    (.then (fn [folded-3]
+                                                             (is (= 0 (eng/novelty-size get-fn folded-3)))
+                                                             (-> (eng/hot-datoms get-fn folded-3 everything test-blind-fn test-decrypt-fn)
+                                                                 (.then (fn [rows]
+                                                                          (is (= #{{:e "x" :a "flag" :v_edn "\"on\"" :added true}}
+                                                                                 (set rows))
+                                                                              "final state is X asserted (newest write wins) -- NOT retracted")
+                                                                          (done))))))))))))))))))))
 
 #?(:cljs
    (deftest fold-bang-is-deterministic-across-independent-stores

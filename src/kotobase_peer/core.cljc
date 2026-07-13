@@ -15,9 +15,15 @@
 ;; a full hot db into 4 fresh prolly-trees on EVERY write -- O(graph). Confirmed
 ;; live 2026-07-03 as the root cause of a CF Worker CPU-limit collapse (error 1102)
 ;; during a 321-actor mass write. `commit!` is now a novelty-log APPEND (O(tx)):
-;; chain's opaque `state` carries `{"indexed" <snapshot Link>|nil "novelty"
-;; [<tx-block Link> ...]}`; a write puts one small tx block and prepends its link,
-;; touching neither a prolly-tree nor the graph itself. `fold!` compacts novelty
+;; chain's opaque `state` carries `{"indexed" <snapshot Link>|nil "novelty-front"
+;; <Link>|nil "novelty-back" <Link>|nil "novelty-count" <int>}` -- a two-list
+;; persistent-queue novelty log (kotoba-lang/kotobase-peer#16; front/back are
+;; cons-chains of small nodes, not a flat vector -- see the "persistence"
+;; section below for the full design and why the ORIGINAL D1 landing's flat-
+;; vector `"novelty"` [<tx-block Link> ...] was still O(n) per write despite
+;; this comment's O(tx) claim). A write puts one small tx block and pushes ONE
+;; new small cons node onto `novelty-back`, touching neither a prolly-tree,
+;; the graph itself, nor any EXISTING novelty entry. `fold!` compacts novelty
 ;; into a fresh `indexed` snapshot (the same O(graph) work the old `commit!` always
 ;; did, now amortized over however many writes accumulated first) and is content-
 ;; addressed -- deterministic, safe for any writer (server cron, a browser at idle)
@@ -733,19 +739,57 @@
 ;;
 ;; state shape (opaque to chain; this peer library's own convention, encoded
 ;; with STRING keys per the codebase's IPLD-node convention):
-;;   {"indexed" Link|nil    -- the last-folded arrangement snapshot CID
-;;    "novelty" [Link ...]} -- tx-block CIDs appended since, oldest first
+;;   {"indexed" Link|nil        -- the last-folded arrangement snapshot CID
+;;    "novelty-front" Link|nil  -- oldest-first cons-chain of not-yet-folded
+;;                                 tx-block links (walking via "rest" gives
+;;                                 oldest-to-newest order)
+;;    "novelty-back" Link|nil   -- newest-first cons-chain (walking via
+;;                                 "rest" gives newest-to-oldest order) --
+;;                                 commit! pushes HERE, O(1): one new small
+;;                                 node; front and every EXISTING back node
+;;                                 are never touched/re-encoded (kotoba-lang/
+;;                                 kotobase-peer#16 -- the flat-vector
+;;                                 "novelty" this replaces required
+;;                                 decoding+re-encoding the WHOLE thing on
+;;                                 every single commit!, O(n) per write /
+;;                                 O(n^2) total for n writes)
+;;    "novelty-count" Int}      -- maintained alongside front/back so
+;;                                 novelty-size/should-fold? and the
+;;                                 per-commit delta walk in
+;;                                 newly-added-tx-cids stay O(1) without
+;;                                 walking either chain
+;;
+;; A "novelty node" (front's and back's element type) is {"e" Link "rest"
+;; Link|nil} -- e = the tx-block link, rest = the next node in THIS
+;; particular chain (front or back), or nil at that chain's end.
+;;
+;; Reading ALL novelty in chronological (oldest-first) order = walk front
+;; (already oldest-first) ++ reverse(walk back) (back is newest-first, so
+;; reversing it gives oldest-of-back-first) -- see novelty-cids, below.
+;;
+;; Classic two-list persistent-queue design (Okasaki, *Purely Functional
+;; Data Structures*): push (commit!) is O(1) (one new back node, see
+;; push-novelty!). Pop-oldest-N (fold!'s max-novelty, see take-oldest-
+;; novelty) is O(min(n, front-length)) in the common case; when front runs
+;; out before n is reached, back gets reversed into a fresh front (O(back-
+;; length), but only on that one call -- amortized against however many
+;; pushes built up back since front was last refreshed, NOT a flat per-call
+;; guarantee regardless of history).
 ;;
 ;; Pre-D1 chains store a BARE snapshot Link as `state` (the original commit!,
-;; now `snapshot!`) -- `normalize-state` reads that as the D1 empty-novelty
-;; equivalent, so existing chains (incl. every actor already live on
-;; pds.aozora.app before this landed) keep reading and writing correctly with
-;; zero migration step.
+;; now `snapshot!`) -- `normalize-state` reads that as the empty-novelty
+;; equivalent (new shape), zero migration step. Chains written by the
+;; ORIGINAL D1 landing (flat-vector `"novelty"`, no `"novelty-front"` key)
+;; are detected by `legacy-novelty-state?` and read correctly by every
+;; function below; `commit!`/`fold!` migrate them to the new shape on next
+;; write (one-time O(existing legacy novelty length) cost -- no worse than
+;; any other read of that legacy data would already pay, see push-novelty!/
+;; take-oldest-novelty's own docstrings).
 
 (defn snapshot!
   "Full O(graph) commit: snapshot `db`'s 4 indexes into content-addressed
    prolly-trees (`arrangement.core/commit!`, always with `prev` nil) and
-   append that snapshot CID (as `{\"indexed\" snap \"novelty\" []}`) onto the
+   append that snapshot CID (as a fresh empty-novelty state) onto the
    chain rooted at `prev-chain-cid`. This is the SAME expensive
    rebuild the pre-D1 `commit!` did on every write; it now exists only as a
    primitive `fold!` calls internally, plus a one-shot cold-start entry point
@@ -761,34 +805,161 @@
   #?(:clj
      (let [snapshot-cid (qs/commit! put! db nil qs/current-schema-version blind-fn encrypt-fn)]
        (cd/commit! put! get-fn
-                   {"indexed" (ipld/link snapshot-cid) "novelty" []}
+                   {"indexed" (ipld/link snapshot-cid)
+                    "novelty-front" nil "novelty-back" nil "novelty-count" 0}
                    prev-chain-cid))
      :cljs
      (-> (qs/commit! put! db nil qs/current-schema-version blind-fn encrypt-fn)
          (.then (fn [snapshot-cid]
                   (cd/commit! put! get-fn
-                              {"indexed" (ipld/link snapshot-cid) "novelty" []}
+                              {"indexed" (ipld/link snapshot-cid)
+                               "novelty-front" nil "novelty-back" nil "novelty-count" 0}
                               prev-chain-cid))))))
 
 (defn- normalize-state [state]
   (cond
-    (ipld/link? state) {"indexed" state "novelty" []}
+    (ipld/link? state) {"indexed" state "novelty-front" nil "novelty-back" nil "novelty-count" 0}
     (map? state)       state
-    (nil? state)       {"indexed" nil "novelty" []}
+    (nil? state)       {"indexed" nil "novelty-front" nil "novelty-back" nil "novelty-count" 0}
     :else (throw (ex-info "kotobase-peer: unrecognized commit state shape"
                           {:state state}))))
 
+(defn- legacy-novelty-state?
+  "True iff `state` uses the ORIGINAL flat-vector \"novelty\" shape (a chain
+  written before this landing, never yet migrated). Every state THIS build
+  writes always has \"novelty-front\"/\"novelty-back\" keys present (even
+  when both nil), so their absence reliably means 'not yet touched by
+  post-migration code' rather than 'empty via the new code path'."
+  [state]
+  (and (contains? state "novelty") (not (contains? state "novelty-front"))))
+
 (defn- state-at
-  "The normalized `{\"indexed\" ... \"novelty\" ...}` state at `chain-cid`
-   (an O(1) head fetch since chain/head, ADR-2607032430's other half).
-   nil chain-cid (no prior commit) → the empty state."
+  "The normalized state at `chain-cid` (an O(1) head fetch since chain/head,
+   ADR-2607032430's other half -- and, since kotoba-lang/kotobase-peer#16's
+   fix, an O(1) STATE SIZE too: the state block itself only ever holds 4
+   small links/ints, never the full novelty backlog inline, unlike the flat
+   vector this replaced). nil chain-cid (no prior commit) → the empty state."
   [get-fn chain-cid]
   (if (nil? chain-cid)
-    {"indexed" nil "novelty" []}
+    {"indexed" nil "novelty-front" nil "novelty-back" nil "novelty-count" 0}
     (normalize-state (:state (cd/head get-fn chain-cid)))))
 
 (defn- indexed-cid [state] (some-> (get state "indexed") ipld/link-cid))
-(defn- novelty-cids [state] (mapv ipld/link-cid (get state "novelty" [])))
+
+;; ── novelty cons-chains (front/back) ────────────────────────────────────────
+
+(defn- novelty-node-cid!
+  "Puts one {\"e\" tx-link \"rest\" rest-link|nil} node, returns its cid
+  (string, NOT wrapped in a Link -- callers wrap when storing it as a
+  value)."
+  [put! tx-cid rest-link]
+  (ipld/put-node! put! {"e" (ipld/link tx-cid) "rest" rest-link}))
+
+(defn- walk-novelty-chain
+  "cids in this cons-chain's own head-to-tail order (the caller decides what
+  that means: front chains are oldest-first, back chains are newest-first).
+  O(chain length) -- necessarily, every node has to be fetched to return it.
+  nil head-cid -> []."
+  [get-fn head-cid]
+  (loop [cid head-cid acc []]
+    (if (nil? cid)
+      acc
+      (let [{:strs [e rest]} (ipld/get-node get-fn cid)]
+        (recur (some-> rest ipld/link-cid) (conj acc (ipld/link-cid e)))))))
+
+(defn- build-novelty-chain!
+  "Builds a new cons-chain from `cids` (a vector, in the order you want when
+  WALKING the result head-to-tail) and returns a Link to its head, or nil if
+  `cids` is empty. Shared by legacy-novelty migration and by 'reverse back
+  into a fresh front' (take-oldest-novelty) -- both are 'turn this in-order
+  vector into a walkable chain, cheaply'. O(count cids) puts -- the one-time
+  cost either of those two callers pays, never repeated per-entry on a later
+  unrelated push."
+  [put! cids]
+  (reduce (fn [rest-link cid] (ipld/link (novelty-node-cid! put! cid rest-link)))
+          nil
+          (reverse cids)))
+
+(defn- novelty-cids
+  "ALL not-yet-folded tx-block cids, oldest-first (chronological order).
+  O(current total novelty length) -- necessarily, since returning everything
+  means touching everything; see take-oldest-novelty for a genuinely bounded
+  alternative when only a prefix is needed."
+  [get-fn state]
+  (if (legacy-novelty-state? state)
+    (mapv ipld/link-cid (get state "novelty" []))
+    (let [front (walk-novelty-chain get-fn (some-> (get state "novelty-front") ipld/link-cid))
+          back (walk-novelty-chain get-fn (some-> (get state "novelty-back") ipld/link-cid))]
+      (into front (rseq back)))))
+
+(defn- newest-novelty-cid
+  "The single most-recently-pushed tx-cid, or nil if novelty is empty. O(1)
+  for a non-legacy state (peeks novelty-back's head node) -- never walks the
+  full backlog just to find its newest entry."
+  [get-fn state]
+  (if (legacy-novelty-state? state)
+    (some-> (peek (get state "novelty" [])) ipld/link-cid)
+    (when-let [back-cid (some-> (get state "novelty-back") ipld/link-cid)]
+      (ipld/link-cid (get (ipld/get-node get-fn back-cid) "e")))))
+
+(defn- push-novelty!
+  "Returns a NEW {\"novelty-front\" .. \"novelty-back\" .. \"novelty-count\"
+  ..} triple with `tx-cid` pushed onto the back. O(1) in steady state (one
+  new small cons node; `front` and every EXISTING `back` node are never
+  touched/re-encoded) -- THE actual fix for kotoba-lang/kotobase-peer#16
+  (the flat vector this replaces had to be decoded+re-encoded WHOLE on
+  every single push). Migrates a legacy flat-vector novelty into the new
+  front chain the first time a push touches it -- O(legacy length), paid
+  once, never again for that chain."
+  [put! state tx-cid]
+  (if (legacy-novelty-state? state)
+    (let [legacy-cids (mapv ipld/link-cid (get state "novelty" []))]
+      {"novelty-front" (build-novelty-chain! put! legacy-cids)
+       "novelty-back" (ipld/link (novelty-node-cid! put! tx-cid nil))
+       "novelty-count" (inc (count legacy-cids))})
+    (let [back-link (get state "novelty-back")]
+      {"novelty-front" (get state "novelty-front")
+       "novelty-back" (ipld/link (novelty-node-cid! put! tx-cid back-link))
+       "novelty-count" (inc (get state "novelty-count" 0))})))
+
+(defn- take-oldest-novelty
+  "Returns {\"novelty-front\" .. \"novelty-back\" .. \"novelty-count\" ..
+  :taken [cids, oldest-first, up to n]} -- the n oldest not-yet-folded
+  entries, plus the novelty state with them removed (fewer than n taken if
+  that's all there was).
+
+  Cost: O(min(n, front-length)) in the common case -- taken directly off
+  `front`, which is already oldest-first; `back` untouched. If `front`
+  doesn't have n entries, ALSO pays O(back-length) to reverse `back` into a
+  fresh front and continue taking from there -- this only happens once
+  `front` is exhausted, amortized against however many pushes built up
+  `back` since front was last refreshed (classic persistent-queue amortized
+  accounting -- expensive on a single call sometimes, O(1) amortized over a
+  sequence of push/take calls, NOT a flat per-call guarantee regardless of
+  history; see kotoba-lang/kotobase-peer#16's own follow-up comment on
+  this).
+
+  A legacy flat-vector novelty is migrated to the new shape as part of this
+  call (same one-time-cost story as push-novelty!)."
+  [put! get-fn state n]
+  (let [legacy? (legacy-novelty-state? state)
+        front (if legacy?
+                (mapv ipld/link-cid (get state "novelty" []))
+                (walk-novelty-chain get-fn (some-> (get state "novelty-front") ipld/link-cid)))]
+    (if (>= (count front) n)
+      {:taken (subvec front 0 n)
+       "novelty-front" (build-novelty-chain! put! (subvec front n))
+       "novelty-back" (if legacy? nil (get state "novelty-back"))
+       "novelty-count" (- (if legacy? (count front) (get state "novelty-count" 0)) n)}
+      (let [back-cid (if legacy? nil (some-> (get state "novelty-back") ipld/link-cid))
+            back-oldest-first (vec (rseq (walk-novelty-chain get-fn back-cid)))
+            combined (into front back-oldest-first)
+            k (min n (count combined))
+            total (if legacy? (count front) (get state "novelty-count" 0))]
+        {:taken (subvec combined 0 k)
+         "novelty-front" (build-novelty-chain! put! (subvec combined k))
+         "novelty-back" nil
+         "novelty-count" (- total k)}))))
 
 (defn- quad->wire [{:keys [s p o op]}]
   ;; "op" appears only on non-assert quads — asserts (and every pre-
@@ -825,13 +996,16 @@
 
 (defn commit!
   "THE write path (ADR-2607032430 D1): append `tx-data` as one novelty tx
-   block. O(|tx-data|) — reads only the previous state's {indexed, novelty}
-   LINKS (one O(1) head fetch via chain, never the graph itself) and
-   writes one new small tx block plus one new chain entry. Touches no
-   prolly-tree, rehydrates nothing. `tx-data` accepts the same shapes
-   `transact` does (quad maps, `[:db/add e a v]`, bare `[e a v]` triples,
-   and the retraction forms `[:db/retract e a v]` / `[:db/retractEntity e]`
-   — ADR-2607071610).
+   block. O(|tx-data|) — reads only the previous state's small {indexed,
+   novelty-front, novelty-back, novelty-count} LINKS/int (one O(1) head
+   fetch via chain, never the graph itself, and — since kotoba-lang/
+   kotobase-peer#16's fix — never the full novelty backlog either: pushing
+   the new tx-block link is one new small cons node, see push-novelty!,
+   NOT a re-encode of every not-yet-folded entry) and writes one new small
+   tx block plus one new chain entry. Touches no prolly-tree, rehydrates
+   nothing. `tx-data` accepts the same shapes `transact` does (quad maps,
+   `[:db/add e a v]`, bare `[e a v]` triples, and the retraction forms
+   `[:db/retract e a v]` / `[:db/retractEntity e]` — ADR-2607071610).
 
    This REPLACES the pre-D1 `commit!` (now `snapshot!`), which took an
    already-hydrated hot db and paid a full O(graph) rebuild on every call —
@@ -843,18 +1017,20 @@
    `encrypt-fn` (ADR-2607051000, accepted 2026-07-06) is REQUIRED and
    threaded straight to `put-tx-block!` -- see its docstring for the
    contract, including the sync-JVM/Promise-cljs platform split (`put-tx-
-   block!` is itself a `js/Promise` of the tx CID on cljs)."
+   block!` is itself a `js/Promise` of the tx CID on cljs; `push-novelty!`
+   itself is synchronous on BOTH platforms — it touches only cids/links,
+   no crypto)."
   [put! get-fn tx-data prev-chain-cid encrypt-fn]
   (let [quads (mapv ->quad tx-data)
         state (state-at get-fn prev-chain-cid)]
     #?(:clj
        (let [tx-cid (put-tx-block! put! quads encrypt-fn)
-             new-state (update state "novelty" (fnil conj []) (ipld/link tx-cid))]
+             new-state (merge (dissoc state "novelty") (push-novelty! put! state tx-cid))]
          (cd/commit! put! get-fn new-state prev-chain-cid))
        :cljs
        (-> (put-tx-block! put! quads encrypt-fn)
            (.then (fn [tx-cid]
-                    (let [new-state (update state "novelty" (fnil conj []) (ipld/link tx-cid))]
+                    (let [new-state (merge (dissoc state "novelty") (push-novelty! put! state tx-cid))]
                       (cd/commit! put! get-fn new-state prev-chain-cid))))))))
 
 (defn commit-with-report!
@@ -988,9 +1164,16 @@
 
 (defn novelty-size
   "How many not-yet-folded tx blocks sit on `chain-cid`'s current state —
-   the `fold!` trigger signal."
+   the `fold!` trigger signal. O(1) once a chain has been touched by this
+   build's code (reads the maintained \"novelty-count\" field, never walks
+   front/back); O(legacy novelty length) for a chain still in the pre-
+   kotoba-lang/kotobase-peer#16-fix flat-vector shape — no worse than
+   `state-at` already pays to read such a chain's state at all."
   [get-fn chain-cid]
-  (count (get (state-at get-fn chain-cid) "novelty" [])))
+  (let [state (state-at get-fn chain-cid)]
+    (if (legacy-novelty-state? state)
+      (count (get state "novelty" []))
+      (get state "novelty-count" 0))))
 
 (def default-fold-threshold
   "novelty length `should-fold?` flags for compaction at. Tunes the
@@ -1249,12 +1432,12 @@
   (let [state (state-at get-fn chain-cid)]
     #?(:clj
        (let [base (hydrate-db get-fn (indexed-cid state) blind-fn decrypt-fn)
-             novelty-quads (mapcat #(read-tx-block get-fn % decrypt-fn) (novelty-cids state))]
+             novelty-quads (mapcat #(read-tx-block get-fn % decrypt-fn) (novelty-cids get-fn state))]
          (reduce (fn [db q] (apply-quad db q ipld/link?)) base novelty-quads))
        :cljs
        (-> (js/Promise.all
             #js [(hydrate-db get-fn (indexed-cid state) blind-fn decrypt-fn)
-                 (pmap-async (fn [cid] (read-tx-block get-fn cid decrypt-fn)) (novelty-cids state))])
+                 (pmap-async (fn [cid] (read-tx-block get-fn cid decrypt-fn)) (novelty-cids get-fn state))])
            (.then (fn [results]
                     (let [[base novelty-quads-per-cid] (vec results)
                           novelty-quads (apply concat novelty-quads-per-cid)]
@@ -1270,18 +1453,27 @@
    data) -- but any ORIGINAL `commit!` this walk already passed still
    counts regardless of a LATER fold, since this reads each commit's
    HISTORICAL state as it was at that point in the chain, not just the
-   tip's current shape. Shared walk `since`/`history` both build on."
+   tip's current shape. Shared walk `since`/`history` both build on.
+
+   Per-commit cost: O(1) for a state already in the new front/back shape
+   (`novelty-count` read directly, `newest-novelty-cid` peeks novelty-back's
+   head node — never walks the full per-commit backlog just to size or
+   peek it); O(legacy novelty length) for a commit still in the pre-
+   kotoba-lang/kotobase-peer#16-fix flat-vector shape (unavoidable — that
+   shape has no cheaper way to answer either question)."
   [get-fn chain-cid after-seq]
   (loop [prev-count 0, remaining (chain get-fn chain-cid), acc []]
     (if (empty? remaining)
       acc
       (let [{:keys [seq state]} (first remaining)
-            novelty (get (normalize-state state) "novelty" [])
-            cur-count (count novelty)]
+            norm (normalize-state state)
+            cur-count (if (legacy-novelty-state? norm)
+                        (count (get norm "novelty" []))
+                        (get norm "novelty-count" 0))]
         (recur cur-count
                (rest remaining)
                (if (and (> seq after-seq) (= cur-count (inc prev-count)))
-                 (conj acc (ipld/link-cid (last novelty)))
+                 (conj acc (newest-novelty-cid get-fn norm))
                  acc))))))
 
 (defn since
@@ -1500,7 +1692,7 @@
         []
         (let [state (state-at get-fn chain-cid)
               snap-rows (cold-datoms get-fn (indexed-cid state) opts visible? blind-fn decrypt-fn)
-              novelty-quads (mapcat #(read-tx-block get-fn % decrypt-fn) (novelty-cids state))
+              novelty-quads (mapcat #(read-tx-block get-fn % decrypt-fn) (novelty-cids get-fn state))
               ;; ADR-2607071610: novelty retractions must also cancel rows the
               ;; INDEXED snapshot contributed (asserted before the last fold)
               snap-rows (remove-retracted (retraction-filters novelty-quads) snap-rows)
@@ -1514,7 +1706,7 @@
         (let [state (state-at get-fn chain-cid)]
           (-> (js/Promise.all
                #js [(cold-datoms get-fn (indexed-cid state) opts visible? blind-fn decrypt-fn)
-                    (pmap-async (fn [cid] (read-tx-block get-fn cid decrypt-fn)) (novelty-cids state))])
+                    (pmap-async (fn [cid] (read-tx-block get-fn cid decrypt-fn)) (novelty-cids get-fn state))])
               ;; `vec`, NOT `js->clj`: every element `js/Promise.all` resolves here is
               ;; already realized ClojureScript data (a Link is an `ipld.core/Link`
               ;; defrecord, which is iterable) -- `js->clj` walks anything iterable and
@@ -1566,6 +1758,13 @@
   instead of repeatedly attempting (and losing all the work of) one
   all-or-nothing fold that never finishes.
 
+  Since kotoba-lang/kotobase-peer#16's fix: reading which entries to fold
+  (unbounded: everything; bounded: the oldest `max-novelty`) no longer
+  requires decoding the WHOLE novelty backlog just to find them — see
+  `novelty-cids`/`take-oldest-novelty`'s own docstrings for the front/back
+  persistent-queue design and its (amortized, not flat-per-call) cost
+  story.
+
   Deterministic FOR A GIVEN novelty-cids ordering and a given `max-novelty`
   choice: prolly-tree/arrangement are content-addressed, so folding the
   identical (indexed, to-fold-slice) pair — from ANY writer, a server cron
@@ -1597,18 +1796,19 @@
    (fold! put! get-fn chain-cid ref? nil blind-fn encrypt-fn decrypt-fn))
   ([put! get-fn chain-cid ref? max-novelty blind-fn encrypt-fn decrypt-fn]
    (let [state (state-at get-fn chain-cid)
-         novelty (get state "novelty" [])
-         bounded? (and max-novelty (< max-novelty (count novelty)))
-         to-fold (if bounded? (subvec (vec novelty) 0 max-novelty) novelty)
-         remaining (if bounded? (subvec (vec novelty) max-novelty) [])
-         to-fold-cids (mapv ipld/link-cid to-fold)]
+         bounded? (some? max-novelty)
+         take-result (when bounded? (take-oldest-novelty put! get-fn state max-novelty))
+         to-fold-cids (if bounded? (:taken take-result) (novelty-cids get-fn state))
+         new-novelty-state (if bounded?
+                             (dissoc take-result :taken)
+                             {"novelty-front" nil "novelty-back" nil "novelty-count" 0})]
      #?(:clj
         (let [novelty-quads (mapcat #(read-tx-block get-fn % decrypt-fn) to-fold-cids)
               db (reduce (fn [db q] (apply-quad db q ref?))
                          (hydrate-db get-fn (indexed-cid state) blind-fn decrypt-fn)
                          novelty-quads)
               new-snap-cid (qs/commit! put! db nil qs/current-schema-version blind-fn encrypt-fn)
-              new-state {"indexed" (ipld/link new-snap-cid) "novelty" (vec remaining)}]
+              new-state (merge {"indexed" (ipld/link new-snap-cid)} new-novelty-state)]
           (cd/commit! put! get-fn new-state chain-cid))
         :cljs
         (-> (js/Promise.all
@@ -1620,7 +1820,7 @@
                            db (reduce (fn [db q] (apply-quad db q ref?)) hydrated-db novelty-quads)]
                        (qs/commit! put! db nil qs/current-schema-version blind-fn encrypt-fn))))
             (.then (fn [new-snap-cid]
-                     (let [new-state {"indexed" (ipld/link new-snap-cid) "novelty" (vec remaining)}]
+                     (let [new-state (merge {"indexed" (ipld/link new-snap-cid)} new-novelty-state)]
                        (cd/commit! put! get-fn new-state chain-cid)))))))))
 
 (defn verify-chain
