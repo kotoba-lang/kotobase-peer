@@ -58,12 +58,42 @@
 ;; therefore returns its result directly on JVM, a `js/Promise` of it on
 ;; cljs — this file's own sibling of `arrangement.core`'s split.
 #?(:cljs
+   (def ^:private pmap-async-batch-size
+     "Max in-flight `f` calls at once (ADR-2607110200 addendum: `hot-datoms`/
+     `fold!`'s novelty read fired ALL novelty tx-block gets via one unbounded
+     `js/Promise.all` — fine for a handful of blocks, but a graph with
+     hundreds of unfolded novelty blocks (a mass-write burst outrunning the
+     fold cron, exactly what happened to yoro-social-v2 on 2026-07-10 --
+     ~300 create-record calls, each its own novelty block, none folded)
+     fires that many simultaneous R2 gets in one shot. Workers' own
+     concurrent-subrequest ceiling then serializes/queues most of them
+     behind the scenes, so wall-clock time degrades sharply past a few dozen
+     in flight rather than scaling with real R2 latency — a graph that
+     should read in ~1-2s of parallel I/O instead exceeds the Worker's own
+     CPU/wall-time budget and the request never completes. Batching bounds
+     the storm to a size well under typical Workers subrequest concurrency
+     limits while still running each batch fully in parallel, so this stays
+     `pmap-async`'s intended 'concurrent, not sequential' behavior -- just
+     capped instead of unbounded. 24 is a starting point (not load-tested
+     against Workers' exact per-plan ceiling); revisit if a graph's novelty
+     count grows enough to need re-tuning."
+     24))
+
+#?(:cljs
    (defn- pmap-async
-     "cljs only: map `f` (returns a `js/Promise`) over `coll` concurrently,
-     return one `js/Promise` of the resolved results, order-preserved."
+     "cljs only: map `f` (returns a `js/Promise`) over `coll` in batches of
+     `pmap-async-batch-size` concurrent calls at a time (never all of `coll`
+     at once, see that var's docstring for why), return one `js/Promise` of
+     the resolved results, order-preserved."
      [f coll]
-     (-> (js/Promise.all (into-array (map f coll)))
-         (.then (fn [arr] (vec arr))))))
+     (let [batches (partition-all pmap-async-batch-size coll)]
+       (reduce (fn [acc-promise batch]
+                 (.then acc-promise
+                        (fn [acc]
+                          (-> (js/Promise.all (into-array (map f batch)))
+                              (.then (fn [batch-results] (into acc batch-results)))))))
+               (js/Promise.resolve [])
+               batches))))
 
 (defn empty-db [] (qs/empty-db))
 

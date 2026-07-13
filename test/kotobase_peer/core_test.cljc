@@ -1463,6 +1463,51 @@
                                                                (done))))))))))))))))))
 
 #?(:cljs
+   (deftest hot-datoms-and-fold-bang-correct-past-the-pmap-async-batch-size
+     ;; ADR-2607110200 addendum: pmap-async batches novelty tx-block gets
+     ;; (pmap-async-batch-size, currently 24) instead of firing them all via
+     ;; one unbounded js/Promise.all -- a graph with hundreds of unfolded
+     ;; novelty blocks was overrunning Workers' concurrent-subrequest ceiling
+     ;; and blowing the CPU/wall-time budget (yoro-social-v2, 2026-07-10,
+     ;; ~300 create-record calls none of which got folded in time). This
+     ;; test commits MORE writes than one batch (30 > 24) so both
+     ;; hot-datoms's and fold!'s novelty reads span at least two batches,
+     ;; and asserts correctness (no dropped/duplicated/reordered rows) is
+     ;; preserved across that batch boundary -- the actual regression this
+     ;; guards against isn't "does batching happen" (opaque from outside)
+     ;; but "does batching silently corrupt results at scale."
+     (async done
+       (let [{:keys [put! get-fn]} (mem-store)
+             everything (constantly true)
+             n 30
+             commit-n! (fn commit-n! [i chain-cid]
+                         (if (>= i n)
+                           (js/Promise.resolve chain-cid)
+                           (-> (eng/commit! put! get-fn
+                                            [{:s (str "actor-" i) :p "role" :o "member"}]
+                                            chain-cid test-encrypt-fn)
+                               (.then (fn [next-cid] (commit-n! (inc i) next-cid))))))]
+         (-> (commit-n! 0 nil)
+             (.then (fn [c-final]
+                      (is (= n (eng/novelty-size get-fn c-final))
+                          "all n writes landed as novelty, none folded yet")
+                      (-> (eng/hot-datoms get-fn c-final everything test-blind-fn test-decrypt-fn)
+                          (.then (fn [before-rows]
+                                   (is (= n (count before-rows))
+                                       "hot-datoms sees all n rows across the batch boundary, none dropped/duplicated")
+                                   (is (= n (count (set before-rows)))
+                                       "no duplicate rows introduced by batching")
+                                   (-> (eng/fold! put! get-fn c-final test-blind-fn test-encrypt-fn test-decrypt-fn)
+                                       (.then (fn [folded]
+                                                (is (= 0 (eng/novelty-size get-fn folded))
+                                                    "fold across >1 batch still fully compacts novelty")
+                                                (-> (eng/hot-datoms get-fn folded everything test-blind-fn test-decrypt-fn)
+                                                    (.then (fn [after-rows]
+                                                             (is (= (set before-rows) (set after-rows))
+                                                                 "folding a >1-batch novelty tail loses/duplicates nothing")
+                                                             (done)))))))))))))))))
+
+#?(:cljs
    (deftest fold-bang-is-deterministic-across-independent-stores
      ;; folding the identical (indexed, novelty) history from two independent
      ;; stores yields the same snapshot CID -- content-addressing holds
