@@ -23,5 +23,10 @@
          :exec-fn cognitect.test-runner.api/test}
   ;; clj-kondo as a Clojars lib (no Homebrew/system install needed).
   :lint {:replace-deps {clj-kondo/clj-kondo {:mvn/version "2024.11.14"}}
-         :main-opts ["-m" "clj-kondo.main" "--lint" "src" "test"
-                     "--fail-level" "error"]}}}
+         :main-opts ["-m" "clj-kondo.main" "--lint" "src" "test" "bench"
+                     "--fail-level" "error"]}
+  ;; Load test / benchmark harness (bench/kotobase_peer/load_test.clj) --
+  ;; not part of :test (slow, not correctness-gating). In-memory store, real
+  ;; JVM crypto, no external deps beyond the base :deps above.
+  :bench {:extra-paths ["bench"]
+          :main-opts ["-m" "kotobase-peer.load-test"]}}}
