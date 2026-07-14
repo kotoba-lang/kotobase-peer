@@ -994,6 +994,34 @@
              (-> (decrypt-fn ct)
                  (.then (fn [pt] (mapv wire->quad (get (ipld/decode pt) "quads"))))))))
 
+#?(:cljs
+   (defn- read-tx-block-async
+     "Like `read-tx-block`, but for `async-get-fn`: a Promise-returning
+     `(fn [cid]) -> js/Promise<bytes>` that fetches DIRECTLY, bypassing a
+     synchronous block-miss trampoline (e.g. `with-blocks`) entirely.
+
+     Motivation (ADR-2607120730 follow-up, confirmed live): routing
+     `fold!`'s COLD-snapshot hydrate through `scan-prefix-async` (`cold-
+     datoms-async`) did NOT by itself resolve `yoro-social-v2`'s CPU-
+     exceeded failures, because `fold!`'s NOVELTY tx-block reads
+     (`read-tx-block`, called via `pmap-async` over `to-fold-cids`) still
+     used the plain synchronous `get-fn` -- and a Worker's whole `h/handle`
+     call is wrapped in ONE `with-blocks` retry loop: ANY miss ANYWHERE
+     within that call (not just in the cold scan) restarts the ENTIRE
+     `h/handle` invocation from scratch, including redoing the (now
+     individually fast, ~880ms) hydrate walk again from zero. With up to
+     `max-novelty` (e.g. 200) novelty blocks, none of them pre-cached, this
+     can mean dozens to hundreds of full restarts -- exactly the kind of
+     redundant-retry cost `scan-prefix-async` fixed for the cold side, just
+     relocated to the novelty side. Routing novelty reads through a direct
+     fetch too removes `with-blocks` from `fold!`'s critical path entirely."
+     [async-get-fn tx-cid decrypt-fn]
+     (-> (async-get-fn tx-cid)
+         (.then ipld/decode)
+         (.then (fn [{:strs [ct]}]
+                  (-> (decrypt-fn ct)
+                      (.then (fn [pt] (mapv wire->quad (get (ipld/decode pt) "quads"))))))))))
+
 (defn commit!
   "THE write path (ADR-2607032430 D1): append `tx-data` as one novelty tx
    block. O(|tx-data|) — reads only the previous state's small {indexed,
@@ -1943,7 +1971,17 @@
   `arrangement.core/commit!` (blind-fn, encrypt-fn). Synchronous on JVM; a
   `js/Promise` of the new chain CID on cljs (the novelty-quads read and the
   snapshot hydrate resolve concurrently there, via `js/Promise.all`, since
-  they're independent)."
+  they're independent).
+
+  `async-get-fn` (optional, `:cljs` only, nil-safe) now covers BOTH the
+  cold-snapshot hydrate (`cold-datoms-async`, ADR-2607120730's first
+  follow-up) AND the novelty tx-block reads (`read-tx-block-async`, this
+  addendum) -- confirmed live that routing ONLY the hydrate through it was
+  insufficient: a Worker's whole `h/handle` call is one `with-blocks`
+  retry loop, and a novelty-block miss restarts the ENTIRE call (redoing
+  the hydrate walk too, however fast it now is on its own). Routing BOTH
+  read paths through a direct async fetch removes `with-blocks` from
+  `fold!`'s critical path entirely, not just from one half of it."
   ([put! get-fn chain-cid blind-fn encrypt-fn decrypt-fn]
    (fold! put! get-fn chain-cid ipld/link? nil blind-fn encrypt-fn decrypt-fn))
   ([put! get-fn chain-cid ref? blind-fn encrypt-fn decrypt-fn]
@@ -1970,7 +2008,11 @@
           (cd/commit! put! get-fn new-state chain-cid))
         :cljs
         (-> (js/Promise.all
-             #js [(pmap-async (fn [cid] (read-tx-block get-fn cid decrypt-fn)) to-fold-cids)
+             #js [(pmap-async (fn [cid]
+                                 (if async-get-fn
+                                   (read-tx-block-async async-get-fn cid decrypt-fn)
+                                   (read-tx-block get-fn cid decrypt-fn)))
+                               to-fold-cids)
                   (hydrate-db-cached get-fn (indexed-cid state) blind-fn decrypt-fn cache-get cache-put! async-get-fn)])
             (.then (fn [results]
                      (let [[novelty-quads-per-cid hydrated-db] (vec results)
