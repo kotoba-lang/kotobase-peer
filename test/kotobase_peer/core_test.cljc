@@ -2292,3 +2292,66 @@
 #?(:clj
    (deftest history-datoms-nil-chain-cid-is-empty
      (is (= [] (eng/history-datoms nil nil (constantly true) test-decrypt-fn)))))
+
+;; ── materialized views (ADR-2607166600 IVM) ──────────────────────────────────
+
+#?(:clj
+   (deftest fold-bang-materializes-views-and-view-rows-stays-fresh
+     (let [{:keys [put! get-fn]} (mem-store)
+           everything (constantly true)
+           c0 (eng/commit! put! get-fn [{:s "alice" :p "role" :o "admin"}
+                                        {:s "alice" :p "name" :o "Alice"}] nil test-encrypt-fn)
+           folded (eng/fold! put! get-fn c0 ipld/link? nil test-blind-fn test-encrypt-fn
+                             test-decrypt-fn nil nil nil {"roles" {"attrs" ["role"]}})
+           v (eng/view-rows get-fn folded "roles" everything test-decrypt-fn)]
+       (is (= {"attrs" ["role"]} (:spec v)))
+       (is (= #{{:e "alice" :a "role" :v_edn "\"admin\"" :added true}}
+              (set (:rows v)))
+           "only spec attrs are materialized; the name row is excluded")
+       (is (nil? (eng/view-rows get-fn folded "nope" everything test-decrypt-fn))
+           "unknown view -> nil")
+       ;; unfolded novelty is merged fresh on read, no new fold needed
+       (let [c1 (eng/commit! put! get-fn [{:s "bob" :p "role" :o "user"}] folded test-encrypt-fn)
+             v1 (eng/view-rows get-fn c1 "roles" everything test-decrypt-fn)]
+         (is (= #{{:e "alice" :a "role" :v_edn "\"admin\"" :added true}
+                  {:e "bob" :a "role" :v_edn "\"user\"" :added true}}
+                (set (:rows v1)))
+             "a novelty assertion matching the spec appears without a fold")
+         ;; carry-forward: fold WITHOUT a views param keeps materializing the view
+         (let [folded2 (eng/fold! put! get-fn c1 test-blind-fn test-encrypt-fn test-decrypt-fn)
+               v2 (eng/view-rows get-fn folded2 "roles" everything test-decrypt-fn)]
+           (is (= #{{:e "alice" :a "role" :v_edn "\"admin\"" :added true}
+                    {:e "bob" :a "role" :v_edn "\"user\"" :added true}}
+                  (set (:rows v2)))
+               "a spec-less fold carries the stored view spec forward and re-materializes"))))))
+
+#?(:clj
+   (deftest view-rows-cancels-novelty-retractions-and-transact-preserves-views
+     (let [{:keys [put! get-fn]} (mem-store)
+           everything (constantly true)
+           c0 (eng/commit! put! get-fn [{:s "alice" :p "role" :o "admin"}] nil test-encrypt-fn)
+           folded (eng/fold! put! get-fn c0 ipld/link? nil test-blind-fn test-encrypt-fn
+                             test-decrypt-fn nil nil nil {"roles" {"attrs" ["role"]}})
+           ;; retract the materialized row via post-fold novelty
+           c1 (eng/commit! put! get-fn [[:db/retract "alice" "role" "admin"]] folded test-encrypt-fn)
+           v (eng/view-rows get-fn c1 "roles" everything test-decrypt-fn)]
+       (is (= #{} (set (filter :added (:rows v))))
+           "an unfolded retraction cancels the stored view row on read")
+       ;; a plain transact (commit!) must not drop the "views" link from state
+       (let [c2 (eng/commit! put! get-fn [{:s "carol" :p "name" :o "Carol"}] c1 test-encrypt-fn)
+             v2 (eng/view-rows get-fn c2 "roles" everything test-decrypt-fn)]
+         (is (some? v2) "commit! carries the views link forward")))))
+
+#?(:clj
+   (deftest view-removal-via-nil-spec
+     (let [{:keys [put! get-fn]} (mem-store)
+           everything (constantly true)
+           c0 (eng/commit! put! get-fn [{:s "a" :p "x" :o "1"}] nil test-encrypt-fn)
+           f1 (eng/fold! put! get-fn c0 ipld/link? nil test-blind-fn test-encrypt-fn
+                         test-decrypt-fn nil nil nil {"xs" {"attrs" ["x"]}})
+           c1 (eng/commit! put! get-fn [{:s "b" :p "x" :o "2"}] f1 test-encrypt-fn)
+           f2 (eng/fold! put! get-fn c1 ipld/link? nil test-blind-fn test-encrypt-fn
+                         test-decrypt-fn nil nil nil {"xs" nil})]
+       (is (some? (eng/view-rows get-fn f1 "xs" everything test-decrypt-fn)))
+       (is (nil? (eng/view-rows get-fn f2 "xs" everything test-decrypt-fn))
+           "an explicit nil spec removes the view at the next fold"))))

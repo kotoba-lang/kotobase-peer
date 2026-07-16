@@ -1903,6 +1903,141 @@
                                                   opts visible?)]
                          (vec (concat snap-rows novelty-rows)))))))))))
 
+;; ── materialized views (RisingWave-style IVM on IPLD, ADR-2607166600) ───────
+;; A view is a named, declaratively-specified projection of the graph's
+;; CURRENT STATE — today's spec language is {"attrs" [attr ...]}: the rows
+;; whose :a is in that set — materialized at fold time as ONE
+;; content-addressed dag-cbor block and linked from the chain state under
+;; "views". The RisingWave mapping: novelty tx-blocks are the stream, fold!
+;; is the barrier/checkpoint, the views block is the MV state in shared
+;; storage, and `view-rows` merges unfolded novelty on read (same hot/cold
+;; split as hot-datoms) so reads are always fresh without waiting for the
+;; next fold. Because the MV is content-addressed and reachable from the
+;; chain head, ANY peer that syncs the chain serves the identical view with
+;; one block read — no central cache. `commit!` (transact) carries "views"
+;; forward untouched (its new-state merges over the old state map); only
+;; fold! re-materializes. Rows are stored AEAD-encrypted as one opaque
+;; ciphertext, exactly like tx-blocks (whole-block reads, no keyed seek, so
+;; no blind-index concern — ADR-2607051000's put-tx-block! precedent).
+;;
+;; Phase 1 derives each view's rows from the fold's already-hydrated merged
+;; db (zero extra reads — fold! pays the full hydrate regardless). When fold
+;; itself goes incremental, view maintenance becomes O(novelty) delta
+;; application against the previous view block (RisingWave's actual IVM);
+;; the stored shape already supports that (spec travels with rows).
+
+(defn- put-views-block!
+  "Write the views node {\"views\" {name {\"spec\" .. \"rows\" [[e a v_edn]
+  ...]}}} as one AEAD-encrypted block; returns its CID (string). Sync on
+  JVM, js/Promise of the CID on cljs (encrypt-fn is a Promise there)."
+  [put! views encrypt-fn]
+  #?(:clj (ipld/put-node! put! {"ct" (encrypt-fn (ipld/encode {"views" views}))})
+     :cljs (-> (encrypt-fn (ipld/encode {"views" views}))
+               (.then (fn [ct] (ipld/put-node! put! {"ct" ct}))))))
+
+(defn- read-views-block
+  "Inverse of put-views-block!: the decrypted {name {\"spec\" .. \"rows\"
+  ..}} map. Sync on JVM, js/Promise on cljs."
+  [get-fn views-cid decrypt-fn]
+  #?(:clj (let [{:strs [ct]} (ipld/get-node get-fn views-cid)]
+            (get (ipld/decode (decrypt-fn ct)) "views"))
+     :cljs (let [{:strs [ct]} (ipld/get-node get-fn views-cid)]
+             (-> (decrypt-fn ct)
+                 (.then (fn [pt] (get (ipld/decode pt) "views")))))))
+
+(defn- derive-view-rows
+  "Current-state rows matching `spec` from an in-memory db, as compact
+  [e a v_edn] triples (assertions only — a view holds current state; the
+  read path re-applies unfolded novelty retractions on top)."
+  [db spec]
+  (let [attrs (set (get spec "attrs"))]
+    (->> (datoms db (constantly true))
+         (filter #(and (:added % true) (contains? attrs (:a %))))
+         (mapv (fn [{:keys [e a v_edn]}] [e a v_edn])))))
+
+(defn- merge-view-specs
+  "The spec set to materialize this fold: the previously-stored specs,
+  overridden by `views-param` when the caller passed one (upsert per name;
+  an explicit nil spec removes that view)."
+  [old-views views-param]
+  (let [old-specs (into {} (map (fn [[k v]] [k (get v "spec")])) old-views)]
+    (if (nil? views-param)
+      old-specs
+      (reduce (fn [acc [k v]] (if (nil? v) (dissoc acc k) (assoc acc k v)))
+              old-specs views-param))))
+
+(defn- materialize-views!
+  "Materialize every view over the fold's merged `db` and write ONE views
+  block. Returns a Link to it, or nil when there are no views to keep.
+  Sync on JVM, js/Promise on cljs."
+  [put! get-fn state db views-param encrypt-fn decrypt-fn]
+  (let [views-cid (some-> (get state "views") ipld/link-cid)]
+    #?(:clj
+       (let [old-views (when views-cid (read-views-block get-fn views-cid decrypt-fn))
+             specs (merge-view-specs old-views views-param)]
+         (when (seq specs)
+           (ipld/link
+            (put-views-block!
+             put!
+             (into {} (map (fn [[nm spec]] [nm {"spec" spec "rows" (derive-view-rows db spec)}])) specs)
+             encrypt-fn))))
+       :cljs
+       (-> (if views-cid
+             (read-views-block get-fn views-cid decrypt-fn)
+             (js/Promise.resolve nil))
+           (.then (fn [old-views]
+                    (let [specs (merge-view-specs old-views views-param)]
+                      (if (seq specs)
+                        (-> (put-views-block!
+                             put!
+                             (into {} (map (fn [[nm spec]] [nm {"spec" spec "rows" (derive-view-rows db spec)}])) specs)
+                             encrypt-fn)
+                            (.then ipld/link))
+                        (js/Promise.resolve nil)))))))))
+
+(defn view-rows
+  "Rows of materialized view `view-name` as of `chain-cid`, ALWAYS FRESH:
+  the fold-time view rows with unfolded novelty merged on top (retractions
+  cancel stored rows; novelty assertions matching the view's spec are
+  appended) — the same hot/cold split as hot-datoms, but the cold half is
+  ONE views block instead of a tree scan. Returns {:spec .. :rows
+  [{:e :a :v_edn :added} ...]} or nil when the view doesn't exist.
+  `visible?` is REQUIRED (same contract as datoms/hot-datoms). Sync on JVM,
+  js/Promise on cljs."
+  [get-fn chain-cid view-name visible? decrypt-fn]
+  (let [state (state-at get-fn chain-cid)
+        views-cid (some-> (get state "views") ipld/link-cid)
+        finish (fn [views novelty-quads]
+                 (when-let [entry (get views view-name)]
+                   (let [spec (get entry "spec")
+                         attrs (set (get spec "attrs"))
+                         stored (map (fn [[e a v]] {:e e :a a :v_edn v :added true})
+                                     (get entry "rows"))
+                         snap-rows (filter visible?
+                                           (remove-retracted (retraction-filters novelty-quads)
+                                                             stored))
+                         novelty-rows (->> (datoms (reduce (fn [db q] (apply-quad db q ipld/link?))
+                                                           (qs/empty-db) novelty-quads)
+                                                   visible?)
+                                           (filter #(contains? attrs (:a %))))]
+                     {:spec spec :rows (vec (concat snap-rows novelty-rows))})))]
+    #?(:clj
+       (when views-cid
+         (let [views (read-views-block get-fn views-cid decrypt-fn)
+               novelty-quads (mapcat #(read-tx-block get-fn % decrypt-fn)
+                                     (novelty-cids get-fn state))]
+           (finish views novelty-quads)))
+       :cljs
+       (if-not views-cid
+         (js/Promise.resolve nil)
+         (-> (js/Promise.all
+              #js [(read-views-block get-fn views-cid decrypt-fn)
+                   (js/Promise.all (into-array (map #(read-tx-block get-fn % decrypt-fn)
+                                                    (novelty-cids get-fn state))))])
+             (.then (fn [^js pair]
+                      (finish (aget pair 0)
+                              (apply concat (array-seq (aget pair 1)))))))))))
+
 (defn fold!
   "Compact `chain-cid`'s novelty into a fresh indexed snapshot: hydrate the
   current `indexed` snapshot, re-assert every novelty quad on top (append
@@ -1991,6 +2126,8 @@
   ([put! get-fn chain-cid ref? max-novelty blind-fn encrypt-fn decrypt-fn cache-get cache-put!]
    (fold! put! get-fn chain-cid ref? max-novelty blind-fn encrypt-fn decrypt-fn cache-get cache-put! nil))
   ([put! get-fn chain-cid ref? max-novelty blind-fn encrypt-fn decrypt-fn cache-get cache-put! async-get-fn]
+   (fold! put! get-fn chain-cid ref? max-novelty blind-fn encrypt-fn decrypt-fn cache-get cache-put! async-get-fn nil))
+  ([put! get-fn chain-cid ref? max-novelty blind-fn encrypt-fn decrypt-fn cache-get cache-put! async-get-fn views]
    (let [state (state-at get-fn chain-cid)
          bounded? (some? max-novelty)
          take-result (when bounded? (take-oldest-novelty put! get-fn state max-novelty))
@@ -2004,7 +2141,9 @@
                          (hydrate-db-cached get-fn (indexed-cid state) blind-fn decrypt-fn cache-get cache-put!)
                          novelty-quads)
               new-snap-cid (qs/commit! put! db nil qs/current-schema-version blind-fn encrypt-fn)
-              new-state (merge {"indexed" (ipld/link new-snap-cid)} new-novelty-state)]
+              views-link (materialize-views! put! get-fn state db views encrypt-fn decrypt-fn)
+              new-state (cond-> (merge {"indexed" (ipld/link new-snap-cid)} new-novelty-state)
+                          views-link (assoc "views" views-link))]
           (cd/commit! put! get-fn new-state chain-cid))
         :cljs
         (-> (js/Promise.all
@@ -2018,9 +2157,14 @@
                      (let [[novelty-quads-per-cid hydrated-db] (vec results)
                            novelty-quads (apply concat novelty-quads-per-cid)
                            db (reduce (fn [db q] (apply-quad db q ref?)) hydrated-db novelty-quads)]
-                       (qs/commit! put! db nil qs/current-schema-version blind-fn encrypt-fn))))
-            (.then (fn [new-snap-cid]
-                     (let [new-state (merge {"indexed" (ipld/link new-snap-cid)} new-novelty-state)]
+                       (js/Promise.all
+                        #js [(qs/commit! put! db nil qs/current-schema-version blind-fn encrypt-fn)
+                             (materialize-views! put! get-fn state db views encrypt-fn decrypt-fn)]))))
+            (.then (fn [^js pair]
+                     (let [new-snap-cid (aget pair 0)
+                           views-link (aget pair 1)
+                           new-state (cond-> (merge {"indexed" (ipld/link new-snap-cid)} new-novelty-state)
+                                       views-link (assoc "views" views-link))]
                        (cd/commit! put! get-fn new-state chain-cid)))))))))
 
 (defn verify-chain
