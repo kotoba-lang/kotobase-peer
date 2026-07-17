@@ -41,14 +41,25 @@
         ;; v_edn is the wire-EDN of the stored value; the stored value is
         ;; itself an EDN string of the prefix vector (the same
         ;; string-blob convention tx values use throughout this stack).
-        prefixes (try
-                   (some-> (get attrs ":kotobase.policy/protected-prefixes")
-                           edn/read-string
-                           (as-> v (if (string? v) (edn/read-string v) v)))
-                   (catch #?(:clj Exception :cljs :default) _ nil))]
+        read-vec (fn [k]
+                   (try
+                     (some-> (get attrs k)
+                             edn/read-string
+                             (as-> v (if (string? v) (edn/read-string v) v)))
+                     (catch #?(:clj Exception :cljs :default) _ nil)))
+        prefixes (read-vec ":kotobase.policy/protected-prefixes")
+        owner-attrs (read-vec ":kotobase.policy/owner-attrs")]
     (when (and (sequential? prefixes) (seq prefixes)
                (every? string? prefixes))
-      {:protected-prefixes (vec prefixes)})))
+      (cond-> {:protected-prefixes (vec prefixes)}
+        ;; Phase 3c (ADR-2607174500 addendum 2): attrs whose VALUE is a DID
+        ;; that owns the entity. A viewer whose verified CACAO issuer DID
+        ;; matches ANY owner-attr value on an entity sees that entity's
+        ;; protected rows even without the read-protected capability — the
+        ;; owner reading their own data (e.g. a DM's :dm.message/author).
+        (and (sequential? owner-attrs) (seq owner-attrs)
+             (every? string? owner-attrs))
+        (assoc :owner-attrs (vec owner-attrs))))))
 
 (defn visible-for
   "(policy × viewer capability strings) → the `visible?` row fn.
@@ -58,19 +69,22 @@
   resources; everything else stays visible. The policy entity's own rows
   are always visible (a viewer may inspect what is being withheld —
   redaction, not stealth)."
-  [policy caps]
-  (if (nil? policy)
-    (constantly true)
-    (let [prefixes (:protected-prefixes policy)
-          allowed? (contains? (set caps) read-protected-capability)]
-      (if allowed?
-        (constantly true)
-        ;; rows arrive in TWO shapes depending on the producer: datoms/
-        ;; hot-datoms/view-rows emit {:e :a :v_edn}, arrangement.query (q)
-        ;; emits {:s :p :o} — treat :a/:p and :e/:s as the same positions
-        ;; (they are; see kotobase-peer.core/datoms' docstring).
-        (fn [row]
-          (let [ent (or (:e row) (:s row))
-                attr (or (:a row) (:p row))]
-            (or (= ent policy-entity)
-                (not (some #(str/starts-with? (or attr "") %) prefixes)))))))))
+  ([policy caps] (visible-for policy caps nil))
+  ([policy caps owned-entities]
+   (if (nil? policy)
+     (constantly true)
+     (let [prefixes (:protected-prefixes policy)
+           allowed? (contains? (set caps) read-protected-capability)
+           owned (set owned-entities)]
+       (if allowed?
+         (constantly true)
+         ;; rows arrive in TWO shapes depending on the producer: datoms/
+         ;; hot-datoms/view-rows emit {:e :a :v_edn}, arrangement.query (q)
+         ;; emits {:s :p :o} — treat :a/:p and :e/:s as the same positions
+         ;; (they are; see kotobase-peer.core/datoms' docstring).
+         (fn [row]
+           (let [ent (or (:e row) (:s row))
+                 attr (or (:a row) (:p row))]
+             (or (= ent policy-entity)
+                 (contains? owned ent)       ; owner-based disclosure (Phase 3c)
+                 (not (some #(str/starts-with? (or attr "") %) prefixes))))))))))
