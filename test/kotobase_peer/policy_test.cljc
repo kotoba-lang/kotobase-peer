@@ -45,6 +45,35 @@
              [{:e "kotobase.policy/read" :a ":kotobase.policy/protected-prefixes"
                :v_edn "\"not-a-vector\"" :added true}]))))
 
+(deftest network-mode-fails-closed-when-private-policy-is-missing-or-malformed
+  (doseq [pol [nil (policy/policy-of
+                    [{:e "kotobase.policy/read"
+                      :a ":kotobase.policy/protected-prefixes"
+                      :v_edn "\"not-a-vector\"" :added true}])]]
+    (let [visible? (policy/visible-for-mode pol [] #{} :private)]
+      (is (not (visible? {:e "secret" :a ":secret/value" :v_edn "\"x\""})))
+      (is (visible? {:e policy/policy-entity
+                     :a ":kotobase.policy/protected-prefixes"}))))
+  (is ((policy/visible-for-mode nil [] #{} :legacy-public)
+       {:e "legacy" :a ":secret/value"})))
+
+(deftest visibility-decision-carries-stable-policy-evidence
+  (let [pol (policy/policy-of policy-rows)
+        a (policy/visible-for-mode pol [policy/read-capability] #{} :private)
+        b (policy/visible-for-mode pol [policy/read-capability] #{} :private)
+        denied (policy/visible-for-mode nil [] #{} :private)]
+    (is (string? (:policy-cid (policy/visibility-evidence a))))
+    (is (= (policy/visibility-evidence a) (policy/visibility-evidence b)))
+    (is (= :policy-filtered (:policy-reason (policy/visibility-evidence a))))
+    (is (= :deny/missing-policy
+           (:policy-reason (policy/visibility-evidence denied))))))
+
+(deftest sealed-mode-requires-effective-decrypt-capability
+  (let [pol (policy/policy-of policy-rows)
+        row {:e "public-looking" :a ":yoro.post/text" :v_edn "\"x\""}]
+    (is (not ((policy/visible-for-mode pol [] #{} :sealed) row)))
+    (is ((policy/visible-for-mode pol [policy/decrypt-capability] #{} :sealed) row))))
+
 (deftest quad-shaped-rows-are-filtered-too
   ;; arrangement.query (q) rows are {:s :p :o}, not {:e :a :v_edn}
   (let [visible? (policy/visible-for (policy/policy-of policy-rows) [])]
@@ -85,3 +114,66 @@
         cap-view (policy/visible-for pol ["kotoba://can/datom:read-protected"] #{})]
     (is (cap-view {:e "m2" :a ":dm.message/text" :v_edn "\"anything\""})
         "the read-protected capability opens everything regardless of ownership")))
+
+(deftest write-policy-checks-the-complete-transaction-before-commit
+  (let [pol {:protected-prefixes [":secret."]
+             :write-prefixes [":app."], :security-mode :private}
+        context {:effective-caps #{policy/transact-capability}}
+        allowed [{:s "e1" :p ":app.title" :o "ok"}]
+        mixed (conj allowed {:s "e2" :p ":secret.value" :o "no"})]
+    (is (:allowed? (policy/write-decision pol context allowed :private)))
+    (let [decision (policy/write-decision pol context mixed :private)]
+      (is (false? (:allowed? decision)))
+      (is (= :write/attribute-denied (-> decision :denials first :reason))))))
+
+(deftest policy-and-authority-records-require-trusted-admin-capability
+  (let [quad {:s policy/policy-entity
+              :p ":kotobase.policy/write-prefixes" :o "[]"}
+        ordinary {:effective-caps #{policy/transact-capability}}
+        admin {:effective-caps #{policy/transact-capability
+                                 policy/policy-admin-capability}}]
+    (is (false? (:allowed? (policy/write-decision nil ordinary [quad] :private))))
+    (is (:allowed? (policy/write-decision nil admin [quad] :private)))))
+
+(deftest private-mode-without-policy-denies-ordinary-writes
+  (let [quad {:s "e" :p ":app.value" :o "x"}
+        context {:effective-caps #{policy/transact-capability}}]
+    (is (false? (:allowed? (policy/write-decision nil context [quad] :private))))
+    (is (:allowed? (policy/write-decision nil context [quad] :legacy-public)))))
+
+(deftest graph-security-mode-is-immutable-after-policy-creation
+  (let [existing {:protected-prefixes [":secret."] :write-prefixes [":app."]
+                  :security-mode :private}
+        admin {:effective-caps #{policy/transact-capability
+                                 policy/policy-admin-capability}}
+        change {:s policy/policy-entity
+                :p ":kotobase.policy/security-mode" :o ":public"}
+        decision (policy/write-decision existing admin [change] :private)]
+    (is (false? (:allowed? decision)))
+    (is (= :write/security-mode-immutable
+           (-> decision :denials first :reason)))))
+
+(deftest write-policy-enforces-entity-action-purpose-owner-and-quota-selectors
+  (let [pol {:protected-prefixes [":secret."] :write-prefixes [":app."]
+             :owner-attrs [":app.owner"]
+             :write-entity-prefixes ["tenant-a/"]
+             :write-actions #{:assert}
+             :required-purpose "profile-update"
+             :max-datoms-per-tx 1 :security-mode :private}
+        context {:effective-caps #{policy/transact-capability}
+                 :purpose "profile-update"}
+        allowed {:s "tenant-a/e1" :p ":app.name" :o "A"}]
+    (is (:allowed? (policy/write-decision pol context [allowed] :private)))
+    (doseq [[quad reason]
+            [[(assoc allowed :s "tenant-b/e1") :write/entity-denied]
+             [(assoc allowed :op :retract) :write/action-denied]
+             [(assoc allowed :p ":app.owner") :write/policy-admin-required]]]
+      (is (= reason (-> (policy/write-decision pol context [quad] :private)
+                         :denials first :reason))))
+    (is (= :write/purpose-denied
+           (-> (policy/write-decision pol (assoc context :purpose "analytics")
+                                      [allowed] :private)
+               :denials first :reason)))
+    (is (= :write/quota-exceeded
+           (-> (policy/write-decision pol context [allowed allowed] :private)
+               :denials last :reason)))))

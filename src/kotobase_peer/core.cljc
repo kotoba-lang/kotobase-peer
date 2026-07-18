@@ -53,6 +53,15 @@
             [chain.core :as cd]
             [datom.core :as dc]))   ; canonical datom model (kotoba : kotobase = Clojure : Datomic)
 
+(defn- verified-node [get-fn expected-cid]
+  (when-let [bytes (get-fn expected-cid)]
+    (let [actual (ipld/cid bytes)]
+      (when-not (= expected-cid actual)
+        (throw (ex-info "kotobase-peer: block CID mismatch"
+                        {:type :ipld/cid-mismatch :expected-cid expected-cid
+                         :actual-cid actual})))
+      (ipld/decode bytes))))
+
 ;; ── platform split for the crypto-touching functions below (ADR-2607051000
 ;; Worker addendum): `blind-fn`/`encrypt-fn`/`decrypt-fn` are synchronous on
 ;; JVM, `js/Promise`-returning on cljs (Web Crypto's `crypto.subtle` has no
@@ -1371,7 +1380,7 @@
      (if (nil? snapshot-cid)
        []
        (let [{:keys [root ->eav]} (index-spec (or index :eavt))
-             snap      (ipld/decode (get-fn snapshot-cid))
+             snap      (verified-node get-fn snapshot-cid)
              root-cid  (some-> (get-in snap ["index-roots" root]) ipld/link-cid)
              entries   (if (nil? root-cid)
                          []
@@ -1387,7 +1396,7 @@
      (if (nil? snapshot-cid)
        (js/Promise.resolve [])
        (let [{:keys [root ->eav]} (index-spec (or index :eavt))
-             snap (ipld/decode (get-fn snapshot-cid))
+             snap (verified-node get-fn snapshot-cid)
              root-cid (some-> (get-in snap ["index-roots" root]) ipld/link-cid)]
          (-> (components-prefix components blind-fn)
              (.then (fn [prefix]
