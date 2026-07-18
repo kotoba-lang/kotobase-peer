@@ -35,12 +35,14 @@
 (defn- bytes-concat
   "a ++ b in the platform's native byte-buffer type (byte[] on :clj,
    Uint8Array on :cljs) — the type multiformats.core/sha256 requires
-   directly, since it does no seq-coercion of its own."
-  [a b]
+   directly, since it does no seq-coercion of its own. `a`/`b` are expected
+   to already be that native type (byte[]/Uint8Array) — the :clj branch
+   type-hints them directly instead of re-coercing via `(byte-array a)`,
+   which was needlessly recopying already-correctly-typed input (~40x
+   slower than the direct arraycopy below)."
+  [^bytes a ^bytes b]
   #?(:clj
-     (let [^bytes a (byte-array a)
-           ^bytes b (byte-array b)
-           out (byte-array (+ (alength a) (alength b)))]
+     (let [out (byte-array (+ (alength a) (alength b)))]
        (System/arraycopy a 0 out 0 (alength a))
        (System/arraycopy b 0 out (alength a) (alength b))
        out)
@@ -59,8 +61,16 @@
   "Verifier -> one challenge for one (node, cid) pair. `nonce` is
    caller-supplied randomness (host chooses the source; this stays a
    pure fn of its inputs, matching this codebase's Date.now/random
-   discipline elsewhere)."
+   discipline elsewhere). `cid`/`nonce` are required at construction
+   time — a nil `nonce` would silently produce a hash with no freshness
+   guarantee instead of erroring, so this fails fast (ex-info, matching
+   this codebase's programmer-error discipline, e.g. murakumo.infer.
+   credits/job-cost) rather than degrading silently."
   [cid nonce epoch]
+  (when (nil? cid)
+    (throw (ex-info "challenge: cid must not be nil" {:cid cid :nonce nonce :epoch epoch})))
+  (when (nil? nonce)
+    (throw (ex-info "challenge: nonce must not be nil" {:cid cid :nonce nonce :epoch epoch})))
   {:kotobase.availability/cid cid
    :kotobase.availability/nonce nonce
    :kotobase.availability/epoch epoch})
@@ -69,8 +79,15 @@
   "Storage node's response, via the SAME get-fn seam kotobase-peer.core/
    commit! and hot-datoms already use. Returns nil (not a fabricated
    proof) if the node lacks the block — fails closed, same discipline as
-   kotobase-peer.core/verify-chain and quota-exceeded?."
-  [get-fn {:kotobase.availability/keys [cid nonce]}]
+   kotobase-peer.core/verify-chain and quota-exceeded?. `cid`/`nonce` are
+   required in `chal` (same fail-fast discipline as `challenge` above) —
+   a nil nonce here would silently produce a proof with no freshness
+   guarantee instead of erroring."
+  [get-fn {:kotobase.availability/keys [cid nonce] :as chal}]
+  (when (nil? cid)
+    (throw (ex-info "prove: cid must not be nil" {:chal chal})))
+  (when (nil? nonce)
+    (throw (ex-info "prove: nonce must not be nil" {:chal chal})))
   (when-let [block-bytes (get-fn cid)]
     {:kotobase.availability/cid cid
      :kotobase.availability/proof (salted-hash block-bytes nonce)}))
@@ -80,15 +97,34 @@
    recomputes the salted hash — only the compact `proof` crosses the
    wire from the node under audit, not the block itself. Never throws;
    fails closed on a missing local replica or a malformed/missing
-   response."
+   response — including a `node-response` whose `:kotobase.availability/
+   proof` (or bytes flowing into bytes-concat/salted-hash) is a
+   malformed/non-byte type: that would otherwise throw out of
+   bytes-concat (ClassCastException on JVM / TypeError on cljs), so the
+   hash computation is wrapped and any such exception maps to
+   `:malformed` instead of propagating."
   [verifier-get-fn {:kotobase.availability/keys [cid nonce]} node-response]
   (let [local-bytes (verifier-get-fn cid)]
     (cond
       (nil? local-bytes) :verifier-lacks-replica
       (nil? node-response) :missed
       (not= (:kotobase.availability/cid node-response) cid) :malformed
-      (= (:kotobase.availability/proof node-response) (salted-hash local-bytes nonce)) :ok
-      :else :failed)))
+      :else
+      (let [expected (try (salted-hash local-bytes nonce)
+                           (catch #?(:clj Exception :cljs :default) _ ::malformed))]
+        (cond
+          (= expected ::malformed) :malformed
+          (= (:kotobase.availability/proof node-response) expected) :ok
+          :else :failed)))))
+
+(defn audit-required?
+  "Does `tier` (a key of redundancy-tiers) require an availability audit
+   before a caller (murakumo/kekkai) invokes challenge/verify at all?
+   Pure lookup over redundancy-tiers — tiers with no other replica holder
+   (see the ns docstring's HONEST SCOPE) can't be audited and shouldn't
+   attempt to be."
+  [tier]
+  (:availability-proof? (get redundancy-tiers tier)))
 
 (defn audit-outcome
   "One epoch's result for one (node, cid) pair -> a pure decision record.
@@ -96,6 +132,11 @@
    :failed/:missed into kekkai membership standing — this ns holds no
    opinion on credits or admission, the same stance kotobase-peer.core
    already takes on CACAO auth (its own README: 'no auth opinion of its
-   own')."
+   own'). Keys are in the same :kotobase.availability/* namespace as
+   challenge/prove/verify's own output (unified from a prior :audit/*
+   namespace) for consistency across this whole ns."
   [node cid epoch verdict]
-  {:audit/node node :audit/cid cid :audit/epoch epoch :audit/verdict verdict})
+  {:kotobase.availability/node node
+   :kotobase.availability/cid cid
+   :kotobase.availability/epoch epoch
+   :kotobase.availability/verdict verdict})

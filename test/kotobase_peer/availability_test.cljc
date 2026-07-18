@@ -17,6 +17,18 @@
 (def nonce-1 (bytes-of [42 42]))
 (def nonce-2 (bytes-of [7 7]))
 
+;; A value that is guaranteed to throw when it reaches bytes-concat's
+;; host interop on EITHER platform -- a keyword hits the `^bytes` type
+;; hint's byte[] cast on :clj (ClassCastException), a JS Symbol can't be
+;; coerced to a number by the Uint8Array constructor on :cljs (TypeError).
+;; Plain cljs collections (keywords, maps, strings, numbers) do NOT
+;; reliably throw here -- `(js/Uint8Array. anything-without-a-.length)`
+;; silently degrades to a zero-length array instead of throwing, so this
+;; needs a platform-specific value to actually exercise the catch.
+(def garbage-bytes
+  #?(:clj :not-bytes-at-all
+     :cljs (js/Symbol "not-bytes-at-all")))
+
 (deftest prove-and-verify-roundtrip-ok
   (testing "node holds the block, verifier holds the SAME block -> :ok"
     (let [node (mem-store {"cid-a" block-a})
@@ -69,6 +81,45 @@
           bad-response {:kotobase.availability/cid "cid-other" :kotobase.availability/proof "whatever"}]
       (is (= :malformed (avail/verify (:get-fn verifier) chal bad-response))))))
 
+(deftest verify-malformed-not-thrown-on-garbage-bytes
+  (testing "a malformed/non-byte type reaching bytes-concat/salted-hash (e.g. a corrupted local replica returned by the verifier's own get-fn) maps to :malformed instead of propagating the ClassCastException/TypeError -- verify's docstring promises 'Never throws' and this makes that promise hold"
+    (let [garbage-get-fn (constantly garbage-bytes)
+          chal (avail/challenge "cid-a" nonce-1 1)
+          node-response {:kotobase.availability/cid "cid-a" :kotobase.availability/proof "deadbeef"}]
+      (is (= :malformed (avail/verify garbage-get-fn chal node-response)))))
+  (testing "a garbage/wrong-type node-response (not even a map) never throws either -- keyword lookup on a non-associative value returns nil, which already routes to :malformed via the cid mismatch"
+    (let [verifier (mem-store {"cid-a" block-a})
+          chal (avail/challenge "cid-a" nonce-1 1)]
+      (is (= :malformed (avail/verify (:get-fn verifier) chal "not-a-response-map")))
+      (is (= :malformed (avail/verify (:get-fn verifier) chal 12345)))
+      (is (= :malformed (avail/verify (:get-fn verifier) chal [:definitely :not :a :response]))))))
+
+(deftest challenge-throws-on-nil-cid-or-nonce
+  (testing "challenge fails fast (ex-info) on a nil cid or nonce instead of silently building a challenge with no freshness guarantee"
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                 (avail/challenge nil nonce-1 1)))
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                 (avail/challenge "cid-a" nil 1)))))
+
+(deftest prove-throws-on-nil-cid-or-nonce
+  (testing "prove fails fast (ex-info) on a nil cid or nonce in the challenge it's given"
+    (let [node (mem-store {"cid-a" block-a})]
+      (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                   (avail/prove (:get-fn node)
+                                 {:kotobase.availability/cid nil :kotobase.availability/nonce nonce-1})))
+      (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                   (avail/prove (:get-fn node)
+                                 {:kotobase.availability/cid "cid-a" :kotobase.availability/nonce nil}))))))
+
+(deftest audit-required?-reflects-redundancy-tiers
+  (testing "only :sla requires an availability audit -- :volatile/:standard have no other replica holder"
+    (is (false? (avail/audit-required? :volatile)))
+    (is (false? (avail/audit-required? :standard)))
+    (is (true? (avail/audit-required? :sla)))))
+
 (deftest audit-outcome-is-a-plain-record
-  (is (= {:audit/node "n1" :audit/cid "cid-a" :audit/epoch 3 :audit/verdict :ok}
+  (is (= {:kotobase.availability/node "n1"
+          :kotobase.availability/cid "cid-a"
+          :kotobase.availability/epoch 3
+          :kotobase.availability/verdict :ok}
          (avail/audit-outcome "n1" "cid-a" 3 :ok))))
