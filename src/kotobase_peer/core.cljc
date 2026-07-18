@@ -1874,10 +1874,31 @@
   `decrypt-fn` also goes to `read-tx-block` (the novelty half, whole-block
   decrypt, no blinding needed there). Synchronous on JVM; a `js/Promise` of
   the rows on cljs (the snapshot and novelty halves resolve concurrently
-  there, via `js/Promise.all`, since they're independent)."
+  there, via `js/Promise.all`, since they're independent).
+
+  `async-get-fn` (optional, `:cljs`-only effect, nil-safe — kotoba-lang/
+  kotobase-peer#21): a Promise-returning `(fn [cid]) -> js/Promise<bytes>`
+  that fetches DIRECTLY, bypassing a synchronous block-miss trampoline
+  (e.g. `with-blocks`) entirely — the exact same fix `fold!` already
+  applies to ITS OWN hydrate step (ADR-2607120730), now available for
+  every regular read too, not just the fold maintenance operation.
+  Without this, EVERY hot-datoms call (the read path `do-q`/`do-pull`/any
+  store bridge's `hydrate!` goes through) pays the sync trampoline's O(N²)
+  block-discovery cost on its cold-snapshot half — confirmed live
+  elsewhere in this org (gftdcojp/app-aozora#78): a 5130-leaf snapshot
+  exceeded a 300s CPU budget via that path vs 806ms via
+  `scan-prefix-async`. Routes the snapshot half through `cold-datoms-async`
+  and the novelty half through `read-tx-block-async` (both already used
+  internally by `fold!`); `nil` (the default, omitted arity) is IDENTICAL
+  to today's behavior — this is purely additive. `chain-cid`'s own head
+  walk (`state-at`) stays synchronous either way, same as `fold!`'s own
+  async-get-fn arity — it's a handful of small metadata blocks, not
+  proportional to graph size, so it isn't the O(N²) cost this closes."
   ([get-fn chain-cid visible? blind-fn decrypt-fn]
    (hot-datoms get-fn chain-cid nil visible? blind-fn decrypt-fn))
   ([get-fn chain-cid opts visible? blind-fn decrypt-fn]
+   (hot-datoms get-fn chain-cid opts visible? blind-fn decrypt-fn nil))
+  ([get-fn chain-cid opts visible? blind-fn decrypt-fn async-get-fn]
    #?(:clj
       (if (nil? chain-cid)
         []
@@ -1896,8 +1917,14 @@
         (js/Promise.resolve [])
         (let [state (state-at get-fn chain-cid)]
           (-> (js/Promise.all
-               #js [(cold-datoms get-fn (indexed-cid state) opts visible? blind-fn decrypt-fn)
-                    (pmap-async (fn [cid] (read-tx-block get-fn cid decrypt-fn)) (novelty-cids get-fn state))])
+               #js [(if async-get-fn
+                      (cold-datoms-async async-get-fn (indexed-cid state) opts visible? blind-fn decrypt-fn)
+                      (cold-datoms get-fn (indexed-cid state) opts visible? blind-fn decrypt-fn))
+                    (pmap-async (fn [cid]
+                                  (if async-get-fn
+                                    (read-tx-block-async async-get-fn cid decrypt-fn)
+                                    (read-tx-block get-fn cid decrypt-fn)))
+                                (novelty-cids get-fn state))])
               ;; `vec`, NOT `js->clj`: every element `js/Promise.all` resolves here is
               ;; already realized ClojureScript data (a Link is an `ipld.core/Link`
               ;; defrecord, which is iterable) -- `js->clj` walks anything iterable and

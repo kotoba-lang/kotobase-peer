@@ -1930,6 +1930,47 @@
                                                                      "Link values survive the async cold-scan path too")
                                                                  (done)))))))))))))))))))
 
+#?(:cljs
+   (deftest hot-datoms-async-get-fn-produces-identical-results-to-the-sync-path
+     ;; kotoba-lang/kotobase-peer#21: hot-datoms is THE regular per-request
+     ;; read path (do-q/do-pull/any store bridge's hydrate!) -- unlike
+     ;; fold!, it had no async-get-fn arity at all, so every read paid the
+     ;; sync with-blocks trampoline's O(N^2) block-discovery cost on its
+     ;; cold-snapshot half regardless of graph size. Covers BOTH halves of
+     ;; hot-datoms's hot/cold split at once: a folded snapshot (cold half,
+     ;; containing a Link-valued datom, routed through cold-datoms-async)
+     ;; with MORE unfolded novelty (a plain scalar, routed through
+     ;; read-tx-block-async) committed on top afterward -- proving neither
+     ;; half silently drops or reshapes data through the new async path,
+     ;; not just that the two halves' ROW COUNTS happen to match."
+     (async done
+       (let [{:keys [put! get-fn]} (mem-store)
+             async-get-fn (fn [cid] (js/Promise.resolve (get-fn cid)))
+             everything (constantly true)]
+         (-> (eng/commit! put! get-fn [{:s "alice" :p "role" :o "admin"}] nil test-encrypt-fn)
+             (.then (fn [c0] (eng/commit! put! get-fn [{:s "alice" :p "knows" :o bob-link}] c0 test-encrypt-fn)))
+             (.then (fn [c1] (eng/fold! put! get-fn c1 test-blind-fn test-encrypt-fn test-decrypt-fn)))
+             (.then (fn [folded] (eng/commit! put! get-fn [{:s "dave" :p "role" :o "guest"}] folded test-encrypt-fn)))
+             (.then (fn [c2]
+                      (is (pos? (eng/novelty-size get-fn c2))
+                          "test setup: c2 really does have a folded cold half PLUS unfolded novelty")
+                      (-> (js/Promise.all
+                           #js [(eng/hot-datoms get-fn c2 everything test-blind-fn test-decrypt-fn)
+                                (eng/hot-datoms get-fn c2 nil everything test-blind-fn test-decrypt-fn async-get-fn)])
+                          (.then (fn [results]
+                                   (let [[sync-rows async-rows] (vec results)
+                                         wire (fn [rows e a] (some #(when (and (= e (:e %)) (= a (:a %))) (:v_edn %)) rows))]
+                                     (is (= 3 (count sync-rows) (count async-rows))
+                                         "test setup: alice/role (cold), alice/knows (cold, Link), dave/role (novelty)")
+                                     (is (= (set sync-rows) (set async-rows))
+                                         "async-get-fn path returns byte-identical rows to the sync path, cold half + novelty half both included")
+                                     (is (= "[\"ipld/link\" \"bafyreiaakutsdtndrl7e7emcmkp5hjsaaq2vu6prfelbgaglprvtdon63m\"]"
+                                            (wire async-rows "alice" "knows"))
+                                         "the folded (cold-half) Link's wire encoding survives cold-datoms-async intact, not shredded")
+                                     (is (= "\"guest\"" (wire async-rows "dave" "role"))
+                                         "the unfolded (novelty-half) scalar survives read-tx-block-async intact")
+                                     (done))))))))))))
+
 ;; ── kotoba-lang/kotobase-peer#16: front/back persistent-queue novelty ──────
 
 #?(:cljs
