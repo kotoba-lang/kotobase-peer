@@ -150,6 +150,8 @@ older than a caller-supplied grace period.
 
 Run `clojure -M:merkle-bench 1000 100000 10000000` for the ADR scale sweep;
 `MERKLE_BENCH_WRITERS` selects simulated concurrent flushers (default 32).
+`npm run ci:local` is the canonical JVM/lint/CLJS/benchmark pre-push gate; CI
+execution does not depend on GitHub Actions.
 
 - canonical newest-first physical keys for EAVT/AEVT/AVET/VAET;
 - deterministic immutable MerkleRun v1 blocks with min/max range metadata;

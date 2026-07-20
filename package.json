@@ -2,6 +2,7 @@
   "name": "kotobase-peer",
   "private": true,
   "scripts": {
+    "ci:local": "node scripts/ci-local.mjs",
     "test:cljs": "bb gen-shadow-cljs-edn.bb && shadow-cljs compile test && node out/test.js",
     "test:nbb": "bb run-nbb-tests.bb"
   },

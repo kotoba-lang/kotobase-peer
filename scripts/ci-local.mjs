@@ -1,0 +1,25 @@
+import { spawnSync } from "node:child_process";
+import { performance } from "node:perf_hooks";
+
+const steps = [
+  ["jvm-test", "clojure", ["-M:test"]],
+  ["lint", "clojure", ["-M:lint"]],
+  ["cljs-test", "npm", ["run", "test:cljs"]],
+  ["merkle-bench", "clojure", ["-M:merkle-bench", "1000"]],
+];
+const receipt = { schema: 1, runner: "kotobase-peer", startedAt: new Date().toISOString(), steps: [] };
+for (const [name, command, args] of steps) {
+  const started = performance.now();
+  const result = spawnSync(command, args, { stdio: "inherit", env: process.env });
+  const step = { name, durationMs: Math.round(performance.now() - started), exitCode: result.status ?? 1 };
+  receipt.steps.push(step);
+  if (step.exitCode !== 0) {
+    receipt.outcome = "failed";
+    receipt.finishedAt = new Date().toISOString();
+    console.log(JSON.stringify(receipt));
+    process.exit(step.exitCode);
+  }
+}
+receipt.outcome = "succeeded";
+receipt.finishedAt = new Date().toISOString();
+console.log(JSON.stringify(receipt));
