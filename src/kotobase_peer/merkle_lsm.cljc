@@ -254,3 +254,13 @@
   [db-id query]
   {:state {:phase :read-head :db-id (str db-id) :query query}
    :need [(head-read db-id)]})
+
+(defn linked-cids
+  "Return every IPLD Link reachable directly from decoded VALUE. Used by host
+  GC walkers; traversal stays pure and independent of an object provider."
+  [value]
+  (cond
+    (ipld/link? value) #{(ipld/link-cid value)}
+    (map? value) (into #{} (mapcat linked-cids) (vals value))
+    (sequential? value) (into #{} (mapcat linked-cids) value)
+    :else #{}))

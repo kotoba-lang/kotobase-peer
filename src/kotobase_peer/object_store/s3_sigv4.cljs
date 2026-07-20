@@ -1,5 +1,5 @@
 (ns kotobase-peer.object-store.s3-sigv4
-  "Minimal AWS SigV4 signer for S3-compatible object PUTs (including B2)."
+  "Minimal AWS SigV4 signer for S3-compatible object requests (including B2)."
   (:require [clojure.string :as str]))
 
 (def ^:private encoder (js/TextEncoder.))
@@ -38,7 +38,7 @@
 
 (defn signed-headers
   "Return Promise<{:url :headers}> for a path-style S3 request."
-  [{:keys [endpoint bucket region access-key secret-key method key body]}]
+  [{:keys [endpoint bucket region access-key secret-key method key body headers]}]
   (let [endpoint (str/replace endpoint #"/+$" "")
         path (object-path bucket key)
         host (.-host (js/URL. endpoint))
@@ -48,14 +48,15 @@
     (-> (digest (or body ""))
         (.then
          (fn [payload-hash]
-           (let [headers #js {"host" host
-                              "x-amz-content-sha256" payload-hash
-                              "x-amz-date" date}
-                 names "host;x-amz-content-sha256;x-amz-date"
+           (let [extra (into {} (map (fn [[k v]] [(str/lower-case (name k)) (str v)])) headers)
+                 signed (merge extra {"host" host
+                                      "x-amz-content-sha256" payload-hash
+                                      "x-amz-date" date})
+                 ordered (sort-by key signed)
+                 names (str/join ";" (map key ordered))
+                 canonical-headers (apply str (map (fn [[k v]] (str k ":" (str/trim v) "\n")) ordered))
                  canonical (str method "\n" path "\n\n"
-                                "host:" host "\n"
-                                "x-amz-content-sha256:" payload-hash "\n"
-                                "x-amz-date:" date "\n\n"
+                                canonical-headers "\n"
                                 names "\n" payload-hash)
                  scope (str short "/" region "/s3/aws4_request")]
              (-> (digest canonical)
@@ -68,7 +69,7 @@
                     {:url (str endpoint path)
                      :headers
                      (js/Object.assign
-                      headers
+                      (clj->js signed)
                       #js {"authorization"
                            (str "AWS4-HMAC-SHA256 Credential=" access-key "/" scope
                                 ", SignedHeaders=" names ", Signature=" (hex signature))})})))))))))

@@ -35,4 +35,6 @@
   ;; not part of :test (slow, not correctness-gating). In-memory store, real
   ;; JVM crypto, no external deps beyond the base :deps above.
   :bench {:extra-paths ["bench"]
-          :main-opts ["-m" "kotobase-peer.load-test"]}}}
+          :main-opts ["-m" "kotobase-peer.load-test"]}
+  :merkle-bench {:extra-paths ["bench"]
+                 :main-opts ["-m" "kotobase-peer.merkle-lsm-bench"]}}}

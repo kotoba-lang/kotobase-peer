@@ -28,6 +28,12 @@
 (defn configured? [e]
   (boolean (or (env e "MERKLE_BUCKET") (b2-config e))))
 
+(defn- s3-request! [config method key & [{:keys [body headers]}]]
+  (-> (sigv4/signed-headers
+       (assoc config :method method :key key :body body :headers headers))
+      (.then (fn [{:keys [url headers]}]
+               (js/fetch url #js {:method method :headers headers :body body})))))
+
 (defn put-block!
   "Idempotently put CID bytes into R2 or a configured S3-compatible bucket."
   [e cid bytes]
@@ -35,10 +41,7 @@
     (if-let [bucket (env e "MERKLE_BUCKET")]
       (.put bucket key bytes)
       (if-let [config (b2-config e)]
-        (-> (sigv4/signed-headers
-             (assoc config :method "PUT" :key key :body bytes))
-            (.then (fn [{:keys [url headers]}]
-                     (js/fetch url #js {:method "PUT" :headers headers :body bytes})))
+        (-> (s3-request! config "PUT" key {:body bytes})
             (.then (fn [response]
                      (if (.-ok response)
                        response
@@ -47,7 +50,7 @@
         (js/Promise.reject (js/Error. "No MERKLE_BUCKET or MERKLE_S3_* backend configured"))))))
 
 (defn get-block!
-  "Fetch immutable block bytes by CID from R2."
+  "Fetch immutable block bytes from R2 or an S3-compatible backend."
   [e cid]
   (if-let [bucket (env e "MERKLE_BUCKET")]
     (-> (.get bucket (block-key e cid))
@@ -56,8 +59,16 @@
                    (-> (.arrayBuffer obj) (.then #(js/Uint8Array. %)))
                    (js/Promise.reject
                     (ex-info "Merkle block not found" {:cid cid}))))))
-    (js/Promise.reject
-     (js/Error. "Merkle reads require MERKLE_BUCKET R2 binding"))))
+    (if-let [config (b2-config e)]
+      (-> (s3-request! config "GET" (block-key e cid))
+          (.then (fn [response]
+                   (if (.-ok response)
+                     (-> (.arrayBuffer response) (.then #(js/Uint8Array. %)))
+                     (js/Promise.reject
+                      (ex-info "S3 Merkle block GET failed"
+                               {:cid cid :status (.-status response)}))))))
+      (js/Promise.reject
+       (js/Error. "No MERKLE_BUCKET or MERKLE_S3_* backend configured")))))
 
 (defn get-node!
   "Fetch and DAG-CBOR decode an IPLD node."
@@ -76,7 +87,7 @@
        js/Promise.all))
 
 (defn get-head
-  "Read an R2 head with its ETag for a subsequent native conditional PUT."
+  "Read a mutable head and its ETag for a subsequent conditional PUT."
   [e db-id]
   (if-let [bucket (env e "MERKLE_BUCKET")]
     (-> (.get bucket (head-key e db-id))
@@ -85,13 +96,27 @@
                    (-> (.text obj)
                        (.then (fn [value] {:value value :etag (gobj/get obj "etag")})))
                    {:value nil :etag nil}))))
-    (js/Promise.reject
-     (js/Error. "Mutable Merkle head requires MERKLE_BUCKET R2 binding"))))
+    (if-let [config (b2-config e)]
+      (-> (s3-request! config "GET" (head-key e db-id))
+          (.then (fn [response]
+                   (cond
+                     (= 404 (.-status response)) {:value nil :etag nil}
+                     (.-ok response)
+                     (-> (.text response)
+                         (.then (fn [value]
+                                  {:value value
+                                   :etag (.get (.-headers response) "etag")})))
+                     :else
+                     (js/Promise.reject
+                      (ex-info "S3 Merkle head GET failed"
+                               {:db-id db-id :status (.-status response)}))))))
+      (js/Promise.reject
+       (js/Error. "No MERKLE_BUCKET or MERKLE_S3_* backend configured")))))
 
 (defn cas-head!
-  "R2-native compare-and-swap. Returns Promise<boolean>; nil ETag means
-  create-if-absent. S3/B2 remains valid for immutable blocks but is not used
-  for the mutable head because its conditional PUT contract is not portable."
+  "Compare-and-swap the mutable head. R2 uses native conditional puts. S3 uses
+  signed If-Match/If-None-Match and must be explicitly enabled after verifying
+  that the selected compatible provider implements conditional PutObject."
   [e db-id next etag]
   (if-let [bucket (env e "MERKLE_BUCKET")]
     (-> (.put bucket (head-key e db-id) next
@@ -99,8 +124,23 @@
                              #js {:etagMatches etag}
                              #js {:etagDoesNotMatch "*"})})
         (.then boolean))
-    (js/Promise.reject
-     (js/Error. "Mutable Merkle head requires MERKLE_BUCKET R2 binding"))))
+    (if-let [config (b2-config e)]
+      (if (= "true" (env e "MERKLE_S3_CONDITIONAL_HEAD"))
+        (let [condition (if etag {"if-match" etag} {"if-none-match" "*"})]
+          (-> (s3-request! config "PUT" (head-key e db-id)
+                           {:body next :headers condition})
+              (.then (fn [response]
+                       (cond
+                         (.-ok response) true
+                         (contains? #{409 412} (.-status response)) false
+                         :else
+                         (js/Promise.reject
+                          (ex-info "S3 Merkle head conditional PUT failed"
+                                   {:db-id db-id :status (.-status response)})))))))
+        (js/Promise.reject
+         (js/Error. "Set MERKLE_S3_CONDITIONAL_HEAD=true only for a backend with conditional PutObject")))
+      (js/Promise.reject
+       (js/Error. "No MERKLE_BUCKET or MERKLE_S3_* backend configured")))))
 
 (declare manifest-window! index-run-refs load-runs!)
 
@@ -230,3 +270,73 @@
                               (-> (put-blocks! e effects)
                                   (.then (fn [_]
                                            (cas-head! e db-id (:cid manifest) etag))))))))))))))))))
+
+(defn reachable-cids!
+  "Walk decoded IPLD links from ROOT-CID and return a Promise<set<CID>>."
+  [e root-cid]
+  (let [seen (atom #{})]
+    (letfn [(walk [frontier]
+              (let [fresh (vec (remove @seen frontier))]
+                (if (empty? fresh)
+                  (js/Promise.resolve @seen)
+                  (do
+                    (swap! seen into fresh)
+                    (-> (js/Promise.all
+                         (clj->js
+                          (map #(-> (get-node! e %)
+                                    (.then lsm/linked-cids))
+                               fresh)))
+                        (.then (fn [links]
+                                 (walk (into #{} cat (js->clj links))))))))))]
+      (if root-cid (walk [root-cid]) (js/Promise.resolve #{})))))
+
+(defn- list-r2-blocks! [bucket prefix]
+  (letfn [(page [cursor acc]
+            (-> (.list bucket
+                       (clj->js (cond-> {:prefix prefix :limit 1000}
+                                  cursor (assoc :cursor cursor))))
+                (.then
+                 (fn [result]
+                   (let [objects (into acc (array-seq (gobj/get result "objects")))
+                         truncated? (gobj/get result "truncated")]
+                     (if truncated?
+                       (page (gobj/get result "cursor") objects)
+                       objects))))))]
+    (page nil [])))
+
+(defn gc-unreachable!
+  "Mark from the current head and optionally sweep unreachable R2 blocks older
+  than GRACE-MS. Deletion is explicit so callers can run a dry audit first."
+  [e db-id grace-ms delete?]
+  (if-let [bucket (env e "MERKLE_BUCKET")]
+    (-> (get-head e db-id)
+        (.then
+         (fn [{:keys [value]}]
+           (-> (js/Promise.all
+                #js [(reachable-cids! e value)
+                     (list-r2-blocks! bucket (str (prefix e) "blocks/"))])
+               (.then
+                (fn [result]
+                  (let [reachable (aget result 0)
+                        objects (aget result 1)
+                        cutoff (- (js/Date.now) grace-ms)
+                        candidates
+                        (->> objects
+                             (filter
+                              (fn [object]
+                                (let [key (gobj/get object "key")
+                                      cid (last (str/split key #"/"))
+                                      uploaded (gobj/get object "uploaded")]
+                                  (and (not (contains? reachable cid))
+                                       uploaded
+                                       (< (.getTime uploaded) cutoff)))))
+                             (mapv #(gobj/get % "key")))]
+                    (if (and delete? (seq candidates))
+                      (-> (.delete bucket (clj->js candidates))
+                          (.then (fn [_] {:reachable (count reachable)
+                                         :candidates (count candidates)
+                                         :deleted (count candidates)})))
+                      {:reachable (count reachable)
+                       :candidates (count candidates) :deleted 0}))))))))
+    (js/Promise.reject
+     (js/Error. "Reachability GC currently requires an R2 listing binding"))))

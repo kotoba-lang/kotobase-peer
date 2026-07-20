@@ -141,6 +141,16 @@ fully materialized hot `db` (backfill/migration tooling, tests).
 `kotobase-peer.merkle-lsm` contains the pure M1 kernel and M2 shadow-flush
 vertical slice replacing full-snapshot folding:
 
+The Worker object-store adapter supports R2 bindings and signed S3-compatible
+GET/PUT requests. Mutable S3 heads require a provider that implements
+conditional `PutObject`; enable that path explicitly with
+`MERKLE_S3_CONDITIONAL_HEAD=true`. R2 remains the default CAS implementation.
+Reachability GC walks IPLD links from the current head and only deletes objects
+older than a caller-supplied grace period.
+
+Run `clojure -M:merkle-bench 1000 100000 10000000` for the ADR scale sweep;
+`MERKLE_BENCH_WRITERS` selects simulated concurrent flushers (default 32).
+
 - canonical newest-first physical keys for EAVT/AEVT/AVET/VAET;
 - deterministic immutable MerkleRun v1 blocks with min/max range metadata;
 - sparse VAET runs containing only real IPLD Link values;

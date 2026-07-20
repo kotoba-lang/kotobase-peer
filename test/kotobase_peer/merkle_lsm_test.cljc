@@ -67,6 +67,13 @@
   (is (thrown? #?(:clj Exception :cljs js/Error)
                (lsm/build-manifest {:db-id "x" :epoch 2 :safe-epoch 3}))))
 
+(deftest linked-cids-walks-decoded-ipld-values
+  (let [a (:cid (lsm/build-run :eavt "t" []))
+        b (:cid (lsm/build-run :avet "t" []))]
+    (is (= #{a b}
+           (lsm/linked-cids {"a" (ipld/link a)
+                             "nested" [{"b" (ipld/link b)} "plain"]})))))
+
 (deftest mvcc-merge-and-safe-epoch-compaction
   (let [r1 (lsm/build-run :eavt "t"
                           [{:components ["a" "name" "Alice"]
