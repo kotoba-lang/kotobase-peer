@@ -2,9 +2,10 @@
   "name": "kotobase-peer",
   "private": true,
   "scripts": {
+    "test": "clojure -M:test",
     "ci:local": "node scripts/ci-local.mjs",
-    "test:cljs": "bb gen-shadow-cljs-edn.bb && shadow-cljs compile test && node out/test.js",
-    "test:nbb": "bb run-nbb-tests.bb"
+    "test:cljs": "nbb gen-shadow-cljs-edn.cljs && shadow-cljs compile test && node out/test.js",
+    "test:nbb": "nbb run-nbb-tests.cljs"
   },
   "dependencies": {
     "@noble/hashes": "^1.4.0"

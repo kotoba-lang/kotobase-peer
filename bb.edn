@@ -1,5 +1,0 @@
-{:tasks
- {test {:doc "Run kotobase-peer tests."
-        :task (shell "clojure -M:test")}
-  loadtest {:doc "Run the hot-datoms/fold! load test (bench/kotobase_peer/load_test.clj). Accepts optional novelty-size args, e.g. `bb loadtest 10 100 1000`."
-            :task (apply shell "clojure -M:bench" *command-line-args*)}}}
