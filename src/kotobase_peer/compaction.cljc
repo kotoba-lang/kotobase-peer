@@ -15,7 +15,8 @@
 
 (defn key-range-overlap?
   "Check if two [min-key max-key] ranges have any overlap.
-   Returns true if ranges overlap, false otherwise."
+   Returns true if ranges overlap, false otherwise.
+   Works with any comparable types (strings, numbers, vectors)."
   [range-a range-b]
   (let [[min-a max-a] range-a
         [min-b max-b] range-b]
@@ -145,11 +146,20 @@
    Returns set of live CID strings."
   [manifest]
   (let [cids (atom #{})
-        add-cid! (fn [c] (when c (swap! cids conj c)))
+        ;; Normalize CID to string format, handling both Link objects and raw strings
+        normalize-cid (fn [c]
+                       (cond
+                         (nil? c) nil
+                         (string? c) c
+                         :else (try (ipld/link-cid c) (catch #?(:clj Throwable :cljs :default) _ c))))
+
+        add-cid! (fn [c]
+                  (when-let [normalized (normalize-cid c)]
+                    (swap! cids conj normalized)))
 
         visit-run-ref (fn [ref]
                        (if-let [cid (get ref "cid")]
-                         (add-cid! (ipld/link-cid cid))
+                         (add-cid! cid)
                          (when-let [run-cid (:cid ref)]
                            (add-cid! run-cid))))
 
@@ -162,7 +172,7 @@
         visit-node (fn [node]
                     (add-cid! (:cid manifest))
                     (when-let [prev-link (get node "previous")]
-                      (add-cid! (ipld/link-cid prev-link)))
+                      (add-cid! prev-link))
                     (when-let [indexes (get node "indexes")]
                       (visit-indexes indexes))
                     (when-let [stats (get node "statistics")]
