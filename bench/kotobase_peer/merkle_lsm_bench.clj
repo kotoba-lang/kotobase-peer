@@ -15,7 +15,7 @@
   {:components [(str "entity-" i) "bench/value" (str "value-" i)]
    :epoch (inc i) :op :assert :value (str "value-" i)})
 
-(defn measure [n writers]
+(defn measure [n writers target-rows]
   (let [batch-size 1000
         batches (vec (partition-all batch-size (map datom (range n))))
         timings (atom [])
@@ -33,7 +33,9 @@
                                              result))))
                                  (mapv deref))))
                   vec)
-        compact (elapsed-ms #(lsm/compact-runs :eavt "bench" 0 runs))
+        compact (elapsed-ms #(lsm/compact-runs-partitioned
+                              :eavt "bench" 0 target-rows runs))
+        compacted-runs (:result compact)
         total-ms (/ (- (System/nanoTime) started) 1e6)]
     {:datoms n :writers writers :batches (count batches)
      :total-ms total-ms :throughput-per-sec (/ (* n 1000.0) total-ms)
@@ -41,12 +43,15 @@
      :flush-p95-ms (percentile @timings 0.95)
      :flush-p99-ms (percentile @timings 0.99)
      :compact-ms (:ms compact)
-     :compacted-count (:count (:result compact))}))
+     :compacted-runs (count compacted-runs)
+     :max-run-count (reduce max 0 (map :count compacted-runs))
+     :compacted-count (reduce + (map :count compacted-runs))}))
 
 (defn -main [& args]
   (let [sizes (if (seq args) (mapv parse-long args) [1000 10000])
         writers (parse-long (or (System/getenv "MERKLE_BENCH_WRITERS") "32"))
-        results (mapv #(measure % writers) sizes)]
+        target-rows (parse-long (or (System/getenv "MERKLE_BENCH_TARGET_ROWS") "4096"))
+        results (mapv #(measure % writers target-rows) sizes)]
     (doseq [result results] (prn result))
     (when-not (every? #(= (:datoms %) (:compacted-count %)) results)
       (throw (ex-info "Merkle benchmark lost rows" {:results results})))

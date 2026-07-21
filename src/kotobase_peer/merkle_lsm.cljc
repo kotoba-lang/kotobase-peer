@@ -210,6 +210,46 @@
 (defn- logical-id [row]
   (get row "components"))
 
+(defn- merge-sorted-row-seqs
+  "Lazily merge canonical run rows without materializing the input set."
+  [row-seqs]
+  (lazy-seq
+   (let [active (keep-indexed (fn [i rows]
+                                (when-let [rows (seq rows)] [i rows]))
+                              row-seqs)]
+     (when (seq active)
+       (let [[i rows] (first (sort-by (juxt #(get (first (second %)) "key") first)
+                                      active))]
+         (cons (first rows)
+               (merge-sorted-row-seqs (assoc row-seqs i (next rows)))))))))
+
+(defn- partition-logical-groups [target-rows groups]
+  (lazy-seq
+   (when-let [groups (seq groups)]
+     (loop [remaining groups batch [] row-count 0]
+       (if-let [group (first remaining)]
+         (let [next-count (+ row-count (count group))]
+           (if (and (seq batch) (> next-count target-rows))
+             (cons batch (partition-logical-groups target-rows remaining))
+             (recur (next remaining) (conj batch group) next-count)))
+         (list batch))))))
+
+(defn- retained-entries [safe-epoch runs]
+  (->> runs
+       (mapv #(seq (run-rows %)))
+       merge-sorted-row-seqs
+       (partition-by logical-id)
+       (mapcat (fn [versions]
+                 ;; Physical keys put the newest epoch first for one logical id.
+                 (let [{newer true older false}
+                       (group-by #(> (get % "epoch") safe-epoch) versions)]
+                   (concat newer (take 1 older)))))
+       (map (fn [row]
+              {:components (get row "components")
+               :epoch (get row "epoch")
+               :op (keyword (get row "op"))
+               :value (get row "value")}))))
+
 (defn visible-rows
   "MVCC multi-run merge. For each logical key, select the newest version at
   or before QUERY-EPOCH. Tombstones suppress the key. Returned rows remain in
@@ -232,22 +272,21 @@
   logical key, then emits one deterministic run. This preserves all snapshots
   >= safe-epoch while pruning older shadowed versions."
   [index tenant safe-epoch runs]
-  (let [retained (->> runs
-                      (mapcat run-rows)
-                      (group-by logical-id)
-                      vals
-                      (mapcat (fn [versions]
-                                (let [{newer true older false}
-                                      (group-by #(> (get % "epoch") safe-epoch) versions)
-                                      boundary (when (seq older)
-                                                 [(apply max-key #(get % "epoch") older)])]
-                                  (concat newer boundary))))
-                      (map (fn [row]
-                             {:components (get row "components")
-                              :epoch (get row "epoch")
-                              :op (keyword (get row "op"))
-                              :value (get row "value")})))]
-    (build-run index tenant retained)))
+  (build-run index tenant (retained-entries safe-epoch runs)))
+
+(defn compact-runs-partitioned
+  "Merge sorted RUNS with bounded working input and emit deterministic L1 runs
+  of at most TARGET-ROWS. Logical keys are never split between output runs, so
+  a hot key can exceed the target; all ordinary ranges remain bounded."
+  [index tenant safe-epoch target-rows runs]
+  (when-not (and (integer? target-rows) (pos? target-rows))
+    (throw (ex-info "Compaction target rows must be a positive integer"
+                    {:target-rows target-rows})))
+  (->> (retained-entries safe-epoch runs)
+       (partition-by :components)
+       (partition-logical-groups target-rows)
+       (mapv (fn [groups]
+               (build-run index tenant (mapcat identity groups))))))
 
 (defn query-plan
   "Pure first read step: pin the database by asking the host for its head."

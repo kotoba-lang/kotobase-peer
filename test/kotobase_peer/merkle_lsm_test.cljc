@@ -85,7 +85,8 @@
                             :epoch 3 :op :retract :value "Alice"}
                            {:components ["a" "name" "Alicia"]
                             :epoch 4 :op :assert :value "Alicia"}])
-        compacted (lsm/compact-runs :eavt "t" 3 [r1 r2])]
+        compacted (lsm/compact-runs :eavt "t" 3 [r1 r2])
+        partitions (lsm/compact-runs-partitioned :eavt "t" 3 2 [r1 r2])]
     (testing "snapshot visibility honors assertions and tombstones"
       (is (= 2 (count (lsm/visible-rows [r1 r2] 2))))
       (is (= ["b"] (mapv #(first (get % "components"))
@@ -98,4 +99,23 @@
              (lsm/visible-rows [compacted] 3)))
       (is (= (lsm/visible-rows [r1 r2] 4)
              (lsm/visible-rows [compacted] 4)))
-      (is (= 3 (:count compacted))))))
+      (is (= 3 (:count compacted))))
+    (testing "range partitions preserve MVCC results and remain deterministic"
+      (is (every? #(<= (:count %) 2) partitions))
+      (is (= (lsm/visible-rows [r1 r2] 3)
+             (lsm/visible-rows partitions 3)))
+      (is (= (lsm/visible-rows [r1 r2] 4)
+             (lsm/visible-rows partitions 4)))
+      (is (= (mapv :cid partitions)
+             (mapv :cid (lsm/compact-runs-partitioned
+                         :eavt "t" 3 2 [r2 r1])))))))
+
+(deftest partitioned-compaction-keeps-one-logical-key-whole
+  (let [run (lsm/build-run :eavt "t"
+                           (mapv (fn [epoch]
+                                   {:components ["hot" "counter"]
+                                    :epoch epoch :op :assert :value epoch})
+                                 (range 1 6)))
+        partitions (lsm/compact-runs-partitioned :eavt "t" 0 2 [run])]
+    (is (= 1 (count partitions)))
+    (is (= 5 (:count (first partitions))))))

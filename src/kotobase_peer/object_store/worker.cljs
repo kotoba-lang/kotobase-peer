@@ -232,11 +232,12 @@
       (.then #(vec (array-seq %)))))
 
 (defn compact-head!
-  "Compact the newest manifest window into one L1 run per present index and
+  "Compact the newest manifest window into range-partitioned L1 runs and
   publish it with R2 CAS. The untouched tail remains linked as :previous.
   Returns Promise<boolean>; false means a concurrent writer won the head."
-  ([e db-id] (compact-head! e db-id 64))
-  ([e db-id window-size]
+  ([e db-id] (compact-head! e db-id 64 4096))
+  ([e db-id window-size] (compact-head! e db-id window-size 4096))
+  ([e db-id window-size target-run-rows]
    (-> (get-head e db-id)
        (.then
         (fn [{head-cid :value :keys [etag]}]
@@ -253,19 +254,22 @@
                             (let [epoch (apply max (map #(get-in % [:node "epoch"]) manifests))
                                   compacted (into {}
                                                   (map (fn [index runs]
-                                                         [index (lsm/compact-runs
-                                                                 index db-id epoch runs)])
+                                                         [index (lsm/compact-runs-partitioned
+                                                                 index db-id epoch
+                                                                 target-run-rows runs)])
                                                        present (array-seq loaded)))
                                   manifest (lsm/build-manifest
                                             {:db-id db-id :epoch epoch :safe-epoch epoch
                                              :previous tail
                                              :indexes (into {}
-                                                            (map (fn [[index run]]
-                                                                   [index {:l1 [run]}]))
+                                                            (map (fn [[index runs]]
+                                                                   [index {:l1 runs}]))
                                                             compacted)
                                              :statistics {"operation" "window-compaction"
-                                                          "manifest-count" (count manifests)}})
-                                  effects (concat (mapcat :effects (vals compacted))
+                                                          "manifest-count" (count manifests)
+                                                          "target-run-rows" target-run-rows
+                                                          "output-run-count" (reduce + (map count (vals compacted)))}})
+                                  effects (concat (mapcat :effects (mapcat identity (vals compacted)))
                                                   (:effects manifest))]
                               (-> (put-blocks! e effects)
                                   (.then (fn [_]
