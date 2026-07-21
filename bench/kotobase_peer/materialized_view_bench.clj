@@ -66,6 +66,15 @@
                                                      :upper (key-of (+ i 19))
                                                      :limit 20}))
                             (drop 2 range-starts))
+        scan-width (min 2000 (dec n))
+        scan-starts (mapv #(mod (* % 1543) (- n scan-width)) (range 52))
+        _ (doseq [i (take 2 scan-starts)]
+            (view/query-packed bundle pack {:lower (key-of i)
+                                            :upper (key-of (+ i scan-width))}))
+        scan-samples (mapv (fn [i]
+                             (query-ms bundle pack {:lower (key-of i)
+                                                    :upper (key-of (+ i scan-width))}))
+                           (drop 2 scan-starts))
         middle (quot n 2)
         sample-plan (:plan (view/query-packed bundle pack
                                               {:lower (key-of middle)
@@ -81,6 +90,16 @@
                    :estimated-requests (:estimated-requests sample-plan)
                    :estimated-bytes (:estimated-bytes sample-plan))
      :range-20 (stats range-samples)
+     :range-coalesced
+     (let [i (first scan-starts)
+           plan (:plan (view/query-packed bundle pack
+                                          {:lower (key-of i)
+                                           :upper (key-of (+ i scan-width))}))]
+       (assoc (stats scan-samples)
+              :rows (inc scan-width)
+              :logical-blocks (count (:descriptors plan))
+              :estimated-requests (:estimated-requests plan)
+              :estimated-bytes (:estimated-bytes plan)))
      :correct? (= middle (get-in (view/query-packed
                                   bundle pack {:lower (key-of middle)
                                                :upper (key-of middle) :limit 1})

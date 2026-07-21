@@ -185,6 +185,10 @@ every returned range is verified against its logical block CID before decode.
 `query-packed-chain` applies newest-key-wins assertions/retraction tombstones,
 and `compact-packed-chain` deterministically collapses a bounded chain back to
 one base pack. Run `clojure -M:view-delta-bench 10000 1000 512` for this gate.
+Adjacent selected blocks are coalesced into bounded (default 1 MiB) object
+ranges. The response is split back into logical blocks and every CID is still
+verified independently, reducing request amplification without weakening IPLD
+integrity.
 
 This is currently a behavior-preserving shadow substrate: existing
 `commit!`/`hot-datoms`/`fold!` remain the live path until read equivalence and

@@ -192,19 +192,44 @@
          (filter #(overlaps? % lower upper))
          vec)))
 
+(defn coalesce-block-ranges
+  "Coalesce physically adjacent logical blocks into bounded object fetches.
+  Each logical descriptor remains present for independent CID verification."
+  [descriptors max-range-bytes]
+  (when-not (and (integer? max-range-bytes) (pos? max-range-bytes))
+    (throw (ex-info "Maximum coalesced range must be positive"
+                    {:max-range-bytes max-range-bytes})))
+  (reduce
+   (fn [fetches descriptor]
+     (let [offset (get descriptor "offset")
+           length (get descriptor "length")]
+       (if-let [fetch (peek fetches)]
+         (if (and (= offset (+ (:offset fetch) (:length fetch)))
+                  (<= (+ (:length fetch) length) max-range-bytes))
+           (conj (pop fetches)
+                 (-> fetch
+                     (update :length + length)
+                     (update :descriptors conj descriptor)))
+           (conj fetches {:offset offset :length length
+                          :descriptors [descriptor]}))
+         [{:offset offset :length length :descriptors [descriptor]}])))
+   [] descriptors))
+
 (defn range-query-plan
   "Compile a bounded browser query into declarative object Range GET effects."
-  [{:keys [bundle lower upper limit]}]
+  [{:keys [bundle lower upper limit max-range-bytes]
+    :or {max-range-bytes 1048576}}]
   (let [descriptors (select-blocks bundle lower upper)
+        fetches (coalesce-block-ranges descriptors max-range-bytes)
         pack-cid (ipld/link-cid (get bundle "pack-cid"))]
     {:view-id (get bundle "view-id")
      :epoch (get bundle "epoch")
      :lower lower :upper upper :limit limit
      :descriptors descriptors
-     :estimated-requests (count descriptors)
-     :estimated-bytes (reduce + (map #(get % "length") descriptors))
-     :need (mapv #(object-range-get pack-cid (get % "offset") (get % "length"))
-                 descriptors)}))
+     :fetches fetches
+     :estimated-requests (count fetches)
+     :estimated-bytes (reduce + (map :length fetches))
+     :need (mapv #(object-range-get pack-cid (:offset %) (:length %)) fetches)}))
 
 (defn decode-range
   "Verify and decode one independently addressed block returned by Range GET."
@@ -221,8 +246,22 @@
   tombstones. Delta-chain merge consumes this lower-level browser primitive."
   [plan range-bytes]
   (let [lower (:lower plan)
-        upper (:upper plan)]
-    (->> (map vector (:descriptors plan) range-bytes)
+        upper (:upper plan)
+        logical-ranges
+        (mapcat
+         (fn [fetch bytes]
+           (when-not (= (:length fetch) (byte-count bytes))
+             (throw (ex-info "Materialized view range length mismatch"
+                             {:expected (:length fetch)
+                              :actual (byte-count bytes)})))
+           (map (fn [descriptor]
+                  [descriptor
+                   (slice-bytes bytes
+                                (- (get descriptor "offset") (:offset fetch))
+                                (get descriptor "length"))])
+                (:descriptors fetch)))
+         (:fetches plan) range-bytes)]
+    (->> logical-ranges
          (mapcat (fn [[descriptor bytes]]
                    (get (decode-range descriptor bytes) "rows")))
          (filter (fn [row]
@@ -246,8 +285,8 @@
   as a browser, but slicing a complete pack already supplied by the host."
   [bundle pack-bytes {:keys [lower upper limit]}]
   (let [plan (range-query-plan {:bundle bundle :lower lower :upper upper :limit limit})
-        ranges (mapv #(slice-bytes pack-bytes (get % "offset") (get % "length"))
-                     (:descriptors plan))]
+        ranges (mapv #(slice-bytes pack-bytes (:offset %) (:length %))
+                     (:fetches plan))]
     {:plan plan :values (finish-range-query plan ranges)}))
 
 (defn range-query-plan-chain
@@ -293,8 +332,8 @@
         range-groups
         (mapv (fn [generation generation-plan]
                 (mapv #(slice-bytes (:pack-bytes generation)
-                                    (get % "offset") (get % "length"))
-                      (:descriptors generation-plan)))
+                                    (:offset %) (:length %))
+                      (:fetches generation-plan)))
               generations (:plans plan))]
     {:plan plan :values (finish-range-query-chain plan range-groups)}))
 
@@ -307,8 +346,8 @@
         range-groups
         (mapv (fn [generation generation-plan]
                 (mapv #(slice-bytes (:pack-bytes generation)
-                                    (get % "offset") (get % "length"))
-                      (:descriptors generation-plan)))
+                                    (:offset %) (:length %))
+                      (:fetches generation-plan)))
               generations (:plans chain-plan))
         entries (->> (newest-chain-rows (:plans chain-plan) range-groups)
                      (keep (fn [row]

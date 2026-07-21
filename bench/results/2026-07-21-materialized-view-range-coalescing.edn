@@ -1,0 +1,16 @@
+{:schema 1
+ :date "2026-07-21"
+ :implementation "kotobase-peer.materialized-view/coalesce-block-ranges"
+ :workload {:rows 10000 :block-rows 512 :range-rows 2001 :samples 50}
+ :plan {:logical-blocks 4
+        :object-range-requests 1
+        :estimated-bytes 185911
+        :maximum-coalesced-range-bytes 1048576}
+ :local-query-kernel {:p50-ms 51.403333 :p95-ms 91.631667
+                      :p99-ms 93.801042 :mean-ms 51.80162076}
+ :real-r2 {:provider :cloudflare-r2 :samples 50 :range-bytes 185911
+           :p50-ms 22 :p95-ms 32 :p99-ms 38 :mean-ms 24.02}
+ :invariants [:each-logical-block-cid-verified-after-range-split
+              :coalesced-fetch-bounded
+              :no-cloudflare-kv]
+ :interpretation "Four adjacent logical block reads become one bounded R2 Range GET; this receipt does not claim four independent requests would be serialized by every host."}

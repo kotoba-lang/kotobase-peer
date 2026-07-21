@@ -35,6 +35,24 @@
     (is (< (get-in result [:plan :estimated-bytes])
            (get bundle "pack-bytes")))))
 
+(deftest adjacent-blocks-coalesce-but-remain-individually-verified
+  (let [built (view/build-view {:view-id :feed :epoch 1
+                                :block-rows 2 :entries (entries 10)})
+        bundle (get-in built [:bundle :node])
+        result (view/query-packed bundle (:pack-bytes built)
+                                  {:lower "tenant-a/00000000"
+                                   :upper "tenant-a/00000009"})
+        bounded-plan (view/range-query-plan
+                      {:bundle bundle
+                       :lower "tenant-a/00000000"
+                       :upper "tenant-a/00000009"
+                       :max-range-bytes 1})]
+    (is (= 5 (count (get bundle "blocks"))))
+    (is (= 1 (get-in result [:plan :estimated-requests])))
+    (is (= 5 (count (get-in result [:plan :fetches 0 :descriptors]))))
+    (is (= (range 10) (map #(get % "id") (:values result))))
+    (is (= 5 (:estimated-requests bounded-plan)))))
+
 (deftest query-blocks-are-cid-verified
   (let [built (view/build-view {:view-id :posts :epoch 1
                                 :block-rows 10 :entries (entries 10)})
@@ -102,7 +120,7 @@
     (is (= (get-in base [:bundle :cid])
            (ipld/link-cid (get-in delta [:bundle :node "previous-bundle"]))))
     (is (= [{"version" 2} {"version" 1}] (:values result)))
-    (is (= 3 (get-in result [:plan :estimated-requests])))
+    (is (= 2 (get-in result [:plan :estimated-requests])))
     (is (= (:values result) (:values compacted-result)))
     (is (= "base" (get-in compacted [:bundle :node "mode"])))
     (is (nil? (get-in compacted [:bundle :node "previous-bundle"])))))
