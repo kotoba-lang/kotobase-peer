@@ -13,6 +13,7 @@
 (defn- prefix [e]
   (str (str/replace (or (env e "MERKLE_S3_PREFIX") "kotobase/merkle-lsm") #"^/+|/+$" "") "/"))
 (defn block-key [e cid] (str (prefix e) "blocks/" cid))
+(defn object-key [e cid] (str (prefix e) "objects/" cid))
 (defn head-key [e db-id] (str (prefix e) "heads/" db-id))
 
 (defn- b2-config [e]
@@ -75,6 +76,53 @@
   [e cid]
   (-> (get-block! e cid) (.then ipld/decode)))
 
+(defn put-object!
+  "Idempotently put a packed immutable object. Logical block CIDs and byte
+  ranges are described by a separate query bundle."
+  [e cid bytes]
+  (let [key (object-key e cid)]
+    (if-let [bucket (env e "MERKLE_BUCKET")]
+      (.put bucket key bytes)
+      (if-let [config (b2-config e)]
+        (-> (s3-request! config "PUT" key {:body bytes})
+            (.then (fn [response]
+                     (if (.-ok response)
+                       response
+                       (js/Promise.reject
+                        (ex-info "S3 object PUT failed"
+                                 {:cid cid :status (.-status response)}))))))
+        (js/Promise.reject
+         (js/Error. "No MERKLE_BUCKET or MERKLE_S3_* backend configured"))))))
+
+(defn get-object-range!
+  "Fetch exactly one byte range from a packed object. Works with R2 bindings
+  and generic S3-compatible HTTP; no Cloudflare KV API is involved."
+  [e cid offset length]
+  (when-not (and (integer? offset) (not (neg? offset))
+                 (integer? length) (pos? length))
+    (throw (ex-info "Object range must be non-negative and non-empty"
+                    {:offset offset :length length})))
+  (if-let [bucket (env e "MERKLE_BUCKET")]
+    (-> (.get bucket (object-key e cid)
+              #js {:range #js {:offset offset :length length}})
+        (.then (fn [obj]
+                 (if obj
+                   (-> (.arrayBuffer obj) (.then #(js/Uint8Array. %)))
+                   (js/Promise.reject
+                    (ex-info "Packed object not found" {:cid cid}))))))
+    (if-let [config (b2-config e)]
+      (-> (s3-request! config "GET" (object-key e cid)
+                       {:headers {"range" (str "bytes=" offset "-"
+                                                (dec (+ offset length)))}})
+          (.then (fn [response]
+                   (if (contains? #{200 206} (.-status response))
+                     (-> (.arrayBuffer response) (.then #(js/Uint8Array. %)))
+                     (js/Promise.reject
+                      (ex-info "S3 object Range GET failed"
+                               {:cid cid :status (.-status response)}))))))
+      (js/Promise.reject
+       (js/Error. "No MERKLE_BUCKET or MERKLE_S3_* backend configured")))))
+
 (defn put-blocks!
   "Persist every :block/put effect concurrently. Runs and their manifest are
   immutable and independent; the caller publishes the mutable head only after
@@ -83,6 +131,19 @@
   (->> effects
        (keep (fn [{:keys [effect/type cid bytes]}]
                (when (= :block/put type) (put-block! e cid bytes))))
+       clj->js
+       js/Promise.all))
+
+(defn apply-view-effects!
+  "Interpret immutable materialized-view publication effects. Query bundles
+  use the normal block namespace; packed SST objects use the object namespace."
+  [e effects]
+  (->> effects
+       (keep (fn [{:keys [effect/type cid bytes]}]
+               (case type
+                 :block/put (put-block! e cid bytes)
+                 :object/put (put-object! e cid bytes)
+                 nil)))
        clj->js
        js/Promise.all))
 

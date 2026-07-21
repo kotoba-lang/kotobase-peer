@@ -37,4 +37,6 @@
   :bench {:extra-paths ["bench"]
           :main-opts ["-m" "kotobase-peer.load-test"]}
   :merkle-bench {:extra-paths ["bench"]
-                 :main-opts ["-m" "kotobase-peer.merkle-lsm-bench"]}}}
+                 :main-opts ["-m" "kotobase-peer.merkle-lsm-bench"]}
+  :view-bench {:extra-paths ["bench"]
+               :main-opts ["-m" "kotobase-peer.materialized-view-bench"]}}}

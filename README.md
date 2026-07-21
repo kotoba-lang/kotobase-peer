@@ -147,6 +147,10 @@ older than a caller-supplied grace period.
 
 Run `clojure -M:merkle-bench 1000 100000 10000000` for the ADR scale sweep;
 `MERKLE_BENCH_WRITERS` selects simulated concurrent flushers (default 32).
+Run `clojure -M:view-bench 100000 512` for the browser/no-local-disk serving
+gate. It builds an immutable materialized-view pack, then executes deterministic
+point and bounded-range queries through the same sparse-index selection, byte
+range slicing, block-CID verification, and decode path used by a browser host.
 `npm run ci:local` is the canonical JVM/lint/CLJS/benchmark pre-push gate; CI
 execution does not depend on GitHub Actions.
 
@@ -161,7 +165,19 @@ execution does not depend on GitHub Actions.
 - `visible-rows`, a snapshot-epoch MVCC multi-run merge; and
 - `compact-runs`, which retains all versions newer than safe epoch plus the
   newest boundary version, preserving every snapshot at/above that epoch while
-  pruning older shadowed versions.
+  pruning older shadowed versions; and
+- `kotobase-peer.materialized-view`, which packs independently addressed view
+  blocks into a large immutable object and publishes a small query-bundle CID
+  containing sparse min/max keys and byte offsets. A browser query binary-seeks
+  that bundle and emits bounded `:object/range-get` effects; it never needs the
+  full view or a persistent local database. The Worker adapter interprets these
+  effects using native R2 or standard S3 HTTP Range requests without KV.
+
+Materialized views are derived acceleration data, not a second authority. Their
+bundle records the source manifest/epoch and optional plan CID; canonical datoms
+remain authoritative and a view can be discarded and rebuilt. Physical packed
+objects and logical block CIDs intentionally have different granularity, while
+every returned range is verified against its logical block CID before decode.
 
 This is currently a behavior-preserving shadow substrate: existing
 `commit!`/`hot-datoms`/`fold!` remain the live path until read equivalence and

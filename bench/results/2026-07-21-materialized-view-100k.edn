@@ -1,0 +1,48 @@
+{:schema 1
+ :date "2026-07-21"
+ :implementation "kotobase-peer.materialized-view"
+ :workload
+ {:rows 100000
+  :block-rows 512
+  :point-samples 1000
+  :range-20-samples 200
+  :key-distribution :deterministic-across-entire-view
+  :browser-local-storage :none}
+ :build
+ {:milliseconds 136551.012125
+  :rows-per-second 732.327050849386
+  :blocks 196
+  :pack-bytes 8346444
+  :bundle-bytes 25832}
+ :local-query-kernel
+ {:operation "binary sparse-index seek + byte slice + CID verification + DAG-CBOR decode"
+  :point {:requests 1
+          :bytes 42207
+          :p50-ms 13.103375
+          :p95-ms 65.28
+          :p99-ms 99.512791
+          :mean-ms 20.767469776}
+  :range-20 {:p50-ms 21.340958
+             :p95-ms 86.592333
+             :p99-ms 137.749625
+             :mean-ms 29.8483504}
+  :correct true}
+ :real-r2
+ {:provider :cloudflare-r2
+  :bucket "kotobase-merkle-lsm"
+  :worker "kotobase-view-bench"
+  :region-observed "NRT"
+  :object-bytes 8346444
+  :range-42207
+  {:samples 50 :p50-ms 21 :p95-ms 27 :p99-ms 30 :mean-ms 21.94}
+  :range-262144
+  {:samples 50 :p50-ms 22 :p95-ms 28 :p99-ms 34 :mean-ms 22.74}}
+ :interpretation
+ {:measured-separately true
+  :estimated-warm-point-ms "R2 range plus browser kernel: approximately 34 ms at p50 on this run"
+  :not-claimed "The sum is not an end-to-end browser percentile and no CDN-cache result is claimed."
+  :previous-remote-point-ms "approximately 320-410 ms"
+  :limitations ["single Worker/R2 account"
+                "no concurrent browser clients"
+                "DAG-CBOR row blocks, not yet columnar"
+                "materialization is offline and remains slower than the serving path"]}}
