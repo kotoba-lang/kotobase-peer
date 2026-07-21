@@ -5,6 +5,7 @@ const steps = [
   ["jvm-test", "clojure", ["-M:test"]],
   ["lint", "clojure", ["-M:lint"]],
   ["cljs-test", "npm", ["run", "test:cljs"]],
+  ["r2-gateway-test", "npm", ["run", "test:r2-gateway"]],
   ["merkle-bench", "clojure", ["-M:merkle-bench", "1000"]],
   ["view-bench", "clojure", ["-M:view-bench", "1000", "128"]],
   ["view-delta-bench", "clojure", ["-M:view-delta-bench", "1000", "100", "128"]],

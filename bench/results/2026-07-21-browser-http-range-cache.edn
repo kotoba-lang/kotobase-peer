@@ -1,0 +1,26 @@
+{:schema 1
+ :date "2026-07-21"
+ :endpoint "https://kotobase-view-bench.04-feasts-minded.workers.dev/"
+ :browser "HeadlessChrome/151.0.0.0"
+ :object {:backend :cloudflare-r2 :bytes 8346444
+          :range-bytes 42207 :offset 1048576}
+ :http-contract {:range-status 206
+                 :missing-range-status 416
+                 :matching-etag-status 304
+                 :cors-origin "*"
+                 :cache-control "public, max-age=31536000, immutable"
+                 :maximum-range-bytes 1048576}
+ :browser-e2e
+ {:cold {:cache-mode :reload :samples 10 :bytes 422070
+         :p50-ms 58.10000002384186 :p95-ms 131.69999998807907}
+  :warm {:cache-mode :force-cache :samples 20 :bytes 844140
+         :p50-ms 2.5 :p95-ms 4.899999976158142}
+  :dom-status :done
+  :console-errors 0}
+ :unit-verification {:tests 5 :assertions 14 :outcome :succeeded}
+ :invariants [:fixed-immutable-object
+              :single-bounded-range
+              :standard-http-cache
+              :no-kv
+              :no-cloudflare-cache-api]
+ :interpretation "Warm browser HTTP cache reduced the observed 42KB fetch p50 from 58.1ms to 2.5ms. This gateway benchmark transports a fixed pack range; full DAG-CBOR/CID query execution remains measured separately."}

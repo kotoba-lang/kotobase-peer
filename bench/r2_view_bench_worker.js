@@ -13,9 +13,90 @@ function response(value, status = 200) {
   });
 }
 
+function immutableHeaders(object, offset, length) {
+  const etag = object.httpEtag || `"${object.etag}"`;
+  return {
+    "access-control-allow-origin": "*",
+    "access-control-expose-headers": "accept-ranges, content-length, content-range, etag",
+    "accept-ranges": "bytes",
+    "cache-control": "public, max-age=31536000, immutable",
+    "content-type": "application/vnd.kotobase.view-pack",
+    "content-length": String(length),
+    "content-range": `bytes ${offset}-${offset + length - 1}/${OBJECT_BYTES}`,
+    etag,
+  };
+}
+
+function parseRange(value) {
+  const match = /^bytes=(\d+)-(\d+)$/.exec(value || "");
+  if (!match) return null;
+  const start = Number(match[1]);
+  const end = Number(match[2]);
+  const length = end - start + 1;
+  if (start < 0 || end < start || end >= OBJECT_BYTES || length > 1_048_576) return null;
+  return { offset: start, length };
+}
+
+const BENCH_PAGE = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<title>Kotobase Browser Range Benchmark</title></head>
+<body><main><h1>Kotobase Browser Range Benchmark</h1>
+<p>R2 immutable HTTP Range, no persistent local database.</p>
+<pre id="result" data-status="running">running</pre></main>
+<script>
+const result = document.querySelector('#result');
+const target = '/objects/view-pack';
+async function sample(cache, count) {
+  const values = [];
+  let bytes = 0;
+  for (let i = 0; i < count; i++) {
+    const started = performance.now();
+    const response = await fetch(target, {cache, headers: {Range: 'bytes=1048576-1090782'}});
+    if (response.status !== 206) throw new Error('expected 206, got ' + response.status);
+    bytes += (await response.arrayBuffer()).byteLength;
+    values.push(performance.now() - started);
+  }
+  values.sort((a, b) => a - b);
+  return {samples: count, bytes, p50Ms: values[Math.floor((count - 1) * .5)],
+          p95Ms: values[Math.floor((count - 1) * .95)], values};
+}
+(async () => {
+  try {
+    const cold = await sample('reload', 10);
+    const warm = await sample('force-cache', 20);
+    result.dataset.status = 'done';
+    result.textContent = JSON.stringify({cold, warm, userAgent: navigator.userAgent}, null, 2);
+  } catch (error) {
+    result.dataset.status = 'error'; result.textContent = String(error); console.error(error);
+  }
+})();
+</script></body></html>`;
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+    if (request.method === "OPTIONS" && url.pathname === "/objects/view-pack") {
+      return new Response(null, { status: 204, headers: {
+        "access-control-allow-origin": "*",
+        "access-control-allow-methods": "GET, HEAD, OPTIONS",
+        "access-control-allow-headers": "range",
+        "access-control-max-age": "86400",
+      }});
+    }
+    if ((request.method === "GET" || request.method === "HEAD") &&
+        url.pathname === "/objects/view-pack") {
+      const range = parseRange(request.headers.get("range"));
+      if (!range) return new Response("A single bounded byte range is required", {
+        status: 416, headers: { "content-range": `bytes */${OBJECT_BYTES}` },
+      });
+      const object = await env.MERKLE_BUCKET.get(OBJECT_KEY, { range });
+      if (!object) return response({ error: "benchmark object is not seeded" }, 404);
+      const headers = immutableHeaders(object, range.offset, range.length);
+      if (request.headers.get("if-none-match") === headers.etag)
+        return new Response(null, { status: 304, headers });
+      return new Response(request.method === "HEAD" ? null : object.body,
+                          { status: 206, headers });
+    }
     if (request.method === "GET" && url.pathname === "/bench") {
       const samples = Math.min(100, Math.max(1, Number(url.searchParams.get("samples") || 30)));
       const length = Math.min(1_048_576, Math.max(1, Number(url.searchParams.get("length") || 42207)));
@@ -36,6 +117,12 @@ export default {
                         p99Ms: percentile(timings, 0.99),
                         meanMs: timings.reduce((a, b) => a + b, 0) / timings.length });
     }
-    return response({ service: "kotobase-view-bench", routes: ["GET /bench"] });
+    if (request.method === "GET" && url.pathname === "/") {
+      return new Response(BENCH_PAGE, { headers: {
+        "content-type": "text/html; charset=utf-8", "cache-control": "no-store",
+      }});
+    }
+    return response({ service: "kotobase-view-bench",
+                      routes: ["GET /", "GET|HEAD|OPTIONS /objects/view-pack", "GET /bench"] });
   },
 };

@@ -195,6 +195,13 @@ small query bundle with zero data-object requests. Missing/legacy filters and
 false positives always fall back to a verified block read; range scans do not
 apply an exact-key filter.
 
+`wrangler.view-bench.jsonc` deploys a fixed-object verification gateway for the
+browser gate. It exposes only single ranges up to 1 MiB and returns standard
+HTTP `206`, `Content-Range`, `ETag`, CORS, and
+`Cache-Control: public, max-age=31536000, immutable`. It does not use KV or the
+Cloudflare Cache API; ordinary browser/CDN HTTP caches are optional host
+acceleration. Run `npm run test:r2-gateway` for its contract test.
+
 This is currently a behavior-preserving shadow substrate: existing
 `commit!`/`hot-datoms`/`fold!` remain the live path until read equivalence and
 CLJ/CLJS CID determinism gates pass. New storage work must target the
