@@ -21,14 +21,21 @@
         [min-b max-b] range-b]
     (and (not (nil? min-a)) (not (nil? min-b))
          (not (nil? max-a)) (not (nil? max-b))
-         (<= min-a max-b) (<= min-b max-a))))
+         (not (pos? (compare min-a max-b)))
+         (not (pos? (compare min-b max-a))))))
 
 (defn run-key-range
   "Extract [min-key max-key] range from a run or run-ref.
    Handles both direct run objects and run-ref metadata."
   [run]
-  (if-let [min-key (:min-key run)]
-    [min-key (:max-key run)]
+  (if-let [min-key (or (:first-component-min run)
+                       (get run "first-component-min")
+                       (:min-key run)
+                       (get run "min-key"))]
+    [min-key (or (:first-component-max run)
+                 (get run "first-component-max")
+                 (:max-key run)
+                 (get run "max-key"))]
     (when-let [node (:node run)]
       [(get node "min-key") (get node "max-key")])))
 
@@ -80,8 +87,7 @@
 
    Returns: {:compacted [...] :untouched [...] :all-output [...]}"
   [index tenant safe-epoch target-rows l0-runs level-runs]
-  (let [all-runs (vec (concat l0-runs level-runs))
-        l0-ranges (mapv run-key-range l0-runs)
+  (let [l0-ranges (mapv run-key-range l0-runs)
         overlapping (filterv (fn [run]
                               (let [run-range (run-key-range run)]
                                 (some #(key-range-overlap? % run-range) l0-ranges)))
@@ -198,7 +204,8 @@
    :epoch-readers (or epoch-readers [])
    :replicas (or replicas [])
    :legal-hold legal-hold
-   :pinned-at (System/currentTimeMillis)})
+   :pinned-at #?(:clj (System/currentTimeMillis)
+                 :cljs (.now js/Date))})
 
 (defn minimum-safe-epoch
   "M4: Compute minimum epoch that must be retained.

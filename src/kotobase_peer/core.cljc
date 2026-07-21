@@ -1,7 +1,6 @@
 ;; kotobase-peer.core — the kotobase peer library (Datomic's own term for
 ;; the transact/q/pull library an application embeds; this repo was named
-;; kotobase-engine until ADR-2607050700 -- "kotobase" itself was already
-;; taken by the client-side IStore port, kotoba-lang/kotobase), assembled
+;; kotobase-engine until ADR-2607050700), assembled
 ;; from the already-landed Wave 1-3 primitives (ADR-2607010930 Phase 6 +
 ;; ADR-2607022600): arrangement (hot 4-covering-index Arrangement + query
 ;; routing + per-commit snapshot -- formerly two repos, quad-store and kqe,

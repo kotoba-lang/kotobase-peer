@@ -4,13 +4,11 @@
    Measures:
    - M4 compaction scheduling and GC latency
    - M5 statistics collection and join planning
-   - M6 IStore adapter overhead
 
    Pass sizes explicitly for release sweeps; defaults remain local-test scale."
   (:require [kotobase-peer.merkle-lsm :as lsm]
             [kotobase-peer.compaction :as compaction]
-            [kotobase-peer.statistics :as statistics]
-            [kotobase-peer.istore.adapter :as adapter]))
+            [kotobase-peer.statistics :as statistics]))
 
 ;; ============================================================================
 ;; Utilities
@@ -76,12 +74,14 @@
 (defn bench-m4-safe-epoch-pin
   "Benchmark safe-epoch pin creation and minimum epoch calculation."
   [pin-count]
-  (let [pins (vec (repeatedly pin-count
-                              #(compaction/safe-epoch-pin
-                               {:manifest-cid (str "m" (rand-int 1000))
-                                :epoch (rand-int 100)
-                                :epoch-readers (vec (repeatedly (rand-int 5)
-                                                               #(rand-int 100)))})))
+  (let [pins (vec (repeatedly
+                   pin-count
+                   (fn []
+                     (compaction/safe-epoch-pin
+                      {:manifest-cid (str "m" (rand-int 1000))
+                       :epoch (rand-int 100)
+                       :epoch-readers (vec (repeatedly (rand-int 5)
+                                                      (fn [] (rand-int 100))))}))))
         timings (atom [])]
     (dotimes [_ 10]
       (let [{:keys [ms]} (elapsed-ms #(compaction/minimum-safe-epoch pins))]
@@ -159,71 +159,16 @@
      :avg-ms (/ (reduce + @timings) (count @timings))}))
 
 ;; ============================================================================
-;; M6 IStore Adapter Benchmarks
-;; ============================================================================
-
-(defn bench-m6-read-only-adapter
-  "Benchmark IStore read-only adapter overhead."
-  [request-count]
-  (let [requests (vec (repeatedly request-count
-                                 #(case (rand-int 5)
-                                    0 {:operation :get :doc-id "doc1"}
-                                    1 {:operation :put :doc-id "doc2" :value "v"}
-                                    2 {:operation :list}
-                                    3 {:operation :read :stream-id "s1"}
-                                    4 {:operation :append :stream-id "s2" :value "e"})))
-        timings (atom [])]
-    (dotimes [_ 10]
-      (let [{:keys [ms]} (elapsed-ms
-                          #(doseq [req requests]
-                            (adapter/istore-read-only-adapter req)))]
-        (swap! timings conj ms)))
-    {:operation :m6-read-only-adapter
-     :request-count request-count
-     :p50-ms (percentile @timings 0.50)
-     :p95-ms (percentile @timings 0.95)
-     :p99-ms (percentile @timings 0.99)
-     :avg-ms (/ (reduce + @timings) (count @timings))}))
-
-(defn bench-m6-istore-to-datom-migration
-  "Benchmark IStore → datom operation translation."
-  [operation-count]
-  (let [ops (vec (repeatedly operation-count
-                            #(hash-map :op (case (rand-int 5)
-                                            0 :put
-                                            1 :get
-                                            2 :list
-                                            3 :append
-                                            4 :read)
-                                       :doc-id "doc1"
-                                       :stream-id "stream1"
-                                       :value "value")))
-        timings (atom [])]
-    (dotimes [_ 10]
-      (let [{:keys [ms]} (elapsed-ms
-                          #(doseq [op ops]
-                            (adapter/migrate-istore-to-datom op)))]
-        (swap! timings conj ms)))
-    {:operation :m6-istore-to-datom-migration
-     :operation-count operation-count
-     :p50-ms (percentile @timings 0.50)
-     :p95-ms (percentile @timings 0.95)
-     :p99-ms (percentile @timings 0.99)
-     :avg-ms (/ (reduce + @timings) (count @timings))}))
-
-;; ============================================================================
 ;; Main Benchmark Driver
 ;; ============================================================================
 
-(defn -main [& args]
+(defn -main [& _args]
   (let [m4-run-count (or (some-> (System/getenv "M4_RUN_COUNT") parse-long) 100)
         m4-block-count (or (some-> (System/getenv "M4_BLOCK_COUNT") parse-long) 10000)
         m4-pin-count (or (some-> (System/getenv "M4_PIN_COUNT") parse-long) 100)
         m5-row-count (or (some-> (System/getenv "M5_ROW_COUNT") parse-long) 100000)
         m5-index-count (or (some-> (System/getenv "M5_INDEX_COUNT") parse-long) 4)
         m5-datom-count (or (some-> (System/getenv "M5_DATOM_COUNT") parse-long) 1000)
-        m6-request-count (or (some-> (System/getenv "M6_REQUEST_COUNT") parse-long) 10000)
-        m6-op-count (or (some-> (System/getenv "M6_OP_COUNT") parse-long) 10000)
 
         results (vec (concat
                      [(bench-m4-compaction-plan m4-run-count)
@@ -231,9 +176,7 @@
                       (bench-m4-safe-epoch-pin m4-pin-count)]
                      [(bench-m5-histogram-collection m5-row-count)
                       (bench-m5-join-planner m5-index-count)
-                      (bench-m5-delta-maintenance m5-datom-count)]
-                     [(bench-m6-read-only-adapter m6-request-count)
-                      (bench-m6-istore-to-datom-migration m6-op-count)]))]
+                      (bench-m5-delta-maintenance m5-datom-count)]))]
     (doseq [result results]
       (prn result))
     (shutdown-agents)))

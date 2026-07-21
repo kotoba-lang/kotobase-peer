@@ -5,8 +5,7 @@
    join order using greedy selectivity reduction, and maintains incremental
    materialized query views updated atomically with manifest publishes.
 
-   All functions return immutable data. No effects are executed here."
-  (:require [kotobase-peer.merkle-lsm :as lsm]))
+   All functions return immutable data. No effects are executed here.")
 
 ;; ============================================================================
 ;; Cardinality Histograms
@@ -44,11 +43,13 @@
   (let [indexes-map (get (:node manifest) "indexes")]
     (into {}
           (map (fn [[index-name levels]]
-                 [index-name
-                  (let [runs (mapcat val levels)]
-                    (build-cardinality-histogram
-                     (keyword index-name)
-                     (lsm/visible-rows runs (:epoch manifest))))])
+                 (let [index (keyword index-name)
+                       refs (mapcat val levels)
+                       cardinality (reduce + (map #(get % "count" 0) refs))]
+                   [index {:index index
+                           :full-cardinality cardinality
+                           :prefix-cardinalities {}
+                           :average-cardinality-per-prefix 0.0}]))
                indexes-map))))
 
 ;; ============================================================================
@@ -146,7 +147,8 @@
     (assoc arrangement
            :arrangement/materialized? true
            :arrangement/delta-rows delta-rows
-           :arrangement/last-updated (System/currentTimeMillis))))
+           :arrangement/last-updated #?(:clj (System/currentTimeMillis)
+                                        :cljs (.now js/Date)))))
 
 (defn query-with-arrangements
   "M5: Execute query using pre-materialized arrangements when available.

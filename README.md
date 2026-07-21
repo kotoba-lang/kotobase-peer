@@ -13,7 +13,7 @@ engine (`kotobase.aozora.app`). See
 [ADR-2607022600](https://github.com/com-junkawasaki/root/blob/main/90-docs/adr/2607022600-kotoba-database-crates-cljc-migration-roadmap.md).
 
 **Renamed from `kotobase-engine`** (ADR-2607050700): "kotobase" alone was
-already taken by the client-side `IStore` port (see below), and "engine"
+already used by the former client compatibility repository, and "engine"
 undersold what this actually is against the Datomic vocabulary the rest of
 this substrate deliberately mirrors (`kotoba : kotobase = Clojure :
 Datomic`, ADR-2607032500) — Datomic calls the library an application
@@ -41,15 +41,12 @@ specifically because content-addressing is only meaningful if two
 platforms computing "the same" data agree on its address — that's
 empirically checked, not assumed.
 
-## Not `kotoba-lang/kotobase`, not `kotoba-lang/atproto`
+## Repository boundary
 
 Two adjacent, already-existing `kotoba-lang` repos have different jobs:
 
-- **`kotoba-lang/kotobase`** is a *client-side* `IStore` port (`put`/`get`/
-  `list`/`append`/`read`) that lets an app run standalone locally or persist
-  to kotobase.net through an injected transport, without the app's code
-  changing. It has no server logic and doesn't know what's on the other end
-  of the wire.
+- **`kotoba-lang/kotobase`** provides client protocol compatibility. It is not
+  a storage engine and is not a dependency of this peer.
 - **`kotoba-lang/atproto`** is AT-Protocol *protocol* vocabulary (NSIDs, repo
   URI helpers, lexicon record shapes) shared by anything speaking AT
   Protocol — kotoba, app-aozora, future actors. It isn't kotobase-specific.
@@ -169,7 +166,7 @@ execution does not depend on GitHub Actions.
 This is currently a behavior-preserving shadow substrate: existing
 `commit!`/`hot-datoms`/`fold!` remain the live path until read equivalence and
 CLJ/CLJS CID determinism gates pass. New storage work must target the
-Merkle-LSM surface; no new IStore dependency is permitted.
+Merkle-LSM datom/IPLD surface; compatibility storage adapters are not permitted.
 
 ## Composition decision (resolves a known gap from ADR-2607022600)
 
