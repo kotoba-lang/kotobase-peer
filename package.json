@@ -5,6 +5,7 @@
     "test": "clojure -M:test",
     "ci:local": "node scripts/ci-local.mjs",
     "test:r2-gateway": "node bench/r2_view_bench_worker_test.mjs",
+    "build:view-e2e": "nbb gen-shadow-cljs-edn.cljs && shadow-cljs release view-e2e",
     "test:cljs": "nbb gen-shadow-cljs-edn.cljs && shadow-cljs compile test && node out/test.js",
     "test:nbb": "nbb run-nbb-tests.cljs"
   },

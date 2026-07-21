@@ -5,10 +5,13 @@ const calls = [];
 const env = { MERKLE_BUCKET: {
   async get(key, options) {
     calls.push({ key, options });
-    const length = options.range.length;
-    return { body: new Uint8Array(length), httpEtag: '"test-etag"', etag: "test-etag",
+    const length = options?.range.length ?? 3276;
+    return { body: new Uint8Array(length), size: length,
+             httpEtag: '"test-etag"', etag: "test-etag",
              async arrayBuffer() { return new Uint8Array(length).buffer; } };
   },
+}, ASSETS: {
+  async fetch() { return new Response("compiled browser asset"); },
 }};
 
 const origin = "https://example.test";
@@ -40,4 +43,30 @@ const page = await worker.fetch(new Request(`${origin}/`), env);
 assert.equal(page.status, 200);
 assert.match(await page.text(), /Kotobase Browser Range Benchmark/);
 
-console.log(JSON.stringify({ tests: 5, assertions: 14, outcome: "succeeded" }));
+const config = await worker.fetch(new Request(`${origin}/e2e/config`), env);
+assert.equal(config.status, 200);
+assert.deepEqual(await config.json(), {
+  bundleCid: "bafyreiczu47uqhv2mbid765rkv2zukfu7l664kblf22oodrkm72swyd3ge",
+  queryKey: "tenant-a/000000500",
+});
+
+const bundle = await worker.fetch(new Request(`${origin}/e2e/bundle`), env);
+assert.equal(bundle.status, 200);
+assert.equal(bundle.headers.get("content-length"), "3276");
+assert.match(bundle.headers.get("cache-control"), /immutable/);
+
+const e2eRange = await worker.fetch(new Request(`${origin}/e2e/object`, {
+  headers: { Range: "bytes=100-199" },
+}), env);
+assert.equal(e2eRange.status, 206);
+assert.equal(e2eRange.headers.get("content-range"), "bytes 100-199/63090");
+assert.deepEqual(calls.at(-1).options, { range: { offset: 100, length: 100 } });
+
+const e2ePage = await worker.fetch(new Request(`${origin}/e2e`), env);
+assert.equal(e2ePage.status, 200);
+assert.match(await e2ePage.text(), /bundle CID → plan → R2 Range/);
+
+const browserAsset = await worker.fetch(new Request(`${origin}/view-e2e.js`), env);
+assert.equal(await browserAsset.text(), "compiled browser asset");
+
+console.log(JSON.stringify({ tests: 10, assertions: 24, outcome: "succeeded" }));

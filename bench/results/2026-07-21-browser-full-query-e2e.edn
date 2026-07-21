@@ -1,0 +1,35 @@
+{:date "2026-07-21"
+ :target "https://kotobase-view-bench.04-feasts-minded.workers.dev/e2e"
+ :worker-version "0b5a3681-8f91-4147-b53d-709a5e622030"
+ :backend :cloudflare-r2
+ :persistent-local-storage? false
+ :fixture {:rows 1000
+           :query-key "tenant-a/000000500"
+           :pack-cid "bafyreiarxnmlhhamsuwelo55zfjnfthq4s273m2bs4mpvue3bnpxhz7k3y"
+           :pack-bytes 63090
+           :bundle-cid "bafyreiczu47uqhv2mbid765rkv2zukfu7l664kblf22oodrkm72swyd3ge"
+           :bundle-bytes 3276}
+ :path [:fetch-query-bundle
+        :verify-bundle-cid
+        :decode-bundle-dag-cbor
+        :sparse-and-bloom-plan
+        :r2-http-range
+        :verify-block-cid
+        :decode-row-dag-cbor
+        :render]
+ :cold {:bundle-ms 55.6
+        :range-and-query-ms 134.4
+        :total-ms 207.3}
+ :warm [{:bundle-ms 10.9 :range-and-query-ms 5.5 :total-ms 29.5}
+        {:bundle-ms 10.4 :range-and-query-ms 4.9 :total-ms 27.4}
+        {:bundle-ms 10.5 :range-and-query-ms 4.5 :total-ms 27.3}
+        {:bundle-ms 11.7 :range-and-query-ms 5.4 :total-ms 28.7}
+        {:bundle-ms 12.0 :range-and-query-ms 5.3 :total-ms 28.3}]
+ :query {:requests 1
+         :range-bytes 6348
+         :value {"id" 500 "title" "Post 500"}
+         :verified? true}
+ :browser-cache {:bundle-transfer-bytes 0
+                 :range-transfer-bytes 0}
+ :console-errors []
+ :outcome :succeeded}

@@ -199,6 +199,15 @@ HTTP `206`, `Content-Range`, `ETag`, CORS, and
 Cloudflare Cache API; ordinary browser/CDN HTTP caches are optional host
 acceleration. Run `npm run test:r2-gateway` for its contract test.
 
+`npm run build:view-e2e` compiles the CLJS query executor served at `/e2e`.
+That page downloads and verifies the query-bundle CID, decodes DAG-CBOR, plans
+from sparse metadata and Bloom filters, fetches one bounded R2 byte range,
+verifies the selected block CID, decodes its rows, and renders the result. The
+2026-07-21 real-browser R2 gate returned `tenant-a/000000500` in one 6,348-byte
+range request: 207.3 ms on the first navigation and 27.3–29.5 ms total across
+five warm reloads. The measured receipt is in
+`bench/results/2026-07-21-browser-full-query-e2e.edn`.
+
 This is currently a behavior-preserving shadow substrate: existing
 `commit!`/`hot-datoms`/`fold!` remain the live path until read equivalence and
 CLJ/CLJS CID determinism gates pass. New storage work must target the

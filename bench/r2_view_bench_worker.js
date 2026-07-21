@@ -1,5 +1,10 @@
 const OBJECT_KEY = "bench/materialized-view-pack-v1-8346444";
 const OBJECT_BYTES = 8_346_444;
+const E2E_PACK_KEY = "bench/e2e/view-pack-v1";
+const E2E_PACK_BYTES = 63_090;
+const E2E_BUNDLE_KEY = "bench/e2e/query-bundle-v1";
+const E2E_BUNDLE_CID = "bafyreiczu47uqhv2mbid765rkv2zukfu7l664kblf22oodrkm72swyd3ge";
+const E2E_QUERY_KEY = "tenant-a/000000500";
 
 function percentile(values, p) {
   const sorted = [...values].sort((a, b) => a - b);
@@ -13,27 +18,28 @@ function response(value, status = 200) {
   });
 }
 
-function immutableHeaders(object, offset, length) {
+function immutableHeaders(object, offset, length, totalBytes,
+                          contentType = "application/vnd.kotobase.view-pack") {
   const etag = object.httpEtag || `"${object.etag}"`;
   return {
     "access-control-allow-origin": "*",
     "access-control-expose-headers": "accept-ranges, content-length, content-range, etag",
     "accept-ranges": "bytes",
     "cache-control": "public, max-age=31536000, immutable",
-    "content-type": "application/vnd.kotobase.view-pack",
+    "content-type": contentType,
     "content-length": String(length),
-    "content-range": `bytes ${offset}-${offset + length - 1}/${OBJECT_BYTES}`,
+    "content-range": `bytes ${offset}-${offset + length - 1}/${totalBytes}`,
     etag,
   };
 }
 
-function parseRange(value) {
+function parseRange(value, totalBytes) {
   const match = /^bytes=(\d+)-(\d+)$/.exec(value || "");
   if (!match) return null;
   const start = Number(match[1]);
   const end = Number(match[2]);
   const length = end - start + 1;
-  if (start < 0 || end < start || end >= OBJECT_BYTES || length > 1_048_576) return null;
+  if (start < 0 || end < start || end >= totalBytes || length > 1_048_576) return null;
   return { offset: start, length };
 }
 
@@ -72,6 +78,14 @@ async function sample(cache, count) {
 })();
 </script></body></html>`;
 
+const E2E_PAGE = `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width">
+<title>Kotobase Full Browser Query E2E</title></head><body><main>
+<h1>Kotobase Full Browser Query E2E</h1>
+<p>bundle CID → plan → R2 Range → block CID → DAG-CBOR → render</p>
+<pre id="result" data-status="running">running</pre>
+</main><script src="/view-e2e.js"></script></body></html>`;
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -85,17 +99,40 @@ export default {
     }
     if ((request.method === "GET" || request.method === "HEAD") &&
         url.pathname === "/objects/view-pack") {
-      const range = parseRange(request.headers.get("range"));
+      const range = parseRange(request.headers.get("range"), OBJECT_BYTES);
       if (!range) return new Response("A single bounded byte range is required", {
         status: 416, headers: { "content-range": `bytes */${OBJECT_BYTES}` },
       });
       const object = await env.MERKLE_BUCKET.get(OBJECT_KEY, { range });
       if (!object) return response({ error: "benchmark object is not seeded" }, 404);
-      const headers = immutableHeaders(object, range.offset, range.length);
+      const headers = immutableHeaders(object, range.offset, range.length, OBJECT_BYTES);
       if (request.headers.get("if-none-match") === headers.etag)
         return new Response(null, { status: 304, headers });
       return new Response(request.method === "HEAD" ? null : object.body,
                           { status: 206, headers });
+    }
+    if (request.method === "GET" && url.pathname === "/e2e/config") {
+      return response({ bundleCid: E2E_BUNDLE_CID, queryKey: E2E_QUERY_KEY });
+    }
+    if (request.method === "GET" && url.pathname === "/e2e/bundle") {
+      const object = await env.MERKLE_BUCKET.get(E2E_BUNDLE_KEY);
+      if (!object) return response({ error: "E2E bundle is not seeded" }, 404);
+      return new Response(object.body, { headers: {
+        "content-type": "application/vnd.ipld.dag-cbor",
+        "content-length": String(object.size),
+        "cache-control": "public, max-age=31536000, immutable",
+        etag: object.httpEtag || `"${object.etag}"`,
+      }});
+    }
+    if (request.method === "GET" && url.pathname === "/e2e/object") {
+      const range = parseRange(request.headers.get("range"), E2E_PACK_BYTES);
+      if (!range) return new Response("A single bounded byte range is required", {
+        status: 416, headers: { "content-range": `bytes */${E2E_PACK_BYTES}` },
+      });
+      const object = await env.MERKLE_BUCKET.get(E2E_PACK_KEY, { range });
+      if (!object) return response({ error: "E2E pack is not seeded" }, 404);
+      return new Response(object.body, { status: 206,
+        headers: immutableHeaders(object, range.offset, range.length, E2E_PACK_BYTES) });
     }
     if (request.method === "GET" && url.pathname === "/bench") {
       const samples = Math.min(100, Math.max(1, Number(url.searchParams.get("samples") || 30)));
@@ -122,6 +159,13 @@ export default {
         "content-type": "text/html; charset=utf-8", "cache-control": "no-store",
       }});
     }
+    if (request.method === "GET" && url.pathname === "/e2e") {
+      return new Response(E2E_PAGE, { headers: {
+        "content-type": "text/html; charset=utf-8", "cache-control": "no-store",
+      }});
+    }
+    if (request.method === "GET" && url.pathname === "/view-e2e.js")
+      return env.ASSETS.fetch(request);
     return response({ service: "kotobase-view-bench",
                       routes: ["GET /", "GET|HEAD|OPTIONS /objects/view-pack", "GET /bench"] });
   },
