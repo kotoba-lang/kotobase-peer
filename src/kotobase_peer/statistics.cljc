@@ -39,16 +39,36 @@
 (defn build-index-statistics
   "M5: Build histograms for all indexes in a manifest.
 
+   When full run objects are available (with :node field), computes detailed
+   histograms including prefix cardinalities. When only run-refs are available
+   (typical for persisted manifests), uses run counts for cardinality estimates.
+
    Returns map: {:eavt {...} :aevt {...} :avet {...} :vaet {...}}"
   [manifest]
-  (let [indexes-map (get (:node manifest) "indexes")]
+  (let [indexes-map (get (:node manifest) "indexes")
+        epoch (:epoch manifest)]
     (into {}
           (map (fn [[index-name levels]]
-                 [(keyword index-name)
-                  (let [runs (mapcat val levels)]
-                    (build-cardinality-histogram
-                     (keyword index-name)
-                     (lsm/visible-rows runs (:epoch manifest))))])
+                 (let [index (keyword index-name)
+                       refs (mapcat val levels)
+                       ;; Try to get actual rows from full run objects if available
+                       rows (->> refs
+                                 (mapcat (fn [run]
+                                           ;; If run has :node, extract rows; otherwise empty
+                                           (if-let [node (:node run)]
+                                             (get node "rows")
+                                             [])))
+                                 (filter #(<= (get % "epoch") epoch))
+                                 vec)]
+                   (if (seq rows)
+                     ;; If we have actual rows, compute detailed statistics
+                     [index (build-cardinality-histogram index rows)]
+                     ;; Otherwise, use count-based estimates from run-refs
+                     (let [cardinality (reduce + (map #(get % "count" 0) refs))]
+                       [index {:index index
+                               :full-cardinality cardinality
+                               :prefix-cardinalities {}
+                               :average-cardinality-per-prefix 0.0}]))))
                indexes-map))))
 
 ;; ============================================================================

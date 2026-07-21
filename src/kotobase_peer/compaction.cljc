@@ -26,12 +26,26 @@
 
 (defn run-key-range
   "Extract [min-key max-key] range from a run or run-ref.
-   Handles both direct run objects and run-ref metadata."
+   Handles:
+   1. Direct run objects with :min-key/:max-key (keyword keys)
+   2. Run objects with :node field (string-keyed map)
+   3. Run-refs (string-keyed maps with \"min-key\"/\"max-key\")"
   [run]
-  (if-let [min-key (:min-key run)]
-    [min-key (:max-key run)]
-    (when-let [node (:node run)]
-      [(get node "min-key") (get node "max-key")])))
+  (cond
+    ;; Direct run object with keyword keys
+    (:min-key run)
+    [(:min-key run) (:max-key run)]
+
+    ;; Run with :node field (string-keyed map)
+    (:node run)
+    [(get (:node run) "min-key") (get (:node run) "max-key")]
+
+    ;; Run-ref (string-keyed map) - from manifests
+    (get run "min-key")
+    [(get run "min-key") (get run "max-key")]
+
+    ;; Fallback: nil
+    :else nil))
 
 ;; ============================================================================
 ;; Compaction Plan Selection
@@ -129,16 +143,17 @@
 ;; ============================================================================
 
 (defn gc-live-cids
-  "M4: Collect all CIDs reachable from a manifest.
+  "M4: Collect all CIDs reachable from a manifest and optional previous manifests.
 
    Walks:
    - Manifest's CID itself
    - Previous manifest link (if present)
    - All run references in index levels
    - Values within statistics (may contain IPLD Links)
+   - Optional previous manifests (to collect CIDs from earlier versions)
 
    Returns set of live CID strings."
-  [manifest]
+  [manifest & previous-manifests]
   (let [cids (atom #{})
         ;; Normalize CID to string format, handling both Link objects and raw strings
         normalize-cid (fn [c]
@@ -163,8 +178,8 @@
                            (doseq [run-ref runs]
                              (visit-run-ref run-ref)))))
 
-        visit-node (fn [node]
-                    (add-cid! (:cid manifest))
+        visit-node (fn [node m]
+                    (add-cid! (:cid m))
                     (when-let [prev-link (get node "previous")]
                       (add-cid! prev-link))
                     (when-let [indexes (get node "indexes")]
@@ -172,7 +187,11 @@
                     (when-let [stats (get node "statistics")]
                       (doseq [v (vals stats)]
                         (swap! cids into (lsm/linked-cids v)))))]
-    (visit-node (:node manifest))
+    (visit-node (:node manifest) manifest)
+    ;; Visit all provided previous manifests
+    (doseq [prev-manifest previous-manifests]
+      (when prev-manifest
+        (visit-node (:node prev-manifest) prev-manifest)))
     @cids))
 
 (defn gc-candidates
@@ -182,9 +201,12 @@
    difference(all_stored_cids, live_from_manifest)
 
    In production, host would iterate through manifest chain (old → new)
-   and mark blocks as live before GC sweep."
-  [current-manifest all-stored-cids]
-  (let [live-from-manifest (gc-live-cids current-manifest)]
+   and mark blocks as live before GC sweep.
+
+   Optional previous-manifests parameter: if provided, will be passed to gc-live-cids
+   to ensure all CIDs in the manifest chain are considered live."
+  [current-manifest all-stored-cids & previous-manifests]
+  (let [live-from-manifest (apply gc-live-cids current-manifest previous-manifests)]
     (set/difference all-stored-cids live-from-manifest)))
 
 ;; ============================================================================

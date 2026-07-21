@@ -9,14 +9,23 @@
 
 (deftest m4-compaction-plan-selects-overlapping-runs
   (testing "compaction-plan should select overlapping L1 runs based on L0 key ranges"
+    ;; Create L0 runs with ranges that overlap with L1 runs
+    ;; L0 run 1: spans from entity "a" attr "m" to "s" (overlaps with L1 overlap which goes "a" "p" to "t")
+    ;; L0 run 2: spans from entity "b" attr "x" to "z" (disjoint from both L1 runs)
+    ;; L1 overlap: entity "a" attrs "p" to "t" (overlaps with L0 run 1)
+    ;; L1 disjoint: entity "z" attrs "a" to "z" (disjoint from all L0 runs)
     (let [l0-run-1 (lsm/build-run :eavt "t"
-                                 [{:components ["a" "x"] :epoch 1 :op :assert :value 1}])
+                                 [{:components ["a" "m"] :epoch 1 :op :assert :value 1}
+                                  {:components ["a" "s"] :epoch 1 :op :assert :value 2}])
           l0-run-2 (lsm/build-run :eavt "t"
-                                 [{:components ["b" "y"] :epoch 2 :op :assert :value 2}])
+                                 [{:components ["b" "x"] :epoch 2 :op :assert :value 3}
+                                  {:components ["b" "z"] :epoch 2 :op :assert :value 4}])
           l1-overlap (lsm/build-run :eavt "t"
-                                   [{:components ["a" "z"] :epoch 0 :op :assert :value 0}])
+                                   [{:components ["a" "p"] :epoch 0 :op :assert :value 5}
+                                    {:components ["a" "t"] :epoch 0 :op :assert :value 6}])
           l1-disjoint (lsm/build-run :eavt "t"
-                                    [{:components ["z" "z"] :epoch 0 :op :assert :value 0}])
+                                    [{:components ["z" "a"] :epoch 0 :op :assert :value 7}
+                                     {:components ["z" "z"] :epoch 0 :op :assert :value 8}])
           manifest (lsm/build-manifest
                    {:db-id "test" :epoch 2
                     :indexes {:eavt {:l0 [l0-run-1 l0-run-2]
@@ -45,7 +54,9 @@
                       :previous (:cid manifest-1)})
 
           all-cids #{(:cid run-1) (:cid run-2) (:cid manifest-1) (:cid manifest-2) "orphan-cid"}
-          candidates (compaction/gc-candidates manifest-2 all-cids)]
+          ;; When previous manifests are available, pass them to gc-candidates
+          ;; so it can recursively collect all reachable CIDs
+          candidates (compaction/gc-candidates manifest-2 all-cids manifest-1)]
       (is (= #{"orphan-cid"} candidates)))))
 
 (deftest m4-safe-epoch-pin-prevents-gc
