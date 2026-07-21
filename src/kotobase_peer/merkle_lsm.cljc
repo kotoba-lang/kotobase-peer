@@ -117,6 +117,22 @@
                      :vaet [v a e])]
     {:components components :epoch epoch :op op :value v}))
 
+(declare partition-logical-groups)
+
+(defn build-run-ranges
+  "Build deterministic, logical-key-aligned runs of at most TARGET-ROWS.
+  A single hot logical key may exceed the target rather than being split."
+  [index tenant target-rows entries]
+  (when-not (and (integer? target-rows) (pos? target-rows))
+    (throw (ex-info "Run target rows must be a positive integer"
+                    {:target-rows target-rows})))
+  (->> entries
+       (sort-by (fn [{:keys [components epoch]}]
+                  (canonical-key index tenant components epoch)))
+       (partition-by :components)
+       (partition-logical-groups target-rows)
+       (mapv #(build-run index tenant (mapcat identity %)))))
+
 (defn build-index-runs
   "Flush one immutable datom batch into covering index runs. DATOMS are
   {:e :a :v :op}; :op defaults to :assert. VAET is intentionally sparse and
@@ -132,6 +148,22 @@
       (seq refs) (assoc :vaet
                         (build-run :vaet tenant
                                    (map #(datom-entry :vaet epoch %) refs))))))
+
+(defn build-index-run-ranges
+  "Flush one datom batch into bounded L0 ranges for every covering index."
+  [tenant epoch target-rows datoms]
+  (let [datoms (vec datoms)
+        general (fn [index]
+                  (build-run-ranges index tenant target-rows
+                                    (map #(datom-entry index epoch %) datoms)))
+        refs (filter #(ipld/link? (:v %)) datoms)]
+    (cond-> {:eavt (general :eavt)
+             :aevt (general :aevt)
+             :avet (general :avet)}
+      (seq refs) (assoc :vaet
+                        (build-run-ranges
+                         :vaet tenant target-rows
+                         (map #(datom-entry :vaet epoch %) refs))))))
 
 (defn run-ref
   "Manifest-safe metadata for a run returned by build-run."
@@ -215,16 +247,22 @@
   "M2 shadow-write vertical slice: turn a datom batch into immutable L0 runs,
   a VersionManifest, and ordered BlockPut...HeadCAS effects. No effect is
   executed here."
-  [{:keys [db-id tenant epoch safe-epoch previous expected datoms statistics]
-    :or {safe-epoch 0 statistics {}}}]
-  (let [runs-by-index (build-index-runs (or tenant db-id) epoch datoms)
+  [{:keys [db-id tenant epoch safe-epoch previous expected datoms statistics
+           target-run-rows]
+    :or {safe-epoch 0 statistics {} target-run-rows 4096}}]
+  (let [runs-by-index (build-index-run-ranges
+                       (or tenant db-id) epoch target-run-rows datoms)
         manifest (build-manifest
                   {:db-id db-id :epoch epoch :safe-epoch safe-epoch
-                   :previous previous :statistics statistics
+                   :previous previous
+                   :statistics (assoc statistics "l0-target-run-rows" target-run-rows)
                    :indexes (into {}
-                                  (map (fn [[index run]] [index {:l0 [run]}]))
+                                  (map (fn [[index runs]] [index {:l0 runs}]))
                                   runs-by-index)})
-        runs (mapv val (sort-by (comp name key) runs-by-index))]
+        runs (->> runs-by-index
+                  (sort-by (comp name key))
+                  (mapcat val)
+                  vec)]
     (assoc (publication-plan db-id expected runs manifest)
            :runs runs-by-index
            :manifest manifest)))

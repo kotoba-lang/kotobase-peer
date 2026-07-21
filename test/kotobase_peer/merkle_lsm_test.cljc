@@ -70,11 +70,24 @@
                         {:e "a" :a "friend" :v target}]})
         effects (:effects plan)]
     (is (= #{:eavt :aevt :avet :vaet} (set (keys (:runs plan)))))
-    (is (= 2 (get-in plan [:runs :eavt :count])))
-    (is (= 1 (get-in plan [:runs :vaet :count])))
+    (is (= 2 (get-in plan [:runs :eavt 0 :count])))
+    (is (= 1 (get-in plan [:runs :vaet 0 :count])))
     (is (= :head/cas (:effect/type (peek effects))))
     (is (every? #(= :block/put (:effect/type %)) (pop effects)))
     (is (= (:cid (:manifest plan)) (get-in plan [:result :manifest])))))
+
+(deftest flush-plan-partitions-broad-l0-runs
+  (let [datoms (mapv (fn [i] {:e (str "entity-" i) :a "value" :v i})
+                     (range 7))
+        plan (lsm/flush-plan {:db-id "db" :epoch 1 :datoms datoms
+                              :target-run-rows 2})
+        runs (get-in plan [:runs :eavt])
+        refs (get-in plan [:manifest :node "indexes" "eavt" "l0"])]
+    (is (= 4 (count runs)))
+    (is (= [2 2 2 1] (mapv :count runs)))
+    (is (= 7 (reduce + (map :count runs))))
+    (is (= (mapv lsm/run-ref runs) refs))
+    (is (= 2 (get-in plan [:manifest :node "statistics" "l0-target-run-rows"])))))
 
 (deftest invalid-manifest-safe-epoch-is-rejected
   (is (thrown? #?(:clj Exception :cljs js/Error)
