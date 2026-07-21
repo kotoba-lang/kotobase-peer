@@ -36,6 +36,19 @@
     (is (ipld/link? run-link))
     (is (= (:cid run) (ipld/link-cid run-link)))))
 
+(deftest overlapping-run-ranges-form-transitive-tasks
+  (let [ref (fn [id lo hi] {"cid" id "min-key" lo "max-key" hi})
+        a (ref "a" "a" "d")
+        b (ref "b" "c" "f")
+        c (ref "c" "f" "h")
+        d (ref "d" "x" "z")
+        ranges (lsm/overlapping-run-ranges [d c a b])]
+    (is (= [[a b c] [d]] (mapv :refs ranges)))
+    (is (= [["a" "h"] ["x" "z"]]
+           (mapv (juxt :min-key :max-key) ranges)))
+    (is (= [[a (dissoc b "min-key")]]
+           (lsm/overlapping-run-ranges [a (dissoc b "min-key")])))))
+
 (deftest publication-puts-before-cas
   (let [run (lsm/build-run :eavt "tenant-a" entries)
         manifest (lsm/build-manifest

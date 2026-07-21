@@ -231,6 +231,25 @@
       js/Promise.all
       (.then #(vec (array-seq %)))))
 
+(defn- compact-index-ranges!
+  "Process disjoint overlap components sequentially. Uploaded run bytes leave
+  the live working set before the next range starts; only manifest refs stay."
+  [e db-id index safe-epoch target-run-rows refs]
+  (reduce
+   (fn [result {:keys [refs]}]
+     (.then result
+            (fn [output-refs]
+              (-> (load-runs! e refs)
+                  (.then
+                   (fn [runs]
+                     (let [outputs (lsm/compact-runs-partitioned
+                                    index db-id safe-epoch target-run-rows runs)]
+                       (-> (put-blocks! e (mapcat :effects outputs))
+                           (.then (fn [_]
+                                    (into output-refs (map lsm/run-ref) outputs)))))))))))
+   (js/Promise.resolve [])
+   (lsm/overlapping-run-ranges refs)))
+
 (defn compact-head!
   "Compact the newest manifest window into range-partitioned L1 runs and
   publish it with R2 CAS. The untouched tail remains linked as :previous.
@@ -247,18 +266,20 @@
                 (.then
                  (fn [{:keys [manifests tail]}]
                    (let [present (filter #(seq (index-run-refs manifests %)) lsm/indexes)
-                         loads (mapv #(load-runs! e (index-run-refs manifests %)) present)]
-                     (-> (js/Promise.all (clj->js loads))
+                         epoch (apply max (map #(get-in % [:node "epoch"]) manifests))]
+                     (-> (reduce
+                          (fn [result index]
+                            (.then result
+                                   (fn [compacted]
+                                     (-> (compact-index-ranges!
+                                          e db-id index epoch target-run-rows
+                                          (index-run-refs manifests index))
+                                         (.then #(assoc compacted index %))))))
+                          (js/Promise.resolve {})
+                          present)
                          (.then
-                          (fn [loaded]
-                            (let [epoch (apply max (map #(get-in % [:node "epoch"]) manifests))
-                                  compacted (into {}
-                                                  (map (fn [index runs]
-                                                         [index (lsm/compact-runs-partitioned
-                                                                 index db-id epoch
-                                                                 target-run-rows runs)])
-                                                       present (array-seq loaded)))
-                                  manifest (lsm/build-manifest
+                          (fn [compacted]
+                            (let [manifest (lsm/build-manifest
                                             {:db-id db-id :epoch epoch :safe-epoch epoch
                                              :previous tail
                                              :indexes (into {}
@@ -269,8 +290,7 @@
                                                           "manifest-count" (count manifests)
                                                           "target-run-rows" target-run-rows
                                                           "output-run-count" (reduce + (map count (vals compacted)))}})
-                                  effects (concat (mapcat :effects (mapcat identity (vals compacted)))
-                                                  (:effects manifest))]
+                                  effects (:effects manifest)]
                               (-> (put-blocks! e effects)
                                   (.then (fn [_]
                                            (cas-head! e db-id (:cid manifest) etag))))))))))))))))))
