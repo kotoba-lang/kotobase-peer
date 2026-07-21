@@ -211,6 +211,14 @@ range request: 207.3 ms on the first navigation and 27.3–29.5 ms total across
 five warm reloads. The measured receipt is in
 `bench/results/2026-07-21-browser-full-query-e2e.edn`.
 
+The load gate extends that executor to repeated point and 200-row range queries
+plus five batches of eight concurrent cold point queries. Protected fixture
+routes require an `E2E_BEARER_TOKEN` Worker secret; the browser accepts the
+capability only through the URL fragment and sends it as `Authorization`, so it
+is neither committed nor sent in the page URL. Tenant responses are
+`private, immutable` and vary on authorization. See
+`bench/results/2026-07-21-browser-r2-load-auth.edn` for the real R2 receipt.
+
 This is currently a behavior-preserving shadow substrate: existing
 `commit!`/`hot-datoms`/`fold!` remain the live path until read equivalence and
 CLJ/CLJS CID determinism gates pass. New storage work must target the

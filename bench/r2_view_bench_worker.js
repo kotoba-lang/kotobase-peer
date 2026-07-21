@@ -5,6 +5,7 @@ const E2E_PACK_BYTES = 63_090;
 const E2E_BUNDLE_KEY = "bench/e2e/query-bundle-v1";
 const E2E_BUNDLE_CID = "bafyreiczu47uqhv2mbid765rkv2zukfu7l664kblf22oodrkm72swyd3ge";
 const E2E_QUERY_KEY = "tenant-a/000000500";
+const E2E_ASSET_VERSION = "load-auth-v2";
 
 function percentile(values, p) {
   const sorted = [...values].sort((a, b) => a - b);
@@ -41,6 +42,11 @@ function parseRange(value, totalBytes) {
   const length = end - start + 1;
   if (start < 0 || end < start || end >= totalBytes || length > 1_048_576) return null;
   return { offset: start, length };
+}
+
+function authorized(request, env) {
+  if (!env.E2E_BEARER_TOKEN) return true;
+  return request.headers.get("authorization") === `Bearer ${env.E2E_BEARER_TOKEN}`;
 }
 
 const BENCH_PAGE = `<!doctype html>
@@ -82,13 +88,17 @@ const E2E_PAGE = `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width">
 <title>Kotobase Full Browser Query E2E</title></head><body><main>
 <h1>Kotobase Full Browser Query E2E</h1>
-<p>bundle CID → plan → R2 Range → block CID → DAG-CBOR → render</p>
+<p>point/range/cold/warm/concurrent: bundle CID → plan → R2 Range → block CID → DAG-CBOR → render</p>
 <pre id="result" data-status="running">running</pre>
-</main><script src="/view-e2e.js"></script></body></html>`;
+</main><script src="/view-e2e.js?v=${E2E_ASSET_VERSION}"></script></body></html>`;
 
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+    if (["/e2e/config", "/e2e/bundle", "/e2e/object"].includes(url.pathname) &&
+        !authorized(request, env)) {
+      return response({ error: "unauthorized" }, 401);
+    }
     if (request.method === "OPTIONS" && url.pathname === "/objects/view-pack") {
       return new Response(null, { status: 204, headers: {
         "access-control-allow-origin": "*",
@@ -112,7 +122,10 @@ export default {
                           { status: 206, headers });
     }
     if (request.method === "GET" && url.pathname === "/e2e/config") {
-      return response({ bundleCid: E2E_BUNDLE_CID, queryKey: E2E_QUERY_KEY });
+      const result = response({ bundleCid: E2E_BUNDLE_CID, queryKey: E2E_QUERY_KEY });
+      result.headers.set("cache-control", "no-store");
+      result.headers.set("vary", "authorization");
+      return result;
     }
     if (request.method === "GET" && url.pathname === "/e2e/bundle") {
       const object = await env.MERKLE_BUCKET.get(E2E_BUNDLE_KEY);
@@ -120,7 +133,8 @@ export default {
       return new Response(object.body, { headers: {
         "content-type": "application/vnd.ipld.dag-cbor",
         "content-length": String(object.size),
-        "cache-control": "public, max-age=31536000, immutable",
+        "cache-control": "private, max-age=31536000, immutable",
+        "vary": "authorization",
         etag: object.httpEtag || `"${object.etag}"`,
       }});
     }
@@ -131,8 +145,10 @@ export default {
       });
       const object = await env.MERKLE_BUCKET.get(E2E_PACK_KEY, { range });
       if (!object) return response({ error: "E2E pack is not seeded" }, 404);
-      return new Response(object.body, { status: 206,
-        headers: immutableHeaders(object, range.offset, range.length, E2E_PACK_BYTES) });
+      const headers = immutableHeaders(object, range.offset, range.length, E2E_PACK_BYTES);
+      headers["cache-control"] = "private, max-age=31536000, immutable";
+      headers.vary = "authorization";
+      return new Response(object.body, { status: 206, headers });
     }
     if (request.method === "GET" && url.pathname === "/bench") {
       const samples = Math.min(100, Math.max(1, Number(url.searchParams.get("samples") || 30)));

@@ -65,8 +65,26 @@ assert.deepEqual(calls.at(-1).options, { range: { offset: 100, length: 100 } });
 const e2ePage = await worker.fetch(new Request(`${origin}/e2e`), env);
 assert.equal(e2ePage.status, 200);
 assert.match(await e2ePage.text(), /bundle CID → plan → R2 Range/);
+assert.match(await (await worker.fetch(new Request(`${origin}/e2e`), env)).text(),
+             /view-e2e\.js\?v=load-auth-v2/);
 
 const browserAsset = await worker.fetch(new Request(`${origin}/view-e2e.js`), env);
 assert.equal(await browserAsset.text(), "compiled browser asset");
 
-console.log(JSON.stringify({ tests: 10, assertions: 24, outcome: "succeeded" }));
+const protectedEnv = { ...env, E2E_BEARER_TOKEN: "test-capability" };
+const callsBeforeDenied = calls.length;
+const denied = await worker.fetch(new Request(`${origin}/e2e/object`, {
+  headers: { Range: "bytes=100-199" },
+}), protectedEnv);
+assert.equal(denied.status, 401);
+assert.equal(calls.length, callsBeforeDenied);
+
+const allowed = await worker.fetch(new Request(`${origin}/e2e/object`, {
+  headers: { Range: "bytes=100-199", Authorization: "Bearer test-capability" },
+}), protectedEnv);
+assert.equal(allowed.status, 206);
+assert.equal(calls.at(-1).key, "bench/e2e/view-pack-v1");
+assert.match(allowed.headers.get("cache-control"), /private/);
+assert.equal(allowed.headers.get("vary"), "authorization");
+
+console.log(JSON.stringify({ tests: 12, assertions: 31, outcome: "succeeded" }));

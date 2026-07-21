@@ -1,0 +1,35 @@
+{:date "2026-07-21"
+ :target "https://kotobase-view-bench.04-feasts-minded.workers.dev/e2e"
+ :worker-version "7d6b7216-9301-48d2-95e2-b9a0aa15b0ea"
+ :asset-version "load-auth-v2"
+ :backend :cloudflare-r2
+ :browser "Headless Chrome 151"
+ :bundle-cid "bafyreiczu47uqhv2mbid765rkv2zukfu7l664kblf22oodrkm72swyd3ge"
+ :authorization {:scheme :bearer-capability
+                 :worker-secret-binding "E2E_BEARER_TOKEN"
+                 :token-recorded? false
+                 :unauthorized-status 401
+                 :authorized-status 200
+                 :tenant-cache-control "private, max-age=31536000, immutable"
+                 :vary "authorization"}
+ :point {:cold {:samples 10 :p50-ms 39.6 :p95-ms 50.4 :p99-ms 50.4
+                :min-ms 36.6 :max-ms 50.5}
+         :warm {:samples 20 :p50-ms 2.8 :p95-ms 3.5 :p99-ms 3.5
+                :min-ms 2.6 :max-ms 36.2}
+         :requests 1 :range-bytes 6348
+         :value {"id" 500 "title" "Post 500"}}
+ :range {:cold {:samples 10 :p50-ms 45.8 :p95-ms 49.5 :p99-ms 49.5
+                :min-ms 37.3 :max-ms 54.8}
+         :rows 200 :requests 1 :range-bytes 19044
+         :first {"id" 450 "title" "Post 450"}
+         :last {"id" 649 "title" "Post 649"}}
+ :concurrent {:batches 5 :concurrency 8 :samples 40
+              :latency {:p50-ms 56.2 :p95-ms 95.7 :p99-ms 97.0
+                        :min-ms 41.8 :max-ms 98.9}
+              :batch-wall {:p50-ms 91.8 :p95-ms 95.0 :p99-ms 95.0
+                           :min-ms 54.8 :max-ms 99.6}}
+ :http {:data-range-requests 80}
+ :total-harness-ms 1450.6
+ :cid-verified-every-query? true
+ :console-errors []
+ :outcome :succeeded}
