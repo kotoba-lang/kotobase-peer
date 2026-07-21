@@ -38,6 +38,21 @@
     (is (ipld/link? run-link))
     (is (= (:cid run) (ipld/link-cid run-link)))))
 
+(deftest range-directory-checkpoints-compacted-refs
+  (let [a (lsm/build-run :eavt "t" entries)
+        b (lsm/build-run :avet "t" entries)
+        directory (lsm/build-range-directory
+                   {:db-id "db" :epoch 9
+                    :indexes {:eavt [a] :avet [(lsm/run-ref b)]}
+                    :previous (:cid a)})]
+    (is (= "kotobase/range-directory" (get-in directory [:node "format"])))
+    (is (= [(lsm/run-ref a)]
+           (lsm/range-directory-refs (:node directory) :eavt)))
+    (is (= [(lsm/run-ref b)]
+           (lsm/range-directory-refs (:node directory) :avet)))
+    (is (= (:cid a)
+           (ipld/link-cid (get-in directory [:node "previous"]))))))
+
 (deftest first-component-range-prunes-run-refs
   (let [alice (lsm/build-run :eavt "t"
                              [{:components ["alice" "name" "Alice"]

@@ -150,7 +150,21 @@
   later replace its bounded manifest walk without changing callers."
   ([e db-id entity] (find-latest-entity! e db-id entity 256))
   ([e db-id entity max-depth]
-   (letfn [(scan [manifest-cid depth]
+   (letfn [(scan-refs [refs previous depth]
+             (let [refs (lsm/select-run-refs-by-first-component refs entity)
+                   loads (mapv #(get-node! e (ipld/link-cid (get % "cid"))) refs)]
+               (-> (js/Promise.all (clj->js loads))
+                   (.then
+                    (fn [runs]
+                      (let [rows (->> (array-seq runs)
+                                      (mapcat #(get % "rows"))
+                                      (filter #(= entity
+                                                  (first (get % "components"))))
+                                      vec)]
+                        (if (seq rows)
+                          rows
+                          (scan previous (inc depth)))))))))
+           (scan [manifest-cid depth]
              (cond
                (nil? manifest-cid) (js/Promise.resolve nil)
                (>= depth max-depth)
@@ -161,21 +175,19 @@
                (-> (get-node! e manifest-cid)
                    (.then
                     (fn [manifest]
-                      (let [refs (-> (index-run-refs [{:node manifest}] :eavt)
-                                     (lsm/select-run-refs-by-first-component entity))
-                            previous (some-> (get manifest "previous") ipld/link-cid)
-                            loads (mapv #(get-node! e (ipld/link-cid (get % "cid"))) refs)]
-                        (-> (js/Promise.all (clj->js loads))
+                      (if-let [directory-link
+                               (get-in manifest ["statistics" "range-directory"])]
+                        (-> (get-node! e (ipld/link-cid directory-link))
                             (.then
-                             (fn [runs]
-                               (let [rows (->> (array-seq runs)
-                                               (mapcat #(get % "rows"))
-                                               (filter #(= entity
-                                                           (first (get % "components"))))
-                                               vec)]
-                                 (if (seq rows)
-                                   rows
-                                   (scan previous (inc depth)))))))))))))]
+                             (fn [directory]
+                               (scan-refs
+                                (lsm/range-directory-refs directory :eavt)
+                                (some-> (get directory "previous") ipld/link-cid)
+                                depth))))
+                        (scan-refs
+                         (index-run-refs [{:node manifest}] :eavt)
+                         (some-> (get manifest "previous") ipld/link-cid)
+                         depth)))))))]
      (-> (get-head e db-id)
          (.then (fn [{:keys [value]}] (scan value 0)))))))
 
@@ -282,7 +294,10 @@
                           present)
                          (.then
                           (fn [compacted]
-                            (let [manifest (lsm/build-manifest
+                            (let [directory (lsm/build-range-directory
+                                             {:db-id db-id :epoch epoch
+                                              :indexes compacted :previous tail})
+                                  manifest (lsm/build-manifest
                                             {:db-id db-id :epoch epoch :safe-epoch epoch
                                              :previous tail
                                              :indexes (into {}
@@ -290,10 +305,11 @@
                                                                    [index {:l1 runs}]))
                                                             compacted)
                                              :statistics {"operation" "window-compaction"
+                                                          "range-directory" (ipld/link (:cid directory))
                                                           "manifest-count" (count manifests)
                                                           "target-run-rows" target-run-rows
                                                           "output-run-count" (reduce + (map count (vals compacted)))}})
-                                  effects (:effects manifest)]
+                                  effects (concat (:effects directory) (:effects manifest))]
                               (-> (put-blocks! e effects)
                                   (.then (fn [_]
                                            (cas-head! e db-id (:cid manifest) etag))))))))))))))))))

@@ -236,6 +236,29 @@
                                    runs)]))
         levels))
 
+(defn build-range-directory
+  "Build an immutable checkpoint directory over compacted run refs. PREVIOUS
+  points at an uncompacted manifest tail, or is nil for a full checkpoint."
+  [{:keys [db-id epoch indexes previous]}]
+  (let [node (cond->
+              {"format" "kotobase/range-directory"
+               "version" format-version
+               "db-id" (str db-id)
+               "epoch" epoch
+               "indexes" (into
+                          (sorted-map)
+                          (map (fn [[index refs]]
+                                 [(name index)
+                                  (mapv #(if (and (map? %) (:cid %))
+                                           (run-ref %) %)
+                                        refs)]))
+                          indexes)}
+               previous (assoc "previous" (ipld/link previous)))]
+    (assoc (encoded node) :db-id (str db-id) :epoch epoch)))
+
+(defn range-directory-refs [directory index]
+  (get-in directory ["indexes" (name index)] []))
+
 (defn build-manifest
   "Build VersionManifest v1. INDEXES maps :eavt/:aevt/:avet/:vaet to level
   maps such as {:l0 [run] :l1 [run-ref]}. PREVIOUS is nil or a manifest CID."
