@@ -141,6 +141,31 @@
    "min-key" min-key
    "max-key" max-key})
 
+(defn overlapping-run-ranges
+  "Partition run refs into deterministic, disjoint key-range tasks. Refs in a
+  task overlap transitively and must be compacted together. Missing range
+  metadata disables splitting so older manifests remain correctness-safe."
+  [refs]
+  (let [refs (vec refs)]
+    (cond
+      (empty? refs) []
+      (some #(or (nil? (get % "min-key")) (nil? (get % "max-key"))) refs)
+      [refs]
+      :else
+      (reduce (fn [ranges ref]
+                (let [start (get ref "min-key")
+                      end (get ref "max-key")]
+                  (if-let [{range-end :max-key range-refs :refs} (peek ranges)]
+                    (if (<= (compare start range-end) 0)
+                      (conj (pop ranges)
+                            {:min-key (:min-key (peek ranges))
+                             :max-key (if (pos? (compare end range-end)) end range-end)
+                             :refs (conj range-refs ref)})
+                      (conj ranges {:min-key start :max-key end :refs [ref]}))
+                    [{:min-key start :max-key end :refs [ref]}])))
+              []
+              (sort-by (juxt #(get % "min-key") #(get % "max-key")) refs)))))
+
 (defn- normalize-levels [levels]
   (into (sorted-map)
         (map (fn [[level runs]]
