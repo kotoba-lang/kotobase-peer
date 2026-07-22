@@ -581,9 +581,8 @@
 
 (defn find-index-prefix-page!
   "Bounded-memory MVCC prefix page. Selected run blocks are fetched and folded
-  in bounded waves; when AFTER falls inside a physical block, that block and
-  its successor are fetched concurrently so a continuation does not serialize
-  two R2 round trips. Only LIMIT+1 logical-key candidates survive between reads.
+  on demand. A continuation never speculatively fetches its successor block;
+  only LIMIT+1 logical-key candidates survive between reads.
   AFTER is the opaque logical-key cursor returned by the previous page."
   [e db-id index prefixes {:keys [after limit max-depth]
                            :or {limit 256 max-depth 256}}]
@@ -640,16 +639,11 @@
                                                     (not (pos? (compare hi after))))
                                                (and page-cutoff lo
                                                     (pos? (compare lo page-cutoff))))))
-                                       (load-block-wave! [descriptors]
-                                         (-> (mapv
-                                              (fn [descriptor]
-                                                (-> (get-node!
-                                                     e (ipld/link-cid
-                                                        (get descriptor "cid")))
-                                                    (.then #(vector descriptor %))))
-                                              descriptors)
-                                             clj->js js/Promise.all
-                                             (.then #(vec (array-seq %)))))
+                                       (load-block! [descriptor]
+                                         (-> (get-node!
+                                              e (ipld/link-cid
+                                                 (get descriptor "cid")))
+                                             (.then #(vector descriptor %))))
                                        (fold-loaded-block [state [descriptor block]]
                                          (let [rows (validated-run-block-rows
                                                      descriptor block index db-id)
@@ -667,23 +661,13 @@
                                                 descriptors)]
                                            (if (empty? remaining)
                                              (js/Promise.resolve state)
-                                             (let [first-block (first remaining)
-                                                   lo (get first-block "logical-min")
-                                                   hi (get first-block "logical-max")
-                                                   cursor-inside?
-                                                   (and after lo hi
-                                                        (not (neg? (compare after lo)))
-                                                        (neg? (compare after hi)))
-                                                   wave-size (if cursor-inside? 2 1)
-                                                   wave (vec (take wave-size remaining))]
-                                               (-> (load-block-wave! wave)
+                                             (let [descriptor (first remaining)]
+                                               (-> (load-block! descriptor)
                                                    (.then
                                                     (fn [loaded]
                                                       (fold-blocks
-                                                       (reduce fold-loaded-block
-                                                               state loaded)
-                                                       (drop (count wave)
-                                                             remaining)))))))))
+                                                       (fold-loaded-block state loaded)
+                                                       (rest remaining)))))))))
                                        (fold-ref [pending ref]
                                          (.then
                                           pending

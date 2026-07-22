@@ -142,9 +142,9 @@ Large immutable runs are stored as a small run root plus logical-key-aligned
 data blocks (128 rows by default).  The block descriptors are copied into the
 manifest run reference, so a bounded prefix page can skip blocks wholly before
 its continuation without fetching the run root or replaying earlier data.
-When a continuation falls inside a block, that block and its immediate
-successor are fetched as one bounded two-request wave; retained candidate state
-and total GET count are unchanged while the two remote round trips overlap.
+Continuation reads are demand-only: a block is fetched after its descriptor is
+known to overlap the cursor and current page cutoff. This avoids speculative
+successor GETs and keeps physical reads attributable to returned page work.
 Legacy inline-row runs remain readable.  A single hot logical key is never
 split merely to meet the row target and can therefore produce an oversized
 block; that skew case remains an explicit compaction/query-planning boundary.

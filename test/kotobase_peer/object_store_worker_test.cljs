@@ -176,8 +176,8 @@
                            (do
                              (is (= 300 (count next-rows)))
                              (is (= [1 2 1 2 1] next-scanned))
-                             (is (= 2 @max-data-gets)
-                                 "a cursor inside a block overlaps its successor GET")
+                             (is (= 1 @max-data-gets)
+                                 "a cursor never speculatively fetches its successor")
                              (is (not-any? #{root-key} @gets)
                                  "manifest block descriptors bypass the run root")
                              (is (= 7 (count (filter data-cids @gets)))
