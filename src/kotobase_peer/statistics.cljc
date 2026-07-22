@@ -6,7 +6,8 @@
    materialized query views updated atomically with manifest publishes.
 
    All functions return immutable data. No effects are executed here."
-  (:require [kotobase-peer.merkle-lsm :as lsm]))
+  (:require [clojure.set]
+            [kotobase-peer.merkle-lsm :as lsm]))
 
 ;; ============================================================================
 ;; Cardinality Histograms
@@ -103,9 +104,13 @@
    Input: {:query-indexes [:eavt :aevt :avet] ...}
    Returns: sequence of join steps with estimated cost at each stage."
   [query histograms]
-  (let [base-index :eavt
-        base-card (get-in histograms [:eavt :full-cardinality] 1.0)
-        remaining-indexes (rest (or (:query-indexes query) [:eavt]))]
+  (let [indexes (vec (or (:query-indexes query) [:eavt]))
+        base-index (apply min-key #(get-in histograms [% :full-cardinality]
+                                           #?(:clj Double/POSITIVE_INFINITY
+                                              :cljs js/Infinity))
+                          indexes)
+        base-card (get-in histograms [base-index :full-cardinality] 1.0)
+        remaining-indexes (remove #{base-index} indexes)]
     (cons {:step 0 :index base-index :estimated-rows base-card}
           (loop [remaining remaining-indexes
                  steps []
@@ -125,6 +130,29 @@
                        next-card
                        (inc step-num)))
               steps)))))
+
+(defn plan-clause-order
+  "Greedy connected join order for portable host executors. CLAUSES contain
+  {:id, :estimated-rows, :vars}. Prefer a clause sharing already-bound vars,
+  then the lowest estimated cardinality. Returns immutable plan steps."
+  [clauses]
+  (loop [remaining (vec clauses), bound #{}, result []]
+    (if (empty? remaining)
+      result
+      (let [connected? (fn [clause] (seq (clojure.set/intersection bound (:vars clause))))
+            candidates (if (seq bound)
+                         (let [connected (filter connected? remaining)]
+                           (if (seq connected) connected remaining))
+                         remaining)
+            next-clause (apply min-key #(or (:estimated-rows %)
+                                            #?(:clj Long/MAX_VALUE
+                                               :cljs js/Number.MAX_SAFE_INTEGER))
+                               candidates)]
+        (recur (vec (remove #(= (:id %) (:id next-clause)) remaining))
+               (into bound (:vars next-clause))
+               (conj result
+                     (assoc next-clause :step (count result)
+                            :bound-vars-after (into bound (:vars next-clause)))))))))
 
 ;; ============================================================================
 ;; Delta-Materialized Arrangements

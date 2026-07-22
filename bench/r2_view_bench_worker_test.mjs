@@ -66,13 +66,14 @@ const e2ePage = await worker.fetch(new Request(`${origin}/e2e`), env);
 assert.equal(e2ePage.status, 200);
 assert.match(await e2ePage.text(), /bundle CID → plan → R2 Range/);
 assert.match(await (await worker.fetch(new Request(`${origin}/e2e`), env)).text(),
-             /view-e2e\.js\?v=noncontig-v1/);
+             /view-e2e\.js\?v=cost-join-v1/);
 assert.equal((await worker.fetch(new Request(`${origin}/e2e/encrypted-v1`), env)).status, 200);
 assert.equal((await worker.fetch(new Request(`${origin}/e2e/rotation-v2`), env)).status, 200);
 assert.equal((await worker.fetch(new Request(`${origin}/e2e/join-v1`), env)).status, 200);
 assert.equal((await worker.fetch(new Request(`${origin}/e2e/join-v2`), env)).status, 200);
 assert.equal((await worker.fetch(new Request(`${origin}/e2e/join-v3`), env)).status, 200);
 assert.equal((await worker.fetch(new Request(`${origin}/e2e/noncontig-v1`), env)).status, 200);
+assert.equal((await worker.fetch(new Request(`${origin}/e2e/cost-join-v1`), env)).status, 200);
 
 const browserAsset = await worker.fetch(new Request(`${origin}/view-e2e.js`), env);
 assert.equal(await browserAsset.text(), "compiled browser asset");
@@ -107,4 +108,4 @@ const retired = await worker.fetch(new Request(`${origin}/e2e/key?keyId=tenant-a
 }), { ...protectedEnv, E2E_DEK_V1_B64: undefined });
 assert.equal(retired.status, 404);
 
-console.log(JSON.stringify({ tests: 14, assertions: 41, outcome: "succeeded" }));
+console.log(JSON.stringify({ tests: 14, assertions: 42, outcome: "succeeded" }));

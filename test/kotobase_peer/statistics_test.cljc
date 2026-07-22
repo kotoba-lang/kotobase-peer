@@ -27,8 +27,16 @@
                       :avet {:full-cardinality 500}}
           plan (statistics/plan-join-order {:query-indexes [:eavt :aevt :avet]}
                                           histograms)]
-      (is (= :eavt (:index (first plan))))
-      (is (some #(= :aevt (:index %)) (rest plan))))))
+      (is (= :aevt (:index (first plan))))
+      (is (= #{:eavt :avet} (set (map :index (rest plan))))))))
+
+(deftest multi-clause-plan-starts-selective-and-stays-connected
+  (let [plan (statistics/plan-clause-order
+              [{:id :posts :estimated-rows 1000 :vars #{'?post}}
+               {:id :authors :estimated-rows 100 :vars #{'?author}}
+               {:id :edges :estimated-rows 20 :vars #{'?post '?author}}])]
+    (is (= [:edges :authors :posts] (mapv :id plan)))
+    (is (= #{'?post '?author} (:bound-vars-after (last plan))))))
 
 (deftest m5-selectivity-estimate-computes-ratio
   (testing "selectivity-estimate should compute cardinality reduction factor"
