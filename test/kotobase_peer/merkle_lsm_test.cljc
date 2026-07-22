@@ -183,6 +183,36 @@
              (mapv :cid (lsm/compact-runs-partitioned
                          :eavt "t" 3 2 [r2 r1])))))))
 
+(deftest visible-prefix-pages-are-bounded-and-tombstone-safe
+  (let [r1 (lsm/build-run
+            :eavt "t"
+            (mapv (fn [entity]
+                    {:components [entity "role" "admin"]
+                     :epoch 1 :op :assert :value "admin"})
+                  ["a" "b" "c" "d"]))
+        r2 (lsm/build-run
+            :eavt "t"
+            [{:components ["b" "role" "admin"]
+              :epoch 2 :op :retract :value "admin"}])
+        add (fn [state run after]
+              (lsm/visible-page-add-run
+               state (get-in run [:node "rows"]) 2 after 2 (constantly true)))
+        first-state (reduce #(add %1 %2 nil) {} [r1 r2])
+        first-page (lsm/visible-page-result first-state 2)
+        second-state (reduce #(add %1 %2 (:cursor first-page)) {} [r2 r1])
+        second-page (lsm/visible-page-result second-state 2)]
+    (is (= ["a"]
+           (mapv #(first (get % "components")) (:rows first-page))))
+    (is (false? (:done? first-page)))
+    (is (string? (:cursor first-page)))
+    (is (= ["c" "d"]
+           (mapv #(first (get % "components")) (:rows second-page))))
+    (is (true? (:done? second-page)))
+    (is (= 3 (count (concat (:rows first-page) (:rows second-page)))))
+    (is (= first-state
+           (reduce #(add %1 %2 nil) {} [r2 r1]))
+        "run fetch order cannot change the page")))
+
 (deftest partitioned-compaction-keeps-one-logical-key-whole
   (let [run (lsm/build-run :eavt "t"
                            (mapv (fn [epoch]

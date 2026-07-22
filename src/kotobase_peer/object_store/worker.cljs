@@ -553,6 +553,72 @@
                                        (->> (lsm/visible-rows runs query-epoch)
                                             (filter matches-prefix?) vec)))))))))))))))))))
 
+(defn find-index-prefix-page!
+  "Bounded-memory MVCC prefix page. Selected run blocks are fetched and folded
+  sequentially; only LIMIT+1 logical-key candidates survive between reads.
+  AFTER is the opaque logical-key cursor returned by the previous page."
+  [e db-id index prefixes {:keys [after limit max-depth]
+                           :or {limit 256 max-depth 256}}]
+  (let [prefixes (vec (distinct (map vec prefixes)))]
+    (when-not (and (lsm/indexes index) (seq prefixes) (pos-int? limit)
+                   (pos-int? max-depth)
+                   (or (nil? after) (string? after))
+                   (every? #(and (seq %) (string? (first %))) prefixes))
+      (throw (ex-info "Invalid bounded Merkle index prefix page"
+                      {:index index :prefixes prefixes :after after
+                       :limit limit :max-depth max-depth})))
+    (-> (resolve-database-head! e db-id)
+        (.then
+         (fn [{:keys [base-cid]}]
+           (if-not base-cid
+             {:rows [] :cursor nil :done? true :scanned-runs 0}
+             (-> (get-node! e base-cid)
+                 (.then
+                  (fn [base-manifest]
+                    (let [query-epoch (get base-manifest "epoch")]
+                      (-> (collect-index-run-refs!
+                           e db-id base-cid index max-depth
+                           {:index index :prefix-count (count prefixes)})
+                          (.then
+                           (fn [refs]
+                             (let [selected
+                                   (->> prefixes
+                                        (mapcat
+                                         #(lsm/select-run-refs-by-first-component
+                                           refs (first %)))
+                                        (reduce
+                                         (fn [by-cid ref]
+                                           (assoc by-cid
+                                                  (str (ipld/link-cid
+                                                        (get ref "cid")))
+                                                  ref)) {})
+                                        (sort-by key)
+                                        (mapv val))
+                                   matches-prefix?
+                                   (fn [row]
+                                     (let [components (get row "components")]
+                                       (some #(= % (subvec components 0
+                                                           (min (count %)
+                                                                (count components))))
+                                             prefixes)))]
+                               (-> (reduce
+                                    (fn [pending ref]
+                                      (.then
+                                       pending
+                                       (fn [state]
+                                         (-> (get-node!
+                                              e (ipld/link-cid (get ref "cid")))
+                                             (.then
+                                              (fn [run]
+                                                (lsm/visible-page-add-run
+                                                 state (get run "rows") query-epoch
+                                                 after limit matches-prefix?)))))))
+                                    (js/Promise.resolve {}) selected)
+                                   (.then
+                                    (fn [state]
+                                      (assoc (lsm/visible-page-result state limit)
+                                             :scanned-runs (count selected)))))))))))))))))))
+
 (defn- manifest-window!
   [e head-cid limit]
   (letfn [(step [cid remaining acc]

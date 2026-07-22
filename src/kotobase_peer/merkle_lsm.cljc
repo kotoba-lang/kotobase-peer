@@ -335,6 +335,62 @@
 (defn- logical-id [row]
   (get row "components"))
 
+(defn row-logical-key
+  "Canonical physical-key prefix without the reversed epoch suffix. It is a
+  portable continuation token for one index/tenant/logical component tuple."
+  [row]
+  (let [key (get row "key")
+        separator (str/last-index-of key "|")]
+    (when-not (and (string? key) (some? separator) (pos? separator))
+      (throw (ex-info "Malformed Merkle row key" {:key key})))
+    (subs key 0 separator)))
+
+(defn visible-page-add-run
+  "Fold one decoded run into a bounded MVCC page candidate map.
+
+  STATE maps logical continuation keys to their newest row. Only LIMIT+1
+  smallest keys after AFTER-KEY are retained, so a host may fetch runs one at
+  a time without retaining the full prefix. MATCHES? is applied before the
+  candidate enters the merge. Tombstones remain candidates until page result
+  construction because they must advance the continuation cursor."
+  [state rows query-epoch after-key limit matches?]
+  (when-not (and (map? state) (nat-int? query-epoch) (pos-int? limit)
+                 (fn? matches?) (or (nil? after-key) (string? after-key)))
+    (throw (ex-info "Invalid visible page accumulator input"
+                    {:query-epoch query-epoch :after-key after-key
+                     :limit limit})))
+  (->> rows
+       (reduce
+        (fn [candidates row]
+          (let [logical-key (row-logical-key row)]
+            (if (and (<= (get row "epoch") query-epoch)
+                     (or (nil? after-key) (pos? (compare logical-key after-key)))
+                     (matches? row))
+              (let [current (get candidates logical-key)]
+                (if (or (nil? current)
+                        (> (get row "epoch") (get current "epoch")))
+                  (assoc candidates logical-key row)
+                  candidates))
+              candidates)))
+        state)
+       (sort-by key)
+       (take (inc limit))
+       (into {})))
+
+(defn visible-page-result
+  "Finalize a state produced by `visible-page-add-run`. CURSOR advances over
+  logical keys including tombstones; ROWS contains assertions only."
+  [state limit]
+  (when-not (and (map? state) (pos-int? limit))
+    (throw (ex-info "Invalid visible page result input" {:limit limit})))
+  (let [ordered (vec (sort-by key state))
+        page (subvec ordered 0 (min limit (count ordered)))
+        more? (> (count ordered) limit)]
+    {:rows (->> page (map val)
+                (filter #(= "assert" (get % "op"))) vec)
+     :cursor (some-> page peek key)
+     :done? (not more?)}))
+
 (defn- merge-sorted-row-seqs
   "Lazily merge canonical run rows without materializing the input set."
   [row-seqs]
