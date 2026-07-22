@@ -854,6 +854,91 @@
        (is (= c2 (get @heads "actor:alice")) "the retried commit is the one that actually won"))))
 
 #?(:clj
+   (deftest commit-serialized-effective-prunes-persisted-no-ops
+     (let [{:keys [put! get-fn store]} (mem-store)
+           heads (atom {})
+           cas-calls (atom 0)
+           cas! (fn [head-key expected new]
+                  (swap! cas-calls inc)
+                  (if (= (get @heads head-key) expected)
+                    (do (swap! heads assoc head-key new) new)
+                    (get @heads head-key)))
+           initial (eng/commit-serialized-effective!
+                    put! get-fn cas! "actor:alice" nil
+                    [{:s "alice" :p "role" :o "admin"}]
+                    test-encrypt-fn test-blind-fn test-decrypt-fn)
+           blocks-before (count @store)
+           calls-before @cas-calls
+           no-op (eng/commit-serialized-effective!
+                  put! get-fn cas! "actor:alice" (:chain-cid-after initial)
+                  [{:s "alice" :p "role" :o "admin"}
+                   {:s "alice" :p "missing" :o "value" :op :retract}]
+                  test-encrypt-fn test-blind-fn test-decrypt-fn)]
+       (is (false? (:committed? no-op)))
+       (is (= (:chain-cid-before no-op) (:chain-cid-after no-op)))
+       (is (empty? (:effective-deltas no-op)))
+       (is (= blocks-before (count @store)) "semantic no-op writes no CAS blocks")
+       (is (= calls-before @cas-calls) "semantic no-op does not touch mutable head"))))
+
+#?(:clj
+   (deftest commit-serialized-effective-publishes-only-effective-deltas
+     (let [{:keys [put! get-fn]} (mem-store)
+           heads (atom {})
+           cas! (fn [head-key expected new]
+                  (if (= (get @heads head-key) expected)
+                    (do (swap! heads assoc head-key new) new)
+                    (get @heads head-key)))
+           initial (eng/commit-serialized-effective!
+                    put! get-fn cas! "actor:alice" nil
+                    [{:s "alice" :p "role" :o "admin"}]
+                    test-encrypt-fn test-blind-fn test-decrypt-fn)
+           report (eng/commit-serialized-effective!
+                   put! get-fn cas! "actor:alice" (:chain-cid-after initial)
+                   [[:db/retract "alice" "role" "admin"]
+                    [:db/add "alice" "role" "user"]
+                    [:db/add "alice" "role" "user"]]
+                   test-encrypt-fn test-blind-fn test-decrypt-fn)
+           rows (eng/hot-datoms get-fn (:chain-cid-after report)
+                                (constantly true) test-blind-fn test-decrypt-fn)]
+       (is (true? (:committed? report)))
+       (is (= [:retract :assert] (mapv :op (:effective-deltas report))))
+       (is (= #{{:e "alice" :a "role" :v_edn "\"user\"" :added true}}
+              (set rows))))))
+
+#?(:clj
+   (deftest commit-serialized-effective-renormalizes-after-lost-cas
+     (let [{:keys [put! get-fn]} (mem-store)
+           heads (atom {})
+           cas-calls (atom 0)
+           cas! (fn [head-key expected new]
+                  (swap! cas-calls inc)
+                  (if (= (get @heads head-key) expected)
+                    (do (swap! heads assoc head-key new) new)
+                    (get @heads head-key)))
+           c0 (:chain-cid-after
+               (eng/commit-serialized-effective!
+                put! get-fn cas! "actor:alice" nil
+                [[:db/add "alice" "role" "admin"]]
+                test-encrypt-fn test-blind-fn test-decrypt-fn))
+           c1 (:chain-cid-after
+               (eng/commit-serialized-effective!
+                put! get-fn cas! "actor:alice" c0
+                [[:db/add "alice" "role" "user"]
+                 [:db/add "alice" "status" "active"]]
+                test-encrypt-fn test-blind-fn test-decrypt-fn))
+           calls-before @cas-calls
+           stale-report (eng/commit-serialized-effective!
+                         put! get-fn cas! "actor:alice" c0
+                         [[:db/add "alice" "role" "user"]]
+                         test-encrypt-fn test-blind-fn test-decrypt-fn)]
+       (is (false? (:committed? stale-report)))
+       (is (= c1 (:chain-cid-after stale-report)))
+       (is (= 1 (:attempts stale-report)))
+       (is (= (inc calls-before) @cas-calls)
+           "first stale attempt loses CAS; retry becomes no-op and performs no second CAS")
+       (is (= [0 1] (mapv :seq (eng/chain get-fn c1))) "head has no duplicate commit"))))
+
+#?(:clj
    (deftest commit-serialized-throws-on-persistent-contention
      (let [{:keys [put! get-fn]} (mem-store)
            always-losing-cas! (fn [head-key expected new] nil)]
@@ -1596,6 +1681,37 @@
                                (is (= [0 1 2] (map :seq (eng/chain get-fn c2))) "no fork -- a clean, gapless sequence")
                                (is (= c2 (get @heads "actor:alice")))
                                (done))))))))))
+
+#?(:cljs
+   (deftest commit-serialized-effective-prunes-persisted-no-ops
+     (async done
+       (let [{:keys [put! get-fn store]} (mem-store)
+             heads (atom {})
+             cas-calls (atom 0)
+             cas! (fn [head-key expected new]
+                    (swap! cas-calls inc)
+                    (if (= (get @heads head-key) expected)
+                      (do (swap! heads assoc head-key new) new)
+                      (get @heads head-key)))]
+         (-> (eng/commit-serialized-effective!
+              put! get-fn cas! "actor:alice" nil
+              [[:db/add "alice" "role" "admin"]]
+              test-encrypt-fn test-blind-fn test-decrypt-fn)
+             (.then (fn [initial]
+                      (let [blocks-before (count @store)
+                            calls-before @cas-calls]
+                        (-> (eng/commit-serialized-effective!
+                             put! get-fn cas! "actor:alice" (:chain-cid-after initial)
+                             [[:db/add "alice" "role" "admin"]
+                              [:db/retract "alice" "missing" "value"]]
+                             test-encrypt-fn test-blind-fn test-decrypt-fn)
+                            (.then (fn [report]
+                                     (is (false? (:committed? report)))
+                                     (is (= (:chain-cid-before report)
+                                            (:chain-cid-after report)))
+                                     (is (= blocks-before (count @store)))
+                                     (is (= calls-before @cas-calls))
+                                     (done))))))))))))
 
 #?(:cljs
    (deftest commit-serialized-throws-on-persistent-contention

@@ -288,6 +288,15 @@ and refreshes the scoped statistics at the same epoch. A 10,000-op fixture with
 9,998 no-ops produced two effective deltas in p50 10.06 ms. See
 `bench/results/2026-07-22-effective-statistics-delta.edn`.
 
+`commit-serialized-effective!` carries normalization through the durable CAS
+publication boundary. It hydrates and CID-verifies the actual winning head,
+persists only effective assert/retract deltas, and re-runs normalization after a
+lost race. A semantic no-op creates no block, chain entry, or CAS operation.
+This correctness-first path currently performs a full head
+hydration; already-normalized writers can retain the O(tx)
+`commit-serialized!` append path. See
+`bench/results/2026-07-22-persisted-effective-cas.edn`.
+
 This is currently a behavior-preserving shadow substrate: existing
 `commit!`/`hot-datoms`/`fold!` remain the live path until read equivalence and
 CLJ/CLJS CID determinism gates pass. New storage work must target the
@@ -356,8 +365,8 @@ entirely chain's job. Neither library needed to change.
 ## Test
 
 ```bash
-clojure -M:test              # JVM      -- 94 tests / 196 assertions
-npm run test:cljs            # cljs     -- 85 tests / 180 assertions (real shadow-cljs build + node, not nbb)
+clojure -M:test              # JVM      -- 179 tests / 462 assertions
+npm run test:cljs            # cljs     -- 171 tests / 447 assertions (real shadow-cljs build + node, not nbb)
 ```
 
 Both 0 failures, 0 errors. Counts differ slightly because some assertions

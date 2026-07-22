@@ -41,4 +41,6 @@
   :view-bench {:extra-paths ["bench"]
                :main-opts ["-m" "kotobase-peer.materialized-view-bench"]}
   :view-delta-bench {:extra-paths ["bench"]
-                     :main-opts ["-m" "kotobase-peer.materialized-view-delta-bench"]}}}
+                     :main-opts ["-m" "kotobase-peer.materialized-view-delta-bench"]}
+  :persisted-effective-bench {:extra-paths ["bench"]
+                              :main-opts ["-m" "kotobase-peer.persisted-effective-bench"]}}}

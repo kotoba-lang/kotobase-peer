@@ -1755,6 +1755,69 @@
                           novelty-quads (apply concat novelty-quads-per-cid)]
                       (reduce (fn [db q] (apply-quad db q ipld/link?)) base novelty-quads))))))))
 
+(defn- delta->quad [{:keys [e a v op]}]
+  {:s e :p a :o v :op op})
+
+(defn commit-serialized-effective!
+  "Correctness-first persisted transactor path. Hydrates the actual CAS head,
+   normalizes TX-DATA against that database value, and persists only effective
+   state transitions. A semantic no-op writes no blocks and does not call
+   `cas!`; a lost CAS race retries from (and re-normalizes against) the actual
+   winning head.
+
+   Returns a report containing `:committed?`, `:chain-cid-before`,
+   `:chain-cid-after`, and `:effective-deltas`. OPTS accepts `:max-retries`
+   (default `default-max-cas-retries`). This path intentionally pays the current
+   full-hydration cost. `commit-serialized!` remains the O(tx) append path for
+   callers which have already normalized their transaction."
+  ([put! get-fn cas! head-key expected-chain-cid tx-data encrypt-fn blind-fn decrypt-fn]
+   (commit-serialized-effective! put! get-fn cas! head-key expected-chain-cid tx-data
+                                 encrypt-fn blind-fn decrypt-fn {}))
+  ([put! get-fn cas! head-key expected-chain-cid tx-data encrypt-fn blind-fn decrypt-fn
+    {:keys [max-retries]
+     :or {max-retries default-max-cas-retries}}]
+   (let [report (fn [before after deltas committed? attempts]
+                  {:committed? committed?
+                   :chain-cid-before before
+                   :chain-cid-after after
+                   :effective-deltas deltas
+                   :attempts attempts})]
+     #?(:clj
+        (loop [current-cid expected-chain-cid, attempts 0]
+          (when (> attempts max-retries)
+            (throw (ex-info "kotobase-peer: commit-serialized-effective! exceeded max-cas-retries"
+                            {:head-key head-key :attempts attempts})))
+          (let [{:keys [effective-deltas]}
+                (transact-effective (hydrate-chain get-fn current-cid blind-fn decrypt-fn) tx-data)]
+            (if (empty? effective-deltas)
+              (report current-cid current-cid [] false attempts)
+              (let [new-cid (commit! put! get-fn (mapv delta->quad effective-deltas)
+                                     current-cid encrypt-fn)
+                    actual (cas! head-key current-cid new-cid)]
+                (if (= actual new-cid)
+                  (report current-cid new-cid effective-deltas true attempts)
+                  (recur actual (inc attempts)))))))
+        :cljs
+        (letfn [(attempt [current-cid attempts]
+                  (if (> attempts max-retries)
+                    (js/Promise.reject
+                     (ex-info "kotobase-peer: commit-serialized-effective! exceeded max-cas-retries"
+                              {:head-key head-key :attempts attempts}))
+                    (-> (hydrate-chain get-fn current-cid blind-fn decrypt-fn)
+                        (.then
+                         (fn [db]
+                           (let [{:keys [effective-deltas]} (transact-effective db tx-data)]
+                             (if (empty? effective-deltas)
+                               (report current-cid current-cid [] false attempts)
+                               (-> (commit! put! get-fn (mapv delta->quad effective-deltas)
+                                            current-cid encrypt-fn)
+                                   (.then (fn [new-cid]
+                                            (let [actual (cas! head-key current-cid new-cid)]
+                                              (if (= actual new-cid)
+                                                (report current-cid new-cid effective-deltas true attempts)
+                                                (attempt actual (inc attempts))))))))))))))]
+          (attempt expected-chain-cid 0))))))
+
 (defn- newly-added-tx-cids
   "Walk `chain-cid`'s full history: for each commit whose OWN novelty list
    grew by exactly one entry relative to the PREVIOUS commit (a plain
