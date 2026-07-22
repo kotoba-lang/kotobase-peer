@@ -581,7 +581,9 @@
 
 (defn find-index-prefix-page!
   "Bounded-memory MVCC prefix page. Selected run blocks are fetched and folded
-  sequentially; only LIMIT+1 logical-key candidates survive between reads.
+  in bounded waves; when AFTER falls inside a physical block, that block and
+  its successor are fetched concurrently so a continuation does not serialize
+  two R2 round trips. Only LIMIT+1 logical-key candidates survive between reads.
   AFTER is the opaque logical-key cursor returned by the previous page."
   [e db-id index prefixes {:keys [after limit max-depth]
                            :or {limit 256 max-depth 256}}]
@@ -630,43 +632,66 @@
                                (letfn [(cutoff [candidates]
                                          (when (> (count candidates) limit)
                                            (nth (sort (keys candidates)) limit)))
-                                       (fold-block [pending descriptor]
-                                         (.then
-                                          pending
-                                          (fn [{:keys [candidates] :as state}]
-                                            (let [lo (get descriptor "logical-min")
-                                                  hi (get descriptor "logical-max")
-                                                  page-cutoff (cutoff candidates)]
-                                              (if (or (and after hi
-                                                           (not (pos? (compare hi after))))
-                                                      (and page-cutoff lo
-                                                           (pos? (compare lo page-cutoff))))
-                                                state
+                                       (skip-block? [candidates descriptor]
+                                         (let [lo (get descriptor "logical-min")
+                                               hi (get descriptor "logical-max")
+                                               page-cutoff (cutoff candidates)]
+                                           (or (and after hi
+                                                    (not (pos? (compare hi after))))
+                                               (and page-cutoff lo
+                                                    (pos? (compare lo page-cutoff))))))
+                                       (load-block-wave! [descriptors]
+                                         (-> (mapv
+                                              (fn [descriptor]
                                                 (-> (get-node!
                                                      e (ipld/link-cid
                                                         (get descriptor "cid")))
-                                                    (.then
-                                                     (fn [block]
-                                                       (let [rows
-                                                             (validated-run-block-rows
-                                                              descriptor block index db-id)]
-                                                         (-> state
-                                                           (assoc :candidates
-                                                                  (lsm/visible-page-add-run
-                                                                   candidates
-                                                                   rows
-                                                                   query-epoch after limit
-                                                                   matches-prefix?))
-                                                           (update :scanned-blocks inc)))))))))))
+                                                    (.then #(vector descriptor %))))
+                                              descriptors)
+                                             clj->js js/Promise.all
+                                             (.then #(vec (array-seq %)))))
+                                       (fold-loaded-block [state [descriptor block]]
+                                         (let [rows (validated-run-block-rows
+                                                     descriptor block index db-id)
+                                               candidates (:candidates state)]
+                                           (cond-> (update state :scanned-blocks inc)
+                                             (not (skip-block? candidates descriptor))
+                                             (assoc :candidates
+                                                    (lsm/visible-page-add-run
+                                                     candidates rows query-epoch after
+                                                     limit matches-prefix?)))))
+                                       (fold-blocks [state descriptors]
+                                         (let [remaining
+                                               (drop-while
+                                                #(skip-block? (:candidates state) %)
+                                                descriptors)]
+                                           (if (empty? remaining)
+                                             (js/Promise.resolve state)
+                                             (let [first-block (first remaining)
+                                                   lo (get first-block "logical-min")
+                                                   hi (get first-block "logical-max")
+                                                   cursor-inside?
+                                                   (and after lo hi
+                                                        (not (neg? (compare after lo)))
+                                                        (neg? (compare after hi)))
+                                                   wave-size (if cursor-inside? 2 1)
+                                                   wave (vec (take wave-size remaining))]
+                                               (-> (load-block-wave! wave)
+                                                   (.then
+                                                    (fn [loaded]
+                                                      (fold-blocks
+                                                       (reduce fold-loaded-block
+                                                               state loaded)
+                                                       (drop (count wave)
+                                                             remaining)))))))))
                                        (fold-ref [pending ref]
                                          (.then
                                           pending
                                           (fn [state]
                                             (if-let [blocks (seq (get ref "blocks"))]
-                                              (reduce fold-block
-                                                      (js/Promise.resolve
-                                                       (update state :scanned-runs inc))
-                                                      (sort-by #(get % "ordinal") blocks))
+                                              (fold-blocks
+                                               (update state :scanned-runs inc)
+                                               (sort-by #(get % "ordinal") blocks))
                                               (-> (load-run! e ref)
                                                   (.then
                                                    (fn [run]
