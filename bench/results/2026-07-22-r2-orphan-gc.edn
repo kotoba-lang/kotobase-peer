@@ -1,0 +1,19 @@
+{:date "2026-07-22"
+ :backend :cloudflare-r2
+ :execution {:mode "wrangler remote preview"
+             :bucket "kotobase-merkle-lsm"
+             :scope "isolated bench/orphan-gc UUID prefix"
+             :cleanup "all drill heads and blocks deleted in finally"}
+ :fixture {:heads 2 :reachable-blocks 4 :orphan-blocks 1}
+ :result {:heads-marked 2
+          :reachable 4
+          :dry-run-candidates 1
+          :deleted 1
+          :live-after 4
+          :orphan-exists-after false
+          :wall-ms 571}
+ :safety {:shared-production-prefix-tested-in-cljs true
+          :all-head-marking true
+          :head-etag-stability-fence true
+          :grace-period-supported true}
+ :interpretation "The isolated real-R2 operational drill deleted exactly the unreachable block and retained every live block. Production GC additionally marks all shared-prefix heads and aborts deletion if the complete sorted head/ETag snapshot changes during marking."}

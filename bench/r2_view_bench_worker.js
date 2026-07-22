@@ -110,6 +110,72 @@ async function benchmarkR2Cas(env, samples, concurrency) {
   }
 }
 
+async function listAll(bucket, prefix) {
+  const objects = [];
+  let cursor;
+  do {
+    const page = await bucket.list({prefix, cursor});
+    objects.push(...page.objects);
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor);
+  return objects;
+}
+
+async function benchmarkR2OrphanGc(env) {
+  const runId = crypto.randomUUID();
+  const prefix = `bench/orphan-gc/${runId}/`;
+  const headPrefix = `${prefix}heads/`;
+  const blockPrefix = `${prefix}blocks/`;
+  const blocks = {
+    "root-a": {links: ["child-a"]}, "child-a": {links: []},
+    "root-b": {links: ["child-b"]}, "child-b": {links: []},
+    orphan: {links: []},
+  };
+  const keys = [...Object.keys(blocks).map(cid => `${blockPrefix}${cid}`),
+                `${headPrefix}db-a`, `${headPrefix}db-b`];
+  const started = performance.now();
+  try {
+    await Promise.all(Object.entries(blocks).map(([cid, node]) =>
+      env.MERKLE_BUCKET.put(`${blockPrefix}${cid}`, JSON.stringify(node))));
+    await Promise.all([
+      env.MERKLE_BUCKET.put(`${headPrefix}db-a`, "root-a"),
+      env.MERKLE_BUCKET.put(`${headPrefix}db-b`, "root-b"),
+    ]);
+
+    const readHeads = async () => Promise.all(
+      (await listAll(env.MERKLE_BUCKET, headPrefix)).map(async object => {
+        const value = await env.MERKLE_BUCKET.get(object.key);
+        return {key: object.key, etag: value.etag, value: await value.text()};
+      })).then(heads => heads.sort((a, b) => a.key.localeCompare(b.key)));
+    const headsBefore = await readHeads();
+    const reachable = new Set();
+    const mark = async cid => {
+      if (reachable.has(cid)) return;
+      reachable.add(cid);
+      const object = await env.MERKLE_BUCKET.get(`${blockPrefix}${cid}`);
+      if (!object) throw new Error(`missing reachable block: ${cid}`);
+      const node = JSON.parse(await object.text());
+      await Promise.all(node.links.map(mark));
+    };
+    await Promise.all(headsBefore.map(head => mark(head.value)));
+    const listedBlocks = await listAll(env.MERKLE_BUCKET, blockPrefix);
+    const candidates = listedBlocks.map(object => object.key)
+      .filter(key => !reachable.has(key.slice(blockPrefix.length)));
+    const headsAfter = await readHeads();
+    const stable = JSON.stringify(headsBefore) === JSON.stringify(headsAfter);
+    if (!stable) throw new Error("head set changed during GC mark; sweep fenced");
+    await env.MERKLE_BUCKET.delete(candidates);
+    const liveAfter = await listAll(env.MERKLE_BUCKET, blockPrefix);
+    return {backend: "cloudflare-r2", heads: headsBefore.length,
+            reachable: reachable.size, dryRunCandidates: candidates.length,
+            deleted: candidates.length, liveAfter: liveAfter.length,
+            orphanExistsAfter: Boolean(await env.MERKLE_BUCKET.get(`${blockPrefix}orphan`)),
+            wallMs: performance.now() - started};
+  } finally {
+    await env.MERKLE_BUCKET.delete(keys);
+  }
+}
+
 const BENCH_PAGE = `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
 <title>Kotobase Browser Range Benchmark</title></head>
@@ -156,9 +222,11 @@ const E2E_PAGE = `<!doctype html><html lang="en"><head><meta charset="utf-8">
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    if (url.pathname === "/bench/write-cas" && !env.E2E_BEARER_TOKEN)
+    if (["/bench/write-cas", "/bench/orphan-gc"].includes(url.pathname) &&
+        !env.E2E_BEARER_TOKEN)
       return response({ error: "write benchmark capability is not configured" }, 503);
-    if (url.pathname === "/bench/write-cas" && !authorized(request, env))
+    if (["/bench/write-cas", "/bench/orphan-gc"].includes(url.pathname) &&
+        !authorized(request, env))
       return response({ error: "unauthorized" }, 401);
     if (["/e2e/config", "/e2e/bundle", "/e2e/object", "/e2e/key"].includes(url.pathname) &&
         !authorized(request, env)) {
@@ -249,6 +317,9 @@ export default {
       const samples = Math.min(256, Math.max(1, Number(url.searchParams.get("samples") || 32)));
       const concurrency = Math.min(32, Math.max(1, Number(url.searchParams.get("concurrency") || 8)));
       return response(await benchmarkR2Cas(env, samples, concurrency));
+    }
+    if (request.method === "POST" && url.pathname === "/bench/orphan-gc") {
+      return response(await benchmarkR2OrphanGc(env));
     }
     if (request.method === "GET" && url.pathname === "/") {
       return new Response(BENCH_PAGE, { headers: {

@@ -480,16 +480,44 @@
                        objects))))))]
     (page nil [])))
 
+(defn- all-r2-heads! [e bucket]
+  (-> (list-r2-blocks! bucket (str (prefix e) "heads/"))
+      (.then
+       (fn [objects]
+         (js/Promise.all
+          (clj->js
+           (map (fn [object]
+                  (let [key (gobj/get object "key")]
+                    (-> (.get bucket key)
+                        (.then (fn [head]
+                                 (when head
+                                   (-> (.text head)
+                                       (.then (fn [value]
+                                                {:key key
+                                                 :etag (gobj/get head "etag")
+                                                 :value value})))))))))
+                objects)))))
+      (.then (fn [heads]
+               (->> (array-seq heads)
+                    (remove nil?)
+                    (sort-by :key)
+                    vec)))))
+
 (defn gc-unreachable!
-  "Mark from the current head and optionally sweep unreachable R2 blocks older
-  than GRACE-MS. Deletion is explicit so callers can run a dry audit first."
-  [e db-id grace-ms delete?]
+  "Globally mark from EVERY mutable R2 head and optionally sweep unreachable
+  shared blocks older than GRACE-MS. DB-ID is retained for source compatibility
+  but deliberately does not scope marking: block keys are globally deduplicated
+  under one prefix, so marking only one database head could delete another
+  database's live blocks. Deletion is explicit for dry-run-first operation."
+  [e _db-id grace-ms delete?]
   (if-let [bucket (env e "MERKLE_BUCKET")]
-    (-> (get-head e db-id)
+    (-> (all-r2-heads! e bucket)
         (.then
-         (fn [{:keys [value]}]
+         (fn [heads-before]
            (-> (js/Promise.all
-                #js [(reachable-cids! e value)
+                #js [(-> (js/Promise.all
+                           (clj->js (map #(reachable-cids! e (:value %)) heads-before)))
+                          (.then (fn [sets] (into #{} cat (array-seq sets)))))
                      (list-r2-blocks! bucket (str (prefix e) "blocks/"))])
                (.then
                 (fn [result]
@@ -508,11 +536,21 @@
                                        (< (.getTime uploaded) cutoff)))))
                              (mapv #(gobj/get % "key")))]
                     (if (and delete? (seq candidates))
-                      (-> (.delete bucket (clj->js candidates))
-                          (.then (fn [_] {:reachable (count reachable)
-                                         :candidates (count candidates)
-                                         :deleted (count candidates)})))
-                      {:reachable (count reachable)
+                      (-> (all-r2-heads! e bucket)
+                          (.then
+                           (fn [heads-after]
+                             (if (= heads-before heads-after)
+                               (-> (.delete bucket (clj->js candidates))
+                                   (.then (fn [_] {:reachable (count reachable)
+                                                  :heads (count heads-before)
+                                                  :candidates (count candidates)
+                                                  :deleted (count candidates)})))
+                               {:reachable (count reachable)
+                                :heads (count heads-before)
+                                :candidates (count candidates)
+                                :deleted 0
+                                :aborted :heads-changed}))))
+                      {:reachable (count reachable) :heads (count heads-before)
                        :candidates (count candidates) :deleted 0}))))))))
     (js/Promise.reject
      (js/Error. "Reachability GC currently requires an R2 listing binding"))))

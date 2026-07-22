@@ -142,8 +142,15 @@ The Worker object-store adapter supports R2 bindings and signed S3-compatible
 GET/PUT requests. Mutable S3 heads require a provider that implements
 conditional `PutObject`; enable that path explicitly with
 `MERKLE_S3_CONDITIONAL_HEAD=true`. R2 remains the default CAS implementation.
-Reachability GC walks IPLD links from the current head and only deletes objects
-older than a caller-supplied grace period.
+Reachability GC walks IPLD links from every R2 head because immutable blocks are
+deduplicated in one shared prefix. It only considers objects older than a
+caller-supplied grace period, supports a dry audit, and re-reads the complete
+sorted head/ETag snapshot immediately before deletion. Any head change fences
+the sweep, preventing mark/publish races from deleting a newly referenced
+block. The authenticated `/bench/orphan-gc` drill uses an isolated prefix and
+cleans it in `finally`; the 2026-07-22 real-R2 run marked 2 heads and 4 live
+blocks, found/deleted exactly 1 orphan, retained all 4 live blocks, and took
+571 ms.
 
 Run `clojure -M:merkle-bench 1000 100000 10000000` for the ADR scale sweep;
 `MERKLE_BENCH_WRITERS` selects simulated concurrent flushers (default 32).
