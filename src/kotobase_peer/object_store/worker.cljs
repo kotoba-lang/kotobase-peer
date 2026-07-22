@@ -235,7 +235,8 @@
            (if object
              (-> (.text object)
                  (.then (fn [value]
-                          {:root (js->clj (js/JSON.parse value))
+                          {:root (retention/validate-node
+                                  (js->clj (js/JSON.parse value)))
                            :etag (gobj/get object "etag")})))
              {:root nil :etag nil}))))
     (js/Promise.reject
@@ -246,7 +247,9 @@
   keyword-keyed options accepted by retention/root-node. A lost renewal or
   release race returns {:won? false}; it never overwrites the winner."
   [e root expected-etag]
-  (let [node (if (contains? root "format") root (retention/root-node root))
+  (let [node (if (contains? root "format")
+               (retention/validate-node root)
+               (retention/root-node root))
         kind (keyword (get node "kind"))
         db-id (get node "db-id")
         id (get node "id")]
@@ -590,7 +593,8 @@
                                      (fn [value]
                                        {:key key
                                         :etag (gobj/get stored "etag")
-                                        :root (js->clj (js/JSON.parse value))})))))))))
+                                        :root (retention/validate-node
+                                               (js->clj (js/JSON.parse value)))})))))))))
                    objects)))
            (js/Promise.resolve #js []))))
       (.then (fn [roots]

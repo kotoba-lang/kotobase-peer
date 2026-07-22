@@ -24,4 +24,7 @@
                    (retention/root-node {:db-id "db-a" :kind :reader :id "bad"
                                          :manifest-cid "m" :epoch 1}))))
     (testing "an empty registry has no artificial epoch-zero pin"
-      (is (nil? (retention/minimum-safe-epoch [] 1000))))))
+      (is (nil? (retention/minimum-safe-epoch [] 1000))))
+    (testing "decoded registry values are revalidated before CAS"
+      (is (thrown? #?(:clj Exception :cljs js/Error)
+                   (retention/validate-node (assoc reader "version" 99)))))))

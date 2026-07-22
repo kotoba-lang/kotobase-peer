@@ -47,6 +47,22 @@
            (> (get node "expires-at" 0) now-ms)
            (contains? durable-kinds kind)))))
 
+(defn validate-node
+  "Validate a decoded string-keyed registry value and return its canonical
+  representation. Unknown fields are not persisted across CAS updates."
+  [node]
+  (when-not (and (= "kotobase/retention-root" (get node "format"))
+                 (= 1 (get node "version")))
+    (throw (ex-info "Unsupported retention root format"
+                    {:format (get node "format") :version (get node "version")})))
+  (root-node {:db-id (get node "db-id")
+              :kind (keyword (get node "kind"))
+              :id (get node "id")
+              :manifest-cid (get node "manifest-cid")
+              :epoch (get node "epoch")
+              :expires-at (get node "expires-at")
+              :released-at (get node "released-at")}))
+
 (defn active-roots [nodes now-ms]
   (filterv #(active? % now-ms) nodes))
 
@@ -63,4 +79,4 @@
   (when-not (and (integer? released-at) (pos? released-at))
     (throw (ex-info "released-at must be a positive millisecond timestamp"
                     {:released-at released-at})))
-  (assoc node "released-at" released-at))
+  (assoc (validate-node node) "released-at" released-at))
