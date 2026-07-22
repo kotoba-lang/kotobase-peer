@@ -166,6 +166,55 @@ async function benchmarkR2Transactor(env, samples, batchSize, shards) {
   }
 }
 
+async function benchmarkAtomicPublication(env) {
+  const runId = crypto.randomUUID();
+  const prefix = `bench/atomic-publication/${runId}/`;
+  const headKey = `${prefix}head`;
+  const allKeys = [];
+  const started = performance.now();
+  try {
+    const contenders = await Promise.all(["a", "b"].map(async contender => {
+      const keys = {
+        base: `${prefix}${contender}/blocks/base-manifest`,
+        statistics: `${prefix}${contender}/blocks/statistics`,
+        bundle: `${prefix}${contender}/blocks/query-bundle`,
+        pack: `${prefix}${contender}/objects/view-pack`,
+        root: `${prefix}${contender}/blocks/epoch-publication`,
+      };
+      allKeys.push(...Object.values(keys));
+      const immutableStarted = performance.now();
+      await Promise.all([
+        env.MERKLE_BUCKET.put(keys.base, `base-${contender}`),
+        env.MERKLE_BUCKET.put(keys.statistics, `statistics-${contender}`),
+        env.MERKLE_BUCKET.put(keys.bundle, `bundle-${contender}`),
+        env.MERKLE_BUCKET.put(keys.pack, new Uint8Array(4096).fill(contender.charCodeAt(0))),
+        env.MERKLE_BUCKET.put(keys.root, JSON.stringify({epoch: 7, contender, keys})),
+      ]);
+      const immutableMs = performance.now() - immutableStarted;
+      const casStarted = performance.now();
+      const result = await r2CompareExchange(env.MERKLE_BUCKET, headKey, null, keys.root);
+      return {contender, keys, won: result.won, immutableMs,
+              casMs: performance.now() - casStarted};
+    }));
+    const head = await env.MERKLE_BUCKET.get(headKey);
+    const publishedRoot = head ? await head.text() : null;
+    const winner = contenders.find(candidate => candidate.won);
+    const winnerArtifacts = winner
+      ? await Promise.all(Object.values(winner.keys).map(key => env.MERKLE_BUCKET.get(key)))
+      : [];
+    return {backend: "cloudflare-r2", epoch: 7, contenders: 2,
+      winners: contenders.filter(candidate => candidate.won).length,
+      publishedRoot, winnerRoot: winner?.keys.root,
+      allWinnerArtifactsPresent: winnerArtifacts.every(Boolean),
+      immutableP50Ms: percentile(contenders.map(x => x.immutableMs), 0.50),
+      immutableP95Ms: percentile(contenders.map(x => x.immutableMs), 0.95),
+      casP50Ms: percentile(contenders.map(x => x.casMs), 0.50),
+      wallMs: performance.now() - started};
+  } finally {
+    await Promise.all([...allKeys, headKey].map(key => env.MERKLE_BUCKET.delete(key)));
+  }
+}
+
 async function listAll(bucket, prefix) {
   const objects = [];
   let cursor;
@@ -373,10 +422,10 @@ const E2E_PAGE = `<!doctype html><html lang="en"><head><meta charset="utf-8">
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    if (["/bench/write-cas", "/bench/write-batch", "/bench/orphan-gc", "/bench/compaction-lease"].includes(url.pathname) &&
+    if (["/bench/write-cas", "/bench/write-batch", "/bench/orphan-gc", "/bench/compaction-lease", "/bench/atomic-publication"].includes(url.pathname) &&
         !env.E2E_BEARER_TOKEN)
       return response({ error: "write benchmark capability is not configured" }, 503);
-    if (["/bench/write-cas", "/bench/write-batch", "/bench/orphan-gc", "/bench/compaction-lease"].includes(url.pathname) &&
+    if (["/bench/write-cas", "/bench/write-batch", "/bench/orphan-gc", "/bench/compaction-lease", "/bench/atomic-publication"].includes(url.pathname) &&
         !authorized(request, env))
       return response({ error: "unauthorized" }, 401);
     if (["/e2e/config", "/e2e/bundle", "/e2e/object", "/e2e/key"].includes(url.pathname) &&
@@ -480,6 +529,9 @@ export default {
     }
     if (request.method === "POST" && url.pathname === "/bench/compaction-lease") {
       return response(await benchmarkR2CompactionLease(env));
+    }
+    if (request.method === "POST" && url.pathname === "/bench/atomic-publication") {
+      return response(await benchmarkAtomicPublication(env));
     }
     if (request.method === "GET" && url.pathname === "/") {
       return new Response(BENCH_PAGE, { headers: {

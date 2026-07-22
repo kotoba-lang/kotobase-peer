@@ -157,6 +157,34 @@
        clj->js
        js/Promise.all))
 
+(declare get-head cas-head!)
+
+(defn apply-atomic-publication!
+  "Persist every immutable block/object in an atomic-publication plan, then
+  conditionally publish its final root. No constituent head effect is executed.
+  A failed immutable write rejects before the mutable head is touched."
+  [e plan]
+  (let [effects (vec (:effects plan))
+        publication (peek effects)
+        immutable (pop effects)]
+    (when-not (and (= :head/cas (:effect/type publication))
+                   (not-any? #(= :head/cas (:effect/type %)) immutable))
+      (throw (ex-info "Atomic publication plan must end in exactly one HeadCAS"
+                      {:effects (mapv :effect/type effects)})))
+    (-> (apply-view-effects! e immutable)
+        (.then (fn [_]
+                 (-> (get-head e (:db-id publication))
+                     (.then
+                      (fn [{current :value :keys [etag]}]
+                        (if (not= current (:expected publication))
+                          {:published? false :actual current}
+                          (-> (cas-head! e (:db-id publication)
+                                         (:next publication) etag)
+                              (.then
+                               (fn [won?]
+                                 {:published? won?
+                                  :actual (when won? (:next publication))}))))))))))))
+
 (defn get-head
   "Read a mutable head and its ETag for a subsequent conditional PUT."
   [e db-id]

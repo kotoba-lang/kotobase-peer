@@ -259,6 +259,17 @@ ciphertext pack and bundle while preserving logical block identity. The real
 encrypted R2/browser result is recorded in
 `bench/results/2026-07-22-browser-r2-encrypted-view.edn`.
 
+Base state and derived state can now be published through one immutable
+`kotobase/epoch-publication` root. `atomic-publication/build-plan` removes the
+constituent base/view HeadCAS effects, requires the statistics and every view
+bundle to share the base epoch, requires each bundle to pin the exact base
+manifest CID, then emits all BlockPut/ObjectPut effects followed by exactly one
+root HeadCAS. The Worker host refuses malformed plans and never touches the
+head after an immutable write failure. Direct VersionManifest heads remain
+explicitly readable during migration. The real two-contender R2 drill produced
+one winner and a root whose base/statistics/bundle/pack artifacts were all
+present; see `bench/results/2026-07-23-r2-atomic-derived-publication.edn`.
+
 Rotation uses a keyring resolved from the immutable bundle descriptors rather
 than a client-side current-key constant. During a rollout the host may expose
 both old and new key IDs; clients fetch only IDs referenced by their pinned

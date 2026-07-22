@@ -160,6 +160,19 @@ assert.deepEqual({samples: batchResult.samples, batches: batchResult.batches,
                   finalWrites: 8, lostUpdates: 0, casPerLogicalWrite: 0.5});
 assert.equal(casObjects.size, 0, "batched transactor objects and heads are deleted");
 
+const atomicResponse = await worker.fetch(new Request(
+  `${origin}/bench/atomic-publication`,
+  {method: "POST", headers: {Authorization: "Bearer cas-capability"}}), casEnv);
+assert.equal(atomicResponse.status, 200);
+const atomicResult = await atomicResponse.json();
+assert.deepEqual({epoch: atomicResult.epoch, contenders: atomicResult.contenders,
+                  winners: atomicResult.winners,
+                  rootMatches: atomicResult.publishedRoot === atomicResult.winnerRoot,
+                  artifacts: atomicResult.allWinnerArtifactsPresent},
+                 {epoch: 7, contenders: 2, winners: 1,
+                  rootMatches: true, artifacts: true});
+assert.equal(casObjects.size, 0, "atomic publication artifacts and head are deleted");
+
 const gcObjects = new Map();
 let gcVersion = 0;
 const gcEnv = {E2E_BEARER_TOKEN: "gc-capability", MERKLE_BUCKET: {
@@ -224,4 +237,4 @@ assert.deepEqual({firstClaimed: schedulerResult.firstClaimed,
                   finalOwner: "murakumo-b", finalStatus: "completed"});
 assert.equal(gcObjects.size, 0, "scheduler drill objects are deleted in finally");
 
-console.log(JSON.stringify({ tests: 20, assertions: 61, outcome: "succeeded" }));
+console.log(JSON.stringify({ tests: 21, assertions: 67, outcome: "succeeded" }));

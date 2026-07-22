@@ -1,0 +1,23 @@
+{:schema 1
+ :date "2026-07-23"
+ :backend :cloudflare-r2-remote-preview
+ :route "POST /bench/atomic-publication"
+ :epoch 7
+ :contenders 2
+ :winners 1
+ :published-root-matches-winner true
+ :all-winner-artifacts-present true
+ :immutable-put-p50-ms 123
+ :immutable-put-p95-ms 123
+ :head-cas-p50-ms 47
+ :worker-wall-ms 442
+ :request-wall-ms 1049
+ :cleanup {:heads true :blocks true :objects true}
+ :invariants
+ {:root-format "kotobase/epoch-publication"
+  :one-head-cas true
+  :base-manifest-same-epoch true
+  :statistics-same-epoch true
+  :view-bundles-pin-base-manifest true
+  :immutable-effects-before-head-cas true
+  :failed-immutable-write-keeps-head-untouched true}}
