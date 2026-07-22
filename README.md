@@ -146,8 +146,9 @@ Reachability GC walks IPLD links from every R2 head because immutable blocks are
 deduplicated in one shared prefix. It only considers objects older than a
 caller-supplied grace period, supports a dry audit, and re-reads the complete
 sorted head/ETag snapshot immediately before deletion. Any head change fences
-the sweep, preventing mark/publish races from deleting a newly referenced
-block. The authenticated `/bench/orphan-gc` drill uses an isolated prefix and
+the sweep; the grace period protects blocks written before a concurrent head
+publication. Publishers must upload their immutable blocks before HeadCAS.
+The authenticated `/bench/orphan-gc` drill uses an isolated prefix and
 cleans it in `finally`; the 2026-07-22 real-R2 run marked 2 heads and 4 live
 blocks, found/deleted exactly 1 orphan, retained all 4 live blocks, and took
 571 ms.

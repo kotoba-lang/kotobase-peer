@@ -508,7 +508,9 @@
   shared blocks older than GRACE-MS. DB-ID is retained for source compatibility
   but deliberately does not scope marking: block keys are globally deduplicated
   under one prefix, so marking only one database head could delete another
-  database's live blocks. Deletion is explicit for dry-run-first operation."
+  database's live blocks. A second head/ETag snapshot fences detected publish
+  races; GRACE-MS protects newly uploaded blocks. Deletion is explicit for
+  dry-run-first operation."
   [e _db-id grace-ms delete?]
   (if-let [bucket (env e "MERKLE_BUCKET")]
     (-> (all-r2-heads! e bucket)
