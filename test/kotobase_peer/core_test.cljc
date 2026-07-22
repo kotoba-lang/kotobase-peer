@@ -1805,6 +1805,25 @@
                                (done))))))))))
 
 #?(:cljs
+   (deftest commit-serialized-effective-awaits-asynchronous-cas
+     (async done
+       (let [{:keys [put! get-fn]} (mem-store)
+             head (atom nil)
+             cas! (fn [_ expected next]
+                    (js/Promise.resolve
+                     (if (= @head expected)
+                       (do (reset! head next) next)
+                       @head)))]
+         (-> (eng/commit-serialized-effective!
+              put! get-fn cas! "r2-head" nil
+              [[:db/add "alice" "role" "admin"]]
+              test-encrypt-fn test-blind-fn test-decrypt-fn)
+             (.then (fn [report]
+                      (is (true? (:committed? report)))
+                      (is (= @head (:chain-cid-after report)))
+                      (done))))))))
+
+#?(:cljs
    (deftest commit-serialized-effective-prunes-persisted-no-ops
      (async done
        (let [{:keys [put! get-fn store]} (mem-store)

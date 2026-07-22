@@ -329,6 +329,16 @@ bounded `max-novelty`, and HeadCAS publication into one scheduler primitive.
 Below threshold it writes no blocks and performs no CAS; after contention it
 re-evaluates the actual winning head before deciding or folding.
 
+CLJS serialized writes now await Promise-returning CAS implementations, and
+`object-store.worker/compare-and-exchange-head!` adapts R2/S3 ETags to the
+engine contract (return next on success, actual winner on loss). A real R2
+remote-preview gate wrote one immutable 256-byte block per operation and
+published 32 updates with zero lost writes at concurrency 1, 8, and 32. The
+single-head contention result is intentionally not hidden: p50 was 293 ms,
+941 ms, and 6,776 ms respectively, demonstrating that production throughput
+must shard heads or batch through a transactor. See
+`bench/results/2026-07-22-r2-head-cas-write.edn`.
+
 This is currently a behavior-preserving shadow substrate: existing
 `commit!`/`hot-datoms`/`fold!` remain the live path until read equivalence and
 CLJ/CLJS CID determinism gates pass. New storage work must target the
@@ -398,7 +408,7 @@ entirely chain's job. Neither library needed to change.
 
 ```bash
 clojure -M:test              # JVM      -- 183 tests / 479 assertions
-npm run test:cljs            # cljs     -- 171 tests / 447 assertions (real shadow-cljs build + node, not nbb)
+npm run test:cljs            # cljs     -- 173 tests / 454 assertions (real shadow-cljs build + node, not nbb)
 ```
 
 Both 0 failures, 0 errors. Counts differ slightly because some assertions

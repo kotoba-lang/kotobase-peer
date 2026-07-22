@@ -203,6 +203,24 @@
       (js/Promise.reject
        (js/Error. "No MERKLE_BUCKET or MERKLE_S3_* backend configured")))))
 
+(defn compare-and-exchange-head!
+  "Adapt the asynchronous R2/S3 ETag API to kotobase-peer.core's CAS result
+   contract: return NEXT on success; on a lost race, return the actual winning
+   head value. EXPECTED/NEXT are CID strings or nil. This performs a fresh head
+   read to obtain the provider ETag, never treats a caller-supplied CID as an
+   ETag, and re-reads after a conditional-put loss."
+  [e db-id expected next]
+  (-> (get-head e db-id)
+      (.then
+       (fn [{current :value :keys [etag]}]
+         (if (not= current expected)
+           current
+           (-> (cas-head! e db-id next etag)
+               (.then (fn [won?]
+                        (if won?
+                          next
+                          (-> (get-head e db-id) (.then :value)))))))))))
+
 (declare manifest-window! index-run-refs load-runs!)
 
 (defn find-latest-entity!

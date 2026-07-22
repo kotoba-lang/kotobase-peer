@@ -110,4 +110,37 @@ const retired = await worker.fetch(new Request(`${origin}/e2e/key?keyId=tenant-a
 }), { ...protectedEnv, E2E_DEK_V1_B64: undefined });
 assert.equal(retired.status, 404);
 
-console.log(JSON.stringify({ tests: 14, assertions: 44, outcome: "succeeded" }));
+const casObjects = new Map();
+let casVersion = 0;
+const casEnv = {E2E_BEARER_TOKEN: "cas-capability", MERKLE_BUCKET: {
+  async get(key) {
+    const entry = casObjects.get(key);
+    if (!entry) return null;
+    return {etag: entry.etag, async text() { return entry.value; }};
+  },
+  async put(key, body, options) {
+    const current = casObjects.get(key);
+    const condition = options?.onlyIf;
+    const won = !condition ||
+      (condition.etagMatches && current?.etag === condition.etagMatches) ||
+      (condition.etagDoesNotMatch === "*" && !current);
+    if (!won) return null;
+    const value = typeof body === "string" ? body : "block";
+    const entry = {value, etag: `cas-${++casVersion}`};
+    casObjects.set(key, entry);
+    return entry;
+  },
+  async delete(key) { casObjects.delete(key); },
+}};
+const deniedCas = await worker.fetch(new Request(`${origin}/bench/write-cas`, {method: "POST"}), casEnv);
+assert.equal(deniedCas.status, 401);
+const casResponse = await worker.fetch(new Request(
+  `${origin}/bench/write-cas?samples=4&concurrency=2`,
+  {method: "POST", headers: {Authorization: "Bearer cas-capability"}}), casEnv);
+assert.equal(casResponse.status, 200);
+const casResult = await casResponse.json();
+assert.equal(casResult.finalHead, 4);
+assert.equal(casResult.lostUpdates, 0);
+assert.equal(casObjects.size, 0, "benchmark objects and head are deleted in finally");
+
+console.log(JSON.stringify({ tests: 16, assertions: 49, outcome: "succeeded" }));

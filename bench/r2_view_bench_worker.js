@@ -49,6 +49,67 @@ function authorized(request, env) {
   return request.headers.get("authorization") === `Bearer ${env.E2E_BEARER_TOKEN}`;
 }
 
+async function r2CompareExchange(bucket, key, expected, next) {
+  const currentObject = await bucket.get(key);
+  const current = currentObject ? await currentObject.text() : null;
+  if (current !== expected) return {actual: current, won: false};
+  const result = await bucket.put(key, next, {
+    onlyIf: currentObject ? {etagMatches: currentObject.etag}
+                          : {etagDoesNotMatch: "*"},
+  });
+  if (result) return {actual: next, won: true};
+  const winner = await bucket.get(key);
+  return {actual: winner ? await winner.text() : null, won: false};
+}
+
+async function incrementHead(bucket, key) {
+  let attempts = 0;
+  while (attempts < 100) {
+    attempts += 1;
+    const object = await bucket.get(key);
+    const expected = object ? await object.text() : null;
+    const next = String((expected === null ? 0 : Number(expected)) + 1);
+    const result = await r2CompareExchange(bucket, key, expected, next);
+    if (result.won) return attempts;
+  }
+  throw new Error("R2 CAS contention retry limit exceeded");
+}
+
+async function benchmarkR2Cas(env, samples, concurrency) {
+  const runId = crypto.randomUUID();
+  const headKey = `bench/write-cas/${runId}/head`;
+  const blockKeys = [];
+  const latencies = [];
+  const attempts = [];
+  const startedAll = performance.now();
+  try {
+    for (let offset = 0; offset < samples; offset += concurrency) {
+      const width = Math.min(concurrency, samples - offset);
+      const batch = Array.from({length: width}, async (_, i) => {
+        const sequence = offset + i;
+        const blockKey = `bench/write-cas/${runId}/blocks/${sequence}`;
+        blockKeys.push(blockKey);
+        const started = performance.now();
+        await env.MERKLE_BUCKET.put(blockKey, new Uint8Array(256).fill(sequence % 251));
+        const retries = await incrementHead(env.MERKLE_BUCKET, headKey);
+        latencies.push(performance.now() - started);
+        attempts.push(retries);
+      });
+      await Promise.all(batch);
+    }
+    const finalHead = await env.MERKLE_BUCKET.get(headKey);
+    const finalValue = finalHead ? Number(await finalHead.text()) : null;
+    return {backend: "cloudflare-r2", samples, concurrency,
+            finalHead: finalValue, lostUpdates: samples - finalValue,
+            p50Ms: percentile(latencies, 0.50), p95Ms: percentile(latencies, 0.95),
+            p99Ms: percentile(latencies, 0.99), wallMs: performance.now() - startedAll,
+            totalCasAttempts: attempts.reduce((a, b) => a + b, 0),
+            maxCasAttempts: Math.max(...attempts)};
+  } finally {
+    await Promise.all([...blockKeys, headKey].map(key => env.MERKLE_BUCKET.delete(key)));
+  }
+}
+
 const BENCH_PAGE = `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
 <title>Kotobase Browser Range Benchmark</title></head>
@@ -95,6 +156,8 @@ const E2E_PAGE = `<!doctype html><html lang="en"><head><meta charset="utf-8">
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+    if (url.pathname === "/bench/write-cas" && !authorized(request, env))
+      return response({ error: "unauthorized" }, 401);
     if (["/e2e/config", "/e2e/bundle", "/e2e/object", "/e2e/key"].includes(url.pathname) &&
         !authorized(request, env)) {
       return response({ error: "unauthorized" }, 401);
@@ -179,6 +242,11 @@ export default {
                         p95Ms: percentile(timings, 0.95),
                         p99Ms: percentile(timings, 0.99),
                         meanMs: timings.reduce((a, b) => a + b, 0) / timings.length });
+    }
+    if (request.method === "POST" && url.pathname === "/bench/write-cas") {
+      const samples = Math.min(256, Math.max(1, Number(url.searchParams.get("samples") || 32)));
+      const concurrency = Math.min(32, Math.max(1, Number(url.searchParams.get("concurrency") || 8)));
+      return response(await benchmarkR2Cas(env, samples, concurrency));
     }
     if (request.method === "GET" && url.pathname === "/") {
       return new Response(BENCH_PAGE, { headers: {

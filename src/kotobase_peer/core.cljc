@@ -1325,10 +1325,10 @@
 
    `head-key` identifies the mutable pointer. `expected-chain-cid` is the
    chain-cid the CALLER currently believes is the head (`nil` means \"I
-   believe this chain doesn't exist yet\"). `cas!` is assumed synchronous
-   on BOTH platforms (matching `put!`/`get-fn`'s own existing convention
-   in this file -- only the crypto step is ever async here); only
-   `commit!`'s own crypto step needs promise-chaining on cljs."
+   believe this chain doesn't exist yet\"). `cas!` is synchronous on JVM.
+   On cljs it may return either the value or a Promise of it, allowing direct
+   composition with R2/S3 conditional-head adapters; the result is always
+   awaited before success/retry is decided."
   ([put! get-fn cas! head-key expected-chain-cid tx-data encrypt-fn]
    (commit-serialized! put! get-fn cas! head-key expected-chain-cid tx-data encrypt-fn default-max-cas-retries))
   ([put! get-fn cas! head-key expected-chain-cid tx-data encrypt-fn max-retries]
@@ -1349,10 +1349,11 @@
                                               {:head-key head-key :attempts attempts}))
                   (-> (commit! put! get-fn tx-data current-cid encrypt-fn)
                       (.then (fn [new-cid]
-                               (let [actual (cas! head-key current-cid new-cid)]
-                                 (if (= actual new-cid)
-                                   new-cid
-                                   (attempt actual (inc attempts)))))))))]
+                               (-> (js/Promise.resolve (cas! head-key current-cid new-cid))
+                                   (.then (fn [actual]
+                                            (if (= actual new-cid)
+                                              new-cid
+                                              (attempt actual (inc attempts)))))))))))]
         (attempt expected-chain-cid 0)))))
 
 (defn commit-serialized-with-report!
@@ -1382,10 +1383,11 @@
                                                 {:head-key head-key :attempts attempts}))
                     (-> (commit! put! get-fn tx-data current-cid encrypt-fn)
                         (.then (fn [new-cid]
-                                 (let [actual (cas! head-key current-cid new-cid)]
-                                   (if (= actual new-cid)
-                                     {:chain-cid-before current-cid :chain-cid-after new-cid :tx-data quads}
-                                     (attempt actual (inc attempts)))))))))]
+                                 (-> (js/Promise.resolve (cas! head-key current-cid new-cid))
+                                     (.then (fn [actual]
+                                              (if (= actual new-cid)
+                                                {:chain-cid-before current-cid :chain-cid-after new-cid :tx-data quads}
+                                                (attempt actual (inc attempts)))))))))))]
           (attempt expected-chain-cid 0))))))
 
 (defn novelty-size
@@ -1950,10 +1952,11 @@
                                (-> (commit! put! get-fn (mapv delta->quad effective-deltas)
                                             current-cid encrypt-fn blind-fn)
                                    (.then (fn [new-cid]
-                                            (let [actual (cas! head-key current-cid new-cid)]
-                                              (if (= actual new-cid)
-                                                (report current-cid new-cid effective-deltas true attempts)
-                                                (attempt actual (inc attempts))))))))))))))]
+                                            (-> (js/Promise.resolve (cas! head-key current-cid new-cid))
+                                                (.then (fn [actual]
+                                                         (if (= actual new-cid)
+                                                           (report current-cid new-cid effective-deltas true attempts)
+                                                           (attempt actual (inc attempts))))))))))))))))]
           (attempt expected-chain-cid 0))))))
 
 (defn- newly-added-tx-cids
@@ -2575,10 +2578,11 @@
                         (-> (fold! put! get-fn current ipld/link? max-novelty
                                    blind-fn encrypt-fn decrypt-fn)
                             (.then (fn [next]
-                                     (let [actual (cas! head-key current next)]
-                                       (if (= actual next)
-                                         (report current next size attempts true)
-                                         (attempt actual (inc attempts)))))))))))]
+                                     (-> (js/Promise.resolve (cas! head-key current next))
+                                         (.then (fn [actual]
+                                                  (if (= actual next)
+                                                    (report current next size attempts true)
+                                                    (attempt actual (inc attempts)))))))))))))]
           (attempt expected-chain-cid 0))))))
 
 (defn verify-chain

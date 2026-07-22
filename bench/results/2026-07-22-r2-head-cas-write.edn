@@ -1,0 +1,21 @@
+{:date "2026-07-22"
+ :backend :cloudflare-r2
+ :execution {:mode "wrangler remote preview"
+             :bucket "kotobase-merkle-lsm"
+             :cleanup "unique run prefix deleted in finally"
+             :payload-bytes-per-write 256
+             :samples-per-run 32}
+ :results
+ [{:concurrency 1 :final-head 32 :lost-updates 0
+   :p50-ms 293 :p95-ms 394 :p99-ms 409 :wall-ms 9719
+   :total-cas-attempts 32 :max-cas-attempts 1}
+  {:concurrency 8 :final-head 32 :lost-updates 0
+   :p50-ms 941 :p95-ms 1731 :p99-ms 1759 :wall-ms 7016
+   :total-cas-attempts 143 :max-cas-attempts 8}
+  {:concurrency 32 :final-head 32 :lost-updates 0
+   :p50-ms 6776 :p95-ms 10262 :p99-ms 10464 :wall-ms 10717
+   :total-cas-attempts 508 :max-cas-attempts 32}]
+ :correctness {:conditional-r2-put true
+               :final-head-equals-successful-writes true
+               :lost-updates 0}
+ :interpretation "R2 ETag CAS is correct but a single hot head is a serialization bottleneck: retries grow approximately with concurrent writers. Production throughput requires sharded actor/tenant heads or a batching transactor; increasing retries alone is not an optimization."}
