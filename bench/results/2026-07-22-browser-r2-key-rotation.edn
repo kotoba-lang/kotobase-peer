@@ -1,0 +1,29 @@
+{:date "2026-07-22"
+ :target "https://kotobase-view-bench.04-feasts-minded.workers.dev/e2e/rotation-v2"
+ :worker-version "347b1474-aecb-4ae2-803c-5a71fca3f0e4"
+ :asset-version "rotation-v2"
+ :rotation {:from-key-id "tenant-a/dek-v1"
+            :to-key-id "tenant-a/dek-v2"
+            :dual-key-before-revoke {:v1-status 200 :v2-status 200}
+            :published-bundle-key-ids ["tenant-a/dek-v2"]
+            :browser-key-requests 1
+            :old-key-after-revoke-status 404
+            :new-query-after-revoke :succeeded}
+ :v2-fixture {:pack-cid "bafyreiaac3q374qoelxevv5lu7or3y4ahdx4whkhf3v25nx55hjbk5glxe"
+              :pack-bytes 63250
+              :bundle-cid "bafyreihps4j4ovl6w2m3xu4eip2433gu5og747dip57xp3ulhrxuldqmxa"
+              :bundle-bytes 4756}
+ :post-revoke-browser
+ {:point {:cold {:samples 10 :p50-ms 46.9 :p95-ms 54.5 :p99-ms 54.5}
+          :warm {:samples 20 :p50-ms 2.9 :p95-ms 3.5 :p99-ms 3.5}
+          :requests 1 :ciphertext-range-bytes 6364}
+  :range {:cold {:samples 10 :p50-ms 47.6 :p95-ms 51.7 :p99-ms 51.7}
+          :rows 200 :requests 1 :ciphertext-range-bytes 19092}
+  :concurrent {:batches 5 :concurrency 8 :samples 40
+               :latency {:p50-ms 93.3 :p95-ms 120.2 :p99-ms 121.7}
+               :batch-wall {:p50-ms 100.1 :p95-ms 122.8 :p99-ms 122.8}}
+  :total-harness-ms 1773.6
+  :verified? true
+  :console-errors []}
+ :note "Bearer secret updates showed short per-edge propagation skew; the post-revoke browser gate was accepted only after the v2 route succeeded."
+ :outcome :succeeded}

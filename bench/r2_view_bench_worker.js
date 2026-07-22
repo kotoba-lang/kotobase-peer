@@ -3,9 +3,9 @@ const OBJECT_BYTES = 8_346_444;
 const E2E_PACK_KEY = "bench/e2e/view-pack-v1";
 const E2E_PACK_BYTES = 63_250;
 const E2E_BUNDLE_KEY = "bench/e2e/query-bundle-v1";
-const E2E_BUNDLE_CID = "bafyreic6llgakz2qbgd3mxmw3zd47v3srwr5fc3vkug5ou77yjtzc6tk4y";
+const E2E_BUNDLE_CID = "bafyreihps4j4ovl6w2m3xu4eip2433gu5og747dip57xp3ulhrxuldqmxa";
 const E2E_QUERY_KEY = "tenant-a/000000500";
-const E2E_ASSET_VERSION = "encrypted-v1";
+const E2E_ASSET_VERSION = "rotation-v2";
 
 function percentile(values, p) {
   const sorted = [...values].sort((a, b) => a - b);
@@ -128,8 +128,11 @@ export default {
       return result;
     }
     if (request.method === "GET" && url.pathname === "/e2e/key") {
-      if (!env.E2E_DEK_B64) return response({ error: "E2E DEK is not configured" }, 503);
-      const result = response({ keyId: "tenant-a/dek-v1", key: env.E2E_DEK_B64 });
+      const keyId = url.searchParams.get("keyId");
+      const keys = {"tenant-a/dek-v1": env.E2E_DEK_V1_B64,
+                    "tenant-a/dek-v2": env.E2E_DEK_V2_B64};
+      if (!keyId || !keys[keyId]) return response({ error: "key unavailable" }, 404);
+      const result = response({ keyId, key: keys[keyId] });
       result.headers.set("cache-control", "no-store");
       result.headers.set("vary", "authorization");
       return result;
@@ -183,7 +186,8 @@ export default {
       }});
     }
     if (request.method === "GET" &&
-        (url.pathname === "/e2e" || url.pathname === "/e2e/encrypted-v1")) {
+        (url.pathname === "/e2e" || url.pathname === "/e2e/encrypted-v1" ||
+         url.pathname === "/e2e/rotation-v2")) {
       return new Response(E2E_PAGE, { headers: {
         "content-type": "text/html; charset=utf-8", "cache-control": "no-store",
       }});

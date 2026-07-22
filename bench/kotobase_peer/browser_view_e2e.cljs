@@ -40,9 +40,12 @@
 (defn- range-header [{:keys [offset length]}]
   (str "bytes=" offset "-" (dec (+ offset length))))
 
-(defn- decrypt-block [crypto-key descriptor ciphertext]
+(defn- decrypt-block [keyring descriptor ciphertext]
   (if-let [encryption (get descriptor "encryption")]
-    (do
+    (let [key-id (get encryption "key-id")
+          crypto-key (get keyring key-id)]
+      (when-not crypto-key
+        (throw (js/Error. (str "missing view key " key-id))))
       (when-not (= "AES-256-GCM" (get encryption "algorithm"))
         (throw (js/Error. "unsupported view block encryption")))
       (-> (.decrypt (.-subtle js/crypto)
@@ -53,7 +56,7 @@
           (.then #(js/Uint8Array. %))))
     (js/Promise.resolve ciphertext)))
 
-(defn- decrypt-ranges [crypto-key plan range-arrays]
+(defn- decrypt-ranges [keyring plan range-arrays]
   (let [promises
         (mapcat
          (fn [fetch range-bytes]
@@ -61,13 +64,13 @@
                   (let [start (- (get descriptor "offset") (:offset fetch))
                         ciphertext (.slice range-bytes start
                                            (+ start (get descriptor "length")))]
-                    (decrypt-block crypto-key descriptor ciphertext)))
+                    (decrypt-block keyring descriptor ciphertext)))
                 (:descriptors fetch)))
          (:fetches plan) range-arrays)]
     (-> (js/Promise.all (clj->js (vec promises)))
         (.then #(vec (array-seq %))))))
 
-(defn- query-once [bundle crypto-key
+(defn- query-once [bundle keyring
                    {:keys [lower upper limit expected-count cache nonce]}]
   (let [plan (view/range-query-plan
               {:bundle bundle :lower lower :upper upper :limit limit})
@@ -84,7 +87,7 @@
     (-> (js/Promise.all (clj->js requests))
         (.then
          (fn [range-arrays]
-           (decrypt-ranges crypto-key plan (vec (array-seq range-arrays)))))
+           (decrypt-ranges keyring plan (vec (array-seq range-arrays)))))
         (.then
          (fn [plaintext-blocks]
            (let [values (view/finish-logical-blocks-query plan plaintext-blocks)
@@ -99,26 +102,26 @@
               :first (first values)
               :last (last values)}))))))
 
-(defn- sequential-samples [bundle crypto-key query count cache label]
+(defn- sequential-samples [bundle keyring query count cache label]
   (reduce
    (fn [promise i]
      (.then promise
             (fn [results]
-              (.then (query-once bundle crypto-key
+              (.then (query-once bundle keyring
                                  (assoc query :cache cache
                                               :nonce (str label "-" i "-" (now))))
                      (fn [result] (conj results result))))))
    (js/Promise.resolve [])
    (range count)))
 
-(defn- concurrent-samples [bundle crypto-key query batches concurrency]
+(defn- concurrent-samples [bundle keyring query batches concurrency]
   (reduce
    (fn [promise batch]
      (.then
       promise
       (fn [results]
         (let [started (now)
-              requests (mapv #(query-once bundle crypto-key
+              requests (mapv #(query-once bundle keyring
                                           (assoc query :cache "reload"
                                                        :nonce (str "c-" batch "-" % "-" (now))))
                              (range concurrency))]
@@ -130,7 +133,7 @@
    (js/Promise.resolve [])
    (range batches)))
 
-(defn- execute-harness [config bundle-bytes crypto-key result started]
+(defn- execute-harness [config bundle-bytes keyring result started]
   (let [actual (str (ipld/cid bundle-bytes))
         expected-cid (gobj/get config "bundleCid")]
     (when-not (= expected-cid actual)
@@ -141,19 +144,19 @@
           range-query {:lower "tenant-a/000000450"
                        :upper "tenant-a/000000649"
                        :limit 200 :expected-count 200}]
-      (-> (sequential-samples bundle crypto-key point 10 "reload" "point-cold")
+      (-> (sequential-samples bundle keyring point 10 "reload" "point-cold")
           (.then
            (fn [point-cold]
-             (.then (sequential-samples bundle crypto-key point 20 "force-cache" "point-warm")
+             (.then (sequential-samples bundle keyring point 20 "force-cache" "point-warm")
                     (fn [point-warm] {:point-cold point-cold
                                       :point-warm point-warm}))))
           (.then
            (fn [output]
-             (.then (sequential-samples bundle crypto-key range-query 10 "reload" "range-cold")
+             (.then (sequential-samples bundle keyring range-query 10 "reload" "range-cold")
                     #(assoc output :range-cold %))))
           (.then
            (fn [output]
-             (.then (concurrent-samples bundle crypto-key point 5 8)
+             (.then (concurrent-samples bundle keyring point 5 8)
                     #(assoc output :concurrent %))))
           (.then
            (fn [{:keys [point-cold point-warm range-cold concurrent]}]
@@ -176,6 +179,7 @@
                                         :latency (summary concurrency-latencies)
                                         :batch-wall (summary (map :wall-ms concurrent))}
                            :encryption "AES-256-GCM"
+                           :key-ids (vec (sort (keys keyring)))
                            :total-harness-ms (- (now) started)
                            :verified? true}]
                (set! (.. result -dataset -status) "done")
@@ -190,6 +194,26 @@
     (.importKey (.-subtle js/crypto) "raw" bytes #js {:name "AES-GCM"}
                 false #js ["decrypt"])))
 
+(defn- load-keyring [bundle-bytes]
+  (let [bundle (ipld/decode bundle-bytes)
+        key-ids (->> (get bundle "blocks")
+                     (keep #(get-in % ["encryption" "key-id"]))
+                     distinct vec)
+        promises
+        (mapv (fn [key-id]
+                (-> (js/fetch (str "/e2e/key?keyId=" (js/encodeURIComponent key-id))
+                              #js {:cache "no-store" :headers (auth-headers)})
+                    (.then (fn [response]
+                             (when-not (.-ok response)
+                               (throw (js/Error. (str "key unavailable: " key-id))))
+                             (.json response)))
+                    (.then (fn [payload]
+                             (.then (import-dek (gobj/get payload "key"))
+                                    (fn [crypto-key] [key-id crypto-key]))))))
+              key-ids)]
+    (-> (js/Promise.all (clj->js promises))
+        (.then #(into {} (array-seq %))))))
+
 (defn ^:export run []
   (let [result (.querySelector js/document "#result")
         started (now)
@@ -203,18 +227,14 @@
                  (let [bundle-promise
                        (fetch-bytes "/e2e/bundle"
                                     #js {:cache "reload" :headers (auth-headers)})
-                       key-promise
-                       (-> (js/fetch "/e2e/key"
-                                     #js {:cache "no-store" :headers (auth-headers)})
-                           (.then (fn [response]
-                                    (when-not (.-ok response)
-                                      (throw (js/Error. "/e2e/key failed")))
-                                    (.json response)))
-                           (.then #(import-dek (gobj/get % "key"))))]
-                   (.then (js/Promise.all #js [bundle-promise key-promise])
-                          (fn [values]
-                            (execute-harness config (aget values 0) (aget values 1)
-                                             result started))))))]
+                       execution
+                       (.then bundle-promise
+                              (fn [bundle-bytes]
+                                (.then (load-keyring bundle-bytes)
+                                       (fn [keyring]
+                                         (execute-harness config bundle-bytes keyring
+                                                          result started)))))]
+                   execution)))]
     (.catch query-promise
             (fn [error]
               (set! (.. result -dataset -status) "error")

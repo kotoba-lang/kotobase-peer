@@ -226,6 +226,13 @@ ciphertext pack and bundle while preserving logical block identity. The real
 encrypted R2/browser result is recorded in
 `bench/results/2026-07-22-browser-r2-encrypted-view.edn`.
 
+Rotation uses a keyring resolved from the immutable bundle descriptors rather
+than a client-side current-key constant. During a rollout the host may expose
+both old and new key IDs; clients fetch only IDs referenced by their pinned
+bundle. After the new pack and bundle are published and verified, the old key
+can be revoked without interrupting new queries. The v1→v2 dual-key and revoke
+drill is recorded in `bench/results/2026-07-22-browser-r2-key-rotation.edn`.
+
 This is currently a behavior-preserving shadow substrate: existing
 `commit!`/`hot-datoms`/`fold!` remain the live path until read equivalence and
 CLJ/CLJS CID determinism gates pass. New storage work must target the
