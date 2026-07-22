@@ -80,6 +80,15 @@
              (is (= (count eavt-run-keys)
                     (count (filter eavt-run-keys @gets)))
                  "overlapping selected run refs are loaded once by CID")
+             (reset! gets [])
+             (worker/find-index-prefixes!
+              env "db-a" :aevt [["name"] ["role"]])))
+          (.then
+           (fn [rows]
+             (is (= [["name" "alice" "Alice"]]
+                    (mapv #(get % "components") rows)))
+             (is (= 1 (count (filter #{"test/heads/db-a"} @gets)))
+                 "an index-prefix batch resolves the head once")
              (done)))
           (.catch
            (fn [error]
