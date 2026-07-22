@@ -16,6 +16,13 @@
        (every? #(and (vector? %) (= 3 (count %))) (:where query))
        (every? datalog-var? (:find query))))
 
+(defn bounded-single-clause-query?
+  "True when a host can maintain QUERY from a touched-entity MVCC slice.
+  Multi-clause queries need an arrangement/frontier loader and must not use
+  this shortcut merely because their final result is small."
+  [query]
+  (and (simple-query? query) (= 1 (count (:where query)))))
+
 (defn- change-bindings
   "Unify one effective datom delta with a positive triple clause."
   [clause {:keys [e a v]}]
@@ -61,6 +68,21 @@
                    (:where query))))
         changes))
 
+(defn affected-query-results
+  "Return only result tuples whose membership can change because of effective
+  datom DELTAS. DB-BEFORE/DB-AFTER may be a correctness-complete query slice;
+  they do not need to contain unrelated entities."
+  [{:keys [db-before db-after query visible? inputs effective-deltas]
+    :or {inputs []}}]
+  (when-not (and (simple-query? query) (fn? visible?))
+    (throw (ex-info "Affected results require a positive conjunctive query and visible?"
+                    {})))
+  (let [assertions (filterv #(= :assert (:op %)) effective-deltas)
+        retractions (filterv #(= :retract (:op %)) effective-deltas)]
+    (set/union
+     (anchored-results db-after query visible? inputs assertions)
+     (anchored-results db-before query visible? inputs retractions))))
+
 (defn- result-exists?
   [db query visible? inputs result]
   (contains? (query-with-bindings db query visible? inputs
@@ -83,17 +105,16 @@
   checked against the after snapshot. Full Datalog grammar remains correct via
   deterministic recomputation for negation, aggregation, functions, or rules."
   [{:keys [db-before db-after query visible? inputs current-result
-           effective-deltas]
-    :or {inputs []}}]
+           current-result-complete? effective-deltas]
+    :or {inputs [] current-result-complete? true}}]
   (when-not (fn? visible?)
     (throw (ex-info "Materialized query requires visible?" {})))
   (let [current (set current-result)]
     (if (simple-query? query)
-      (let [assertions (filterv #(= :assert (:op %)) effective-deltas)
-            retractions (filterv #(= :retract (:op %)) effective-deltas)
-            candidates (set/union
-                        (anchored-results db-after query visible? inputs assertions)
-                        (anchored-results db-before query visible? inputs retractions))
+      (let [candidates (affected-query-results
+                        {:db-before db-before :db-after db-after :query query
+                         :visible? visible? :inputs inputs
+                         :effective-deltas effective-deltas})
             next (reduce (fn [result candidate]
                            (if (result-exists? db-after query visible? inputs candidate)
                              (conj result candidate)
@@ -101,7 +122,7 @@
                          current candidates)]
         {:mode :differential
          :candidate-count (count candidates)
-         :result next
+         :result (when current-result-complete? next)
          :changes (result-changes current next)})
       (let [next (set (peer/query db-after query visible? inputs))]
         {:mode :recompute
@@ -147,8 +168,9 @@
           (statistics/refresh-query-statistics query-statistics
                                                effective-deltas new-epoch)
           maintained
-          (mapv (fn [{:keys [view-id query visible? inputs current-result
-                             previous-bundle previous-epoch block-rows plan-cid]
+                  (mapv (fn [{:keys [view-id query visible? inputs current-result
+                             current-result-complete? previous-bundle
+                             previous-epoch block-rows plan-cid]
                       :as spec}]
                   (when-not (and (seq (str view-id)) previous-bundle
                                  (integer? previous-epoch)
@@ -159,6 +181,9 @@
                                {:db-before db-before :db-after db-after
                                 :query query :visible? visible? :inputs inputs
                                 :current-result current-result
+                                :current-result-complete?
+                                (if (nil? current-result-complete?)
+                                  true current-result-complete?)
                                 :effective-deltas effective-deltas})
                         built (view/build-view-delta
                                {:view-id view-id :epoch new-epoch
