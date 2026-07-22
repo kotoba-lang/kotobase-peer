@@ -128,11 +128,25 @@
                  (contains? #{"before" "after"} (get node "snapshot"))
                  (vector? (get node "remaining"))
                  (every? nat-int? (get node "remaining"))
-                 (vector? (get node "bindings")))
+                 (vector? (get node "bindings"))
+                 (let [scan (get node "scan")]
+                   (or (nil? scan)
+                       (and (map? scan)
+                            (nat-int? (get scan "clause-index"))
+                            (contains? #{"eavt" "aevt" "avet" "vaet"}
+                                       (get scan "index"))
+                            (string? (get scan "after"))
+                            (seq (get scan "after"))
+                            (some #{(get scan "clause-index")}
+                                  (get node "remaining"))))))
     (throw (ex-info "Malformed join frontier work node" {:node node})))
   {:snapshot (keyword (get node "snapshot"))
    :remaining (get node "remaining")
    :bindings (mapv wire->binding (get node "bindings"))
+   :scan (when-let [scan (get node "scan")]
+           {:clause-index (get scan "clause-index")
+            :index (keyword (get scan "index"))
+            :after (get scan "after")})
    :next-work (some-> (get node "next-work") ipld/link-cid)})
 
 (defn build-frontier-work-chain
@@ -141,10 +155,16 @@
   host to prepend the next join wave without rewriting old work. One binding
   that cannot fit fails closed. Returns nodes in traversal/write order plus the
   new head CID."
-  [{:keys [snapshot remaining bindings next-work max-bytes]}]
+  [{:keys [snapshot remaining bindings scan next-work max-bytes]}]
   (when-not (and (contains? #{:before :after} snapshot)
                  (vector? remaining) (every? nat-int? remaining)
-                 (vector? bindings) (pos-int? max-bytes))
+                 (vector? bindings) (pos-int? max-bytes)
+                 (or (nil? scan)
+                     (and (nat-int? (:clause-index scan))
+                          (some #{(:clause-index scan)} remaining)
+                          (contains? lsm/indexes (:index scan))
+                          (string? (:after scan))
+                          (seq (:after scan)))))
     (throw (ex-info "Invalid join frontier work chain input"
                     {:snapshot snapshot :remaining remaining
                      :bindings-type (type bindings) :max-bytes max-bytes})))
@@ -155,6 +175,9 @@
                                  "snapshot" (name snapshot)
                                  "remaining" remaining
                                  "bindings" (mapv binding->wire bindings)}
+                          scan (assoc "scan" {"clause-index" (:clause-index scan)
+                                              "index" (name (:index scan))
+                                              "after" (:after scan)})
                           next-work (assoc "next-work" (ipld/link next-work))))]
               (cond
                 (<= #?(:clj (alength ^bytes (:bytes node))
