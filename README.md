@@ -248,6 +248,14 @@ is pure CLJ/CLJS effect data and is reusable by browser and Datalog hosts. Its
 real encrypted R2 gate is in
 `bench/results/2026-07-22-browser-r2-noncontiguous-batch.edn`.
 
+`plan-clause-order` adds a portable greedy join-order kernel: it starts with
+the lowest estimated cardinality, then prefers clauses connected to already
+bound variables before comparing their estimated rows. The three-clause
+post-author browser gate therefore executes `edges → authors → posts`, returns
+20 joined rows with 3 bounded requests/21,276 bytes, and keeps AES-GCM plus
+plaintext CID verification. See
+`bench/results/2026-07-22-browser-r2-cost-join.edn`.
+
 This is currently a behavior-preserving shadow substrate: existing
 `commit!`/`hot-datoms`/`fold!` remain the live path until read equivalence and
 CLJ/CLJS CID determinism gates pass. New storage work must target the

@@ -1,7 +1,8 @@
 (ns kotobase-peer.browser-view-e2e
   (:require [goog.object :as gobj]
             [ipld.core :as ipld]
-            [kotobase-peer.materialized-view :as view]))
+            [kotobase-peer.materialized-view :as view]
+            [kotobase-peer.statistics :as stats]))
 
 (defn- now [] (.now js/performance))
 
@@ -145,16 +146,26 @@
                 (let [authors (into {} (map (fn [[_ author]]
                                               [(get author "id") author])
                                             (:values inner)))
-                      joined (mapv (fn [edge]
-                                     {:post-id (get edge "post-id")
-                                      :author (get authors (get edge "author-id"))})
-                                   edges)]
-                  {:ms (- (now) started)
-                   :rows (count joined)
-                   :requests (+ (:requests outer) (:requests inner))
-                   :range-bytes (+ (:range-bytes outer) (:range-bytes inner))
-                   :deduplicated-keys (count author-ids)
-                   :first (first joined)})))))))))
+                      post-keys (mapv #(str "tenant-a/"
+                                            (.padStart (str (get % "post-id")) 9 "0"))
+                                      edges)]
+                  (.then
+                   (batch-query-once bundle keyring post-keys (str sample "-posts"))
+                   (fn [posts]
+                     (let [joined (mapv (fn [edge]
+                                          (let [post-id (get edge "post-id")]
+                                            {:post (get (:values posts)
+                                                        (str "tenant-a/"
+                                                             (.padStart (str post-id) 9 "0")))
+                                             :author (get authors (get edge "author-id"))}))
+                                        edges)]
+                       {:ms (- (now) started)
+                        :rows (count joined)
+                        :requests (+ (:requests outer) (:requests inner) (:requests posts))
+                        :range-bytes (+ (:range-bytes outer) (:range-bytes inner)
+                                        (:range-bytes posts))
+                        :deduplicated-keys (+ (count author-ids) (count post-keys))
+                        :first (first joined)}))))))))))))
 
 (defn- join-samples [bundle keyring count]
   (reduce
@@ -246,7 +257,15 @@
                            :concurrent {:batches 5 :concurrency 8
                                         :latency (summary concurrency-latencies)
                                         :batch-wall (summary (map :wall-ms concurrent))}
-                           :join {:kind "non-contiguous-block-batch"
+                           :join {:kind "cost-ordered-three-clause"
+                                  :order (mapv :id
+                                               (stats/plan-clause-order
+                                                [{:id :posts :estimated-rows 1000
+                                                  :vars #{'?post}}
+                                                 {:id :authors :estimated-rows 100
+                                                  :vars #{'?author}}
+                                                 {:id :edges :estimated-rows 20
+                                                  :vars #{'?post '?author}}]))
                                   :cold (summary (map :ms joins))
                                   :rows (:rows (first joins))
                                   :deduplicated-keys (:deduplicated-keys (first joins))

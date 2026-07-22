@@ -1,0 +1,31 @@
+{:date "2026-07-22"
+ :target "https://kotobase-view-bench.04-feasts-minded.workers.dev/e2e/cost-join-v1"
+ :worker-version "85944d92-f598-4c83-8bf2-5f870527adea"
+ :asset-version "cost-join-v1"
+ :backend :cloudflare-r2
+ :fixture {:rows 2100
+           :non-contiguous-author-function "(post-id * 37) mod 100"
+           :pack-cid "bafyreiceomjfxm2ew3tftlsjr6sak5gzhjgitkiap4skr6tjcn73eav5ai"
+           :pack-bytes 148676
+           :bundle-cid "bafyreihg2cnlutee3f463wbbghrccs5bxcrxd3s3s5sy52exbs4qdlrjli"
+           :bundle-bytes 10114}
+ :planner {:name :plan-clause-order
+           :strategy [:lowest-estimated-cardinality :connected-clause-first]
+           :estimates {:edges 20 :authors 100 :posts 1000}
+           :order [:edges :authors :posts]
+           :portable [:clj :cljs]}
+ :join {:kind :cost-ordered-three-clause
+        :samples 10 :rows 20 :deduplicated-keys 40
+        :requests 3 :range-bytes 21276
+        :cold {:p50-ms 198.5 :p95-ms 222.4 :p99-ms 222.4
+               :min-ms 135.3 :max-ms 237.9}
+        :first {:post {"id" 450 "title" "Post 450"}
+                :author {"id" 50 "name" "Author 50"}}}
+ :security {:encryption "AES-256-GCM"
+            :key-ids ["tenant-a/dek-v2"]
+            :plaintext-cid-verified? true}
+ :tests {:clj {:tests 170 :assertions 443}
+         :cljs {:tests 164 :assertions 437}
+         :gateway {:tests 14 :assertions 42}}
+ :console-errors []
+ :outcome :succeeded}
