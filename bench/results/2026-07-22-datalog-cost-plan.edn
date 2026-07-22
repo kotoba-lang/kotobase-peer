@@ -1,0 +1,18 @@
+{:date "2026-07-22"
+ :scope :hot-arrangement-datalog
+ :planner :kotobase-peer.statistics/plan-clause-order
+ :compiler-entry :kotobase-peer.core/datalog-query-plan
+ :fixture {:entities 101 :datoms 202
+           :clauses [[?s "name" ?name] [?s "role" "admin"]]}
+ :visible-cardinality {:source-order [101 1]
+                       :planned-order [1 101]}
+ :plan {:clause-ids [1 0]
+        :where [[?s "role" "admin"] [?s "name" ?name]]
+        :connected-after-first? true}
+ :result #{["Alice"]}
+ :safety {:visibility-applied-to-estimates? true
+          :binding-sensitive-forms-reordered? false}
+ :tests {:clj {:tests 172 :assertions 449}
+         :cljs {:tests 166 :assertions 443}
+         :lint-errors 0}
+ :outcome :succeeded}

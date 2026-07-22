@@ -256,6 +256,14 @@ post-author browser gate therefore executes `edges → authors → posts`, retur
 plaintext CID verification. See
 `bench/results/2026-07-22-browser-r2-cost-join.edn`.
 
+The hot Datalog compiler now calls the same clause-order kernel for queries
+whose `:where` consists entirely of positive triple patterns. It estimates
+each clause through the caller's required `visible?` decision, then passes the
+reordered query to `arrangement.datalog/q`; this keeps authorization filtering
+in the planning path as well as execution. Binding-sensitive negation,
+function, rule, and `or` queries deliberately retain source order. The
+compiler plan is inspectable through `datalog-query-plan`.
+
 This is currently a behavior-preserving shadow substrate: existing
 `commit!`/`hot-datoms`/`fold!` remain the live path until read equivalence and
 CLJ/CLJS CID determinism gates pass. New storage work must target the
