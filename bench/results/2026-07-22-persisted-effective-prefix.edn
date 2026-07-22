@@ -1,0 +1,22 @@
+{:date "2026-07-22"
+ :command "clojure -M:persisted-effective-bench 10000 20"
+ :environment {:runtime "OpenJDK 26.0.1"
+               :store :in-memory
+               :crypto :identity
+               :layout "10,000 datoms folded into indexed snapshot"}
+ :fixture {:entities 10000 :samples 20 :transaction-subjects 1}
+ :full-hydration-baseline {:p50-ms 254.053541
+                           :p95-ms 404.697875
+                           :average-block-gets 44.0}
+ :prefix-effective-no-op {:p50-ms 47.405084
+                          :p95-ms 85.896166
+                          :average-block-gets 4.0
+                          :blocks-written 0
+                          :cas-calls 0}
+ :prefix-effective-commit {:p50-ms 36.293083
+                           :p95-ms 54.89975
+                           :average-block-gets 24.0
+                           :commits 20}
+ :comparison {:no-op-p50-reduction-percent 81.34
+              :no-op-block-get-reduction-percent 90.91}
+ :interpretation "Indexed current-state normalization is now proportional to touched subjects and tree depth, not total folded graph rows. Effective samples accumulate up to 20 unfolded novelty blocks, explaining their average block-get count; fold policy remains the bound."}

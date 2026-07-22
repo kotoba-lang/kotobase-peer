@@ -881,6 +881,27 @@
        (is (= calls-before @cas-calls) "semantic no-op does not touch mutable head"))))
 
 #?(:clj
+   (deftest transaction-slice-is-prefix-pruned-and-novelty-correct
+     (let [{:keys [put! get-fn]} (mem-store)
+           seed (mapv (fn [i] [(str "entity-" i) "role" "user"]) (range 1000))
+           c0 (eng/commit! put! get-fn seed nil test-encrypt-fn)
+           folded (eng/fold! put! get-fn c0 test-blind-fn test-encrypt-fn test-decrypt-fn)
+           c1 (eng/commit! put! get-fn
+                           [[:db/retract "entity-42" "role" "user"]
+                            [:db/add "entity-42" "role" "admin"]
+                            [:db/add "unrelated" "role" "guest"]]
+                           folded test-encrypt-fn)
+           slice (eng/hydrate-transaction-slice
+                  get-fn c1 [[:db/add "entity-42" "role" "admin"]]
+                  test-blind-fn test-decrypt-fn)]
+       (is (= #{"entity-42"} (set (keys (:spo slice))))
+           "snapshot prefix and novelty replay exclude unrelated subjects")
+       (is (= #{"admin"} (get-in slice [:spo "entity-42" "role"])))
+       (is (empty? (:effective-deltas
+                    (eng/transact-effective slice
+                                            [[:db/add "entity-42" "role" "admin"]])))))))
+
+#?(:clj
    (deftest commit-serialized-effective-publishes-only-effective-deltas
      (let [{:keys [put! get-fn]} (mem-store)
            heads (atom {})

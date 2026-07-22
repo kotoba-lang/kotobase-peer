@@ -1758,6 +1758,60 @@
 (defn- delta->quad [{:keys [e a v op]}]
   {:s e :p a :o v :op op})
 
+(defn hydrate-transaction-slice
+  "Rebuild only the current subjects TX-DATA can change. The indexed half is
+   read as one EAVT prefix range per distinct subject; unfolded novelty blocks
+   are fetched once and only matching subjects are replayed. This preserves
+   `transact-effective` semantics (including retractEntity) without hydrating
+   unrelated graph rows. Sync on JVM, Promise on cljs. OPTS currently accepts
+   cljs-only `:async-get-fn` for direct bounded object-store reads."
+  ([get-fn chain-cid tx-data blind-fn decrypt-fn]
+   (hydrate-transaction-slice get-fn chain-cid tx-data blind-fn decrypt-fn {}))
+  ([get-fn chain-cid tx-data blind-fn decrypt-fn {:keys [async-get-fn]}]
+   (let [subjects (into #{} (map (comp :s ->quad)) tx-data)
+         state (state-at get-fn chain-cid)
+         snapshot-cid (indexed-cid state)
+         tx-cids (novelty-cids get-fn state)
+         rows->db (fn [rows]
+                    (reduce (fn [db {:keys [e a v_edn]}]
+                              (qs/assert-quad db {:s e :p a
+                                                  :o (qs/edn->link (edn/read-string v_edn))}
+                                              ipld/link?))
+                            (qs/empty-db) rows))
+         replay (fn [rows novelty-per-cid]
+                  (let [base (rows->db (apply concat rows))
+                        relevant (filter #(contains? subjects (:s %))
+                                         (apply concat novelty-per-cid))]
+                    (reduce (fn [db q] (apply-quad db q ipld/link?)) base relevant)))]
+     #?(:clj
+        (let [rows (mapv #(cold-datoms get-fn snapshot-cid
+                                      {:index :eavt :components [%]}
+                                      (constantly true) blind-fn decrypt-fn)
+                         subjects)
+              novelty (mapv #(read-tx-block get-fn % decrypt-fn) tx-cids)]
+          (replay rows novelty))
+        :cljs
+        (-> (js/Promise.all
+             #js [(pmap-async
+                   (fn [subject]
+                     (if async-get-fn
+                       (cold-datoms-async async-get-fn snapshot-cid
+                                         {:index :eavt :components [subject]}
+                                         (constantly true) blind-fn decrypt-fn)
+                       (cold-datoms get-fn snapshot-cid
+                                   {:index :eavt :components [subject]}
+                                   (constantly true) blind-fn decrypt-fn)))
+                   subjects)
+                  (pmap-async
+                   (fn [cid]
+                     (if async-get-fn
+                       (read-tx-block-async async-get-fn cid decrypt-fn)
+                       (read-tx-block get-fn cid decrypt-fn)))
+                   tx-cids)])
+            (.then (fn [results]
+                     (let [[rows novelty] (vec results)]
+                       (replay rows novelty)))))))))
+
 (defn commit-serialized-effective!
   "Correctness-first persisted transactor path. Hydrates the actual CAS head,
    normalizes TX-DATA against that database value, and persists only effective
@@ -1769,12 +1823,13 @@
    `:chain-cid-after`, and `:effective-deltas`. OPTS accepts `:max-retries`
    (default `default-max-cas-retries`). This path intentionally pays the current
    full-hydration cost. `commit-serialized!` remains the O(tx) append path for
-   callers which have already normalized their transaction."
+   callers which have already normalized their transaction. OPTS also forwards
+   cljs-only `:async-get-fn` to the transaction-slice reader."
   ([put! get-fn cas! head-key expected-chain-cid tx-data encrypt-fn blind-fn decrypt-fn]
    (commit-serialized-effective! put! get-fn cas! head-key expected-chain-cid tx-data
                                  encrypt-fn blind-fn decrypt-fn {}))
   ([put! get-fn cas! head-key expected-chain-cid tx-data encrypt-fn blind-fn decrypt-fn
-    {:keys [max-retries]
+    {:keys [max-retries] :as opts
      :or {max-retries default-max-cas-retries}}]
    (let [report (fn [before after deltas committed? attempts]
                   {:committed? committed?
@@ -1788,7 +1843,9 @@
             (throw (ex-info "kotobase-peer: commit-serialized-effective! exceeded max-cas-retries"
                             {:head-key head-key :attempts attempts})))
           (let [{:keys [effective-deltas]}
-                (transact-effective (hydrate-chain get-fn current-cid blind-fn decrypt-fn) tx-data)]
+                (transact-effective (hydrate-transaction-slice get-fn current-cid tx-data
+                                                                blind-fn decrypt-fn opts)
+                                    tx-data)]
             (if (empty? effective-deltas)
               (report current-cid current-cid [] false attempts)
               (let [new-cid (commit! put! get-fn (mapv delta->quad effective-deltas)
@@ -1803,7 +1860,8 @@
                     (js/Promise.reject
                      (ex-info "kotobase-peer: commit-serialized-effective! exceeded max-cas-retries"
                               {:head-key head-key :attempts attempts}))
-                    (-> (hydrate-chain get-fn current-cid blind-fn decrypt-fn)
+                    (-> (hydrate-transaction-slice get-fn current-cid tx-data
+                                                   blind-fn decrypt-fn opts)
                         (.then
                          (fn [db]
                            (let [{:keys [effective-deltas]} (transact-effective db tx-data)]

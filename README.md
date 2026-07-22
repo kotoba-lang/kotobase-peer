@@ -297,6 +297,14 @@ hydration; already-normalized writers can retain the O(tx)
 `commit-serialized!` append path. See
 `bench/results/2026-07-22-persisted-effective-cas.edn`.
 
+The persisted path now uses `hydrate-transaction-slice`: one range-pruned EAVT
+prefix read per distinct transaction subject plus one replay of the bounded
+unfolded novelty set. Unrelated snapshot rows are never hydrated, while
+retract/reassert and retractEntity semantics remain identical to a full replay.
+On cljs, `:async-get-fn` routes these prefixes directly through the asynchronous
+prolly-tree scanner. See
+`bench/results/2026-07-22-persisted-effective-prefix.edn`.
+
 This is currently a behavior-preserving shadow substrate: existing
 `commit!`/`hot-datoms`/`fold!` remain the live path until read equivalence and
 CLJ/CLJS CID determinism gates pass. New storage work must target the
@@ -365,7 +373,7 @@ entirely chain's job. Neither library needed to change.
 ## Test
 
 ```bash
-clojure -M:test              # JVM      -- 179 tests / 462 assertions
+clojure -M:test              # JVM      -- 180 tests / 465 assertions
 npm run test:cljs            # cljs     -- 171 tests / 447 assertions (real shadow-cljs build + node, not nbb)
 ```
 
