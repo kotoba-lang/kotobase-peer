@@ -46,7 +46,7 @@ assert.match(await page.text(), /Kotobase Browser Range Benchmark/);
 const config = await worker.fetch(new Request(`${origin}/e2e/config`), env);
 assert.equal(config.status, 200);
 assert.deepEqual(await config.json(), {
-  bundleCid: "bafyreihps4j4ovl6w2m3xu4eip2433gu5og747dip57xp3ulhrxuldqmxa",
+  bundleCid: "bafyreihmpkqjjekl2uixpxk25dhazq7xg7s4umv3bzausa46jtmhfh6s7m",
   queryKey: "tenant-a/000000500",
 });
 
@@ -59,16 +59,19 @@ const e2eRange = await worker.fetch(new Request(`${origin}/e2e/object`, {
   headers: { Range: "bytes=100-199" },
 }), env);
 assert.equal(e2eRange.status, 206);
-assert.equal(e2eRange.headers.get("content-range"), "bytes 100-199/63250");
+assert.equal(e2eRange.headers.get("content-range"), "bytes 100-199/148676");
 assert.deepEqual(calls.at(-1).options, { range: { offset: 100, length: 100 } });
 
 const e2ePage = await worker.fetch(new Request(`${origin}/e2e`), env);
 assert.equal(e2ePage.status, 200);
 assert.match(await e2ePage.text(), /bundle CID → plan → R2 Range/);
 assert.match(await (await worker.fetch(new Request(`${origin}/e2e`), env)).text(),
-             /view-e2e\.js\?v=rotation-v2/);
+             /view-e2e\.js\?v=join-v3/);
 assert.equal((await worker.fetch(new Request(`${origin}/e2e/encrypted-v1`), env)).status, 200);
 assert.equal((await worker.fetch(new Request(`${origin}/e2e/rotation-v2`), env)).status, 200);
+assert.equal((await worker.fetch(new Request(`${origin}/e2e/join-v1`), env)).status, 200);
+assert.equal((await worker.fetch(new Request(`${origin}/e2e/join-v2`), env)).status, 200);
+assert.equal((await worker.fetch(new Request(`${origin}/e2e/join-v3`), env)).status, 200);
 
 const browserAsset = await worker.fetch(new Request(`${origin}/view-e2e.js`), env);
 assert.equal(await browserAsset.text(), "compiled browser asset");
@@ -103,4 +106,4 @@ const retired = await worker.fetch(new Request(`${origin}/e2e/key?keyId=tenant-a
 }), { ...protectedEnv, E2E_DEK_V1_B64: undefined });
 assert.equal(retired.status, 404);
 
-console.log(JSON.stringify({ tests: 14, assertions: 37, outcome: "succeeded" }));
+console.log(JSON.stringify({ tests: 14, assertions: 40, outcome: "succeeded" }));

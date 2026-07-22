@@ -1,0 +1,31 @@
+{:date "2026-07-22"
+ :target "https://kotobase-view-bench.04-feasts-minded.workers.dev/e2e/join-v3"
+ :worker-version "4fd25146-f4df-448b-a548-11c08e34fda9"
+ :asset-version "join-v3"
+ :backend :cloudflare-r2
+ :browser "Headless Chrome 151"
+ :fixture {:rows 2100
+           :posts 1000 :authors 100 :post-author-edges 1000
+           :pack-cid "bafyreiaj36p4ypvcmwkzortukai6ejvrdqk45ahhokybjiz3qitgqkzyzq"
+           :pack-bytes 148676
+           :bundle-cid "bafyreihmpkqjjekl2uixpxk25dhazq7xg7s4umv3bzausa46jtmhfh6s7m"
+           :bundle-bytes 10114
+           :key-id "tenant-a/dek-v2"}
+ :naive-index-nested-loop
+ {:samples 10 :rows 20 :requests 21 :range-bytes 148786
+  :cold {:p50-ms 229.4 :p95-ms 310.2 :p99-ms 310.2}}
+ :batched-index-range
+ {:samples 10 :rows 20 :deduplicated-keys 20
+  :requests 2 :range-bytes 14912
+  :cold {:p50-ms 93.9 :p95-ms 147.2 :p99-ms 147.2
+         :min-ms 85.7 :max-ms 149.2}
+  :first {"post-id" 450 "author" {"id" 50 "name" "Author 50"}}}
+ :improvement {:request-reduction 0.9048
+               :byte-reduction 0.8998
+               :p50-reduction 0.5907}
+ :security {:encryption "AES-256-GCM"
+            :plaintext-cid-verified? true
+            :key-ids ["tenant-a/dek-v2"]}
+ :http {:data-range-requests 100 :key-requests 1}
+ :console-errors []
+ :outcome :succeeded}

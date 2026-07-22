@@ -99,8 +99,53 @@
               :requests (:estimated-requests plan)
               :range-bytes (:estimated-bytes plan)
               :count (count values)
+              :values values
               :first (first values)
               :last (last values)}))))))
+
+(defn- join-once [bundle keyring sample]
+  (let [started (now)
+        outer-query {:lower "tenant-a/post-author/000000450"
+                     :upper "tenant-a/post-author/000000469"
+                     :limit 20 :expected-count 20 :cache "reload"
+                     :nonce (str "join-outer-" sample "-" (now))}]
+    (-> (query-once bundle keyring outer-query)
+        (.then
+         (fn [outer]
+           (let [edges (:values outer)
+                 author-ids (vec (sort (distinct (map #(get % "author-id") edges))))
+                 author-key #(str "tenant-a/author/" (.padStart (str %) 9 "0"))]
+             (.then
+              (query-once bundle keyring
+                          {:lower (author-key (first author-ids))
+                           :upper (author-key (last author-ids))
+                           :limit (count author-ids)
+                           :expected-count (count author-ids)
+                           :cache "reload"
+                           :nonce (str "join-inner-batch-" sample "-" (now))})
+              (fn [inner]
+                (let [authors (into {} (map (juxt #(get % "id") identity)
+                                            (:values inner)))
+                      joined (mapv (fn [edge]
+                                     {:post-id (get edge "post-id")
+                                      :author (get authors (get edge "author-id"))})
+                                   edges)]
+                  {:ms (- (now) started)
+                   :rows (count joined)
+                   :requests (+ (:requests outer) (:requests inner))
+                   :range-bytes (+ (:range-bytes outer) (:range-bytes inner))
+                   :deduplicated-keys (count author-ids)
+                   :first (first joined)})))))))))
+
+(defn- join-samples [bundle keyring count]
+  (reduce
+   (fn [promise sample]
+     (.then promise
+            (fn [results]
+              (.then (join-once bundle keyring sample)
+                     #(conj results %)))))
+   (js/Promise.resolve [])
+   (range count)))
 
 (defn- sequential-samples [bundle keyring query count cache label]
   (reduce
@@ -159,7 +204,11 @@
              (.then (concurrent-samples bundle keyring point 5 8)
                     #(assoc output :concurrent %))))
           (.then
-           (fn [{:keys [point-cold point-warm range-cold concurrent]}]
+           (fn [output]
+             (.then (join-samples bundle keyring 10)
+                    #(assoc output :joins %))))
+          (.then
+           (fn [{:keys [point-cold point-warm range-cold concurrent joins]}]
              (let [point-template (first point-cold)
                    range-template (first range-cold)
                    concurrency-latencies (mapcat #(map :ms (:queries %)) concurrent)
@@ -178,6 +227,13 @@
                            :concurrent {:batches 5 :concurrency 8
                                         :latency (summary concurrency-latencies)
                                         :batch-wall (summary (map :wall-ms concurrent))}
+                           :join {:kind "batched-index-range"
+                                  :cold (summary (map :ms joins))
+                                  :rows (:rows (first joins))
+                                  :deduplicated-keys (:deduplicated-keys (first joins))
+                                  :requests (:requests (first joins))
+                                  :range-bytes (:range-bytes (first joins))
+                                  :first (:first (first joins))}
                            :encryption "AES-256-GCM"
                            :key-ids (vec (sort (keys keyring)))
                            :total-harness-ms (- (now) started)
@@ -214,7 +270,7 @@
     (-> (js/Promise.all (clj->js promises))
         (.then #(into {} (array-seq %))))))
 
-(defn ^:export run []
+(defn- run-authorized []
   (let [result (.querySelector js/document "#result")
         started (now)
         config-promise (js/fetch "/e2e/config"
@@ -240,3 +296,12 @@
               (set! (.. result -dataset -status) "error")
               (set! (.-textContent result) (str error))
               (.error js/console error)))))
+
+(defn ^:export run []
+  (if (bearer-token)
+    (run-authorized)
+    (let [result (.querySelector js/document "#result")]
+      (set! (.. result -dataset -status) "awaiting-token")
+      (set! (.-textContent result) "awaiting bearer capability")
+      (.addEventListener js/window "hashchange" (fn [_] (run-authorized))
+                         #js {:once true}))))

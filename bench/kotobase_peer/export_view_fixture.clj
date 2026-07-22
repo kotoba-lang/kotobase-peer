@@ -30,10 +30,20 @@
         key-id (when encrypted?
                  (if (= mode "encrypted-v2") "tenant-a/dek-v2" "tenant-a/dek-v1"))
         fixture-key (get fixture-keys key-id)
-        entries (mapv (fn [i]
-                        {:key (str "tenant-a/" (pad i))
-                         :value {"id" i "title" (str "Post " i)}})
-                      (range 1000))
+        entries (vec
+                 (concat
+                  (map (fn [i]
+                         {:key (str "tenant-a/" (pad i))
+                          :value {"id" i "title" (str "Post " i)}})
+                       (range 1000))
+                  (map (fn [i]
+                         {:key (str "tenant-a/author/" (pad i))
+                          :value {"id" i "name" (str "Author " i)}})
+                       (range 100))
+                  (map (fn [i]
+                         {:key (str "tenant-a/post-author/" (pad i))
+                          :value {"post-id" i "author-id" (mod i 100)}})
+                       (range 1000))))
         built (view/build-view (cond-> {:view-id :browser/e2e :epoch 1
                                         :entries entries :sorted? true :block-rows 100}
                                  encrypted? (assoc :key-id key-id
@@ -51,6 +61,7 @@
           :bundle-cid (str (get-in built [:bundle :cid]))
           :bundle-bytes (alength ^bytes (get-in built [:bundle :bytes]))
           :query-key (str "tenant-a/" (pad 500))
+          :join-rows 20
           :encrypted? encrypted?
           :key-id key-id
           :key-b64 (when encrypted?

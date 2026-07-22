@@ -233,6 +233,13 @@ bundle. After the new pack and bundle are published and verified, the old key
 can be revoked without interrupting new queries. The v1→v2 dual-key and revoke
 drill is recorded in `bench/results/2026-07-22-browser-r2-key-rotation.edn`.
 
+The browser join gate uses an encrypted edge view as its outer bounded scan,
+deduplicates the resulting foreign keys, and turns a contiguous lookup batch
+into one inner sparse-index range. For 20 post→author results this reduces the
+naive index nested loop from 21 requests/148,786 bytes to 2 requests/14,912
+bytes while retaining AES-GCM and plaintext CID verification. See
+`bench/results/2026-07-22-browser-r2-batched-join.edn`.
+
 This is currently a behavior-preserving shadow substrate: existing
 `commit!`/`hot-datoms`/`fold!` remain the live path until read equivalence and
 CLJ/CLJS CID determinism gates pass. New storage work must target the
