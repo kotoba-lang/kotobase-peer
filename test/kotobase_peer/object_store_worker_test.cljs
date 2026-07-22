@@ -227,6 +227,8 @@
           resumable-child (ipld/cid resumable-child-bytes)
           checkpoint-bytes (ipld/encode {"spill" (ipld/link resumable-child)})
           checkpoint (ipld/cid checkpoint-bytes)
+          ingress-workload-bytes (ipld/encode {"requests" []})
+          ingress-workload (ipld/cid ingress-workload-bytes)
           orphan-bytes (ipld/encode {"orphan" true})
           orphan (ipld/cid orphan-bytes)
           prefix "test/"
@@ -240,12 +242,19 @@
                                    "expected-head" root-a
                                    "status" "completed"
                                    "checkpoint" (str checkpoint)}))
+                         (str prefix "scheduler/ingress/task/current")
+                         (js/JSON.stringify
+                          (clj->js {"format" "kotobase/resumable-ingress-job"
+                                   "status" "queued"
+                                   "deadline-at" 9007199254740991
+                                   "workload" (str ingress-workload)}))
                          (block-key root-a) root-a-bytes
                          (block-key child-a) child-a-bytes
                          (block-key root-b) root-b-bytes
                          (block-key child-b) child-b-bytes
                          (block-key checkpoint) checkpoint-bytes
                          (block-key resumable-child) resumable-child-bytes
+                         (block-key ingress-workload) ingress-workload-bytes
                          (block-key orphan) orphan-bytes})
           bytes-object (fn [value]
                          #js {:arrayBuffer
@@ -279,7 +288,9 @@
           (.then (fn [audit]
                    (is (= 2 (:heads audit)))
                    (is (= 1 (:resumable-roots audit)))
-                   (is (= 6 (:reachable audit)))
+                   (is (= 1 (:ingress-roots audit)))
+                   (is (= 1 (:active-ingress-roots audit)))
+                   (is (= 7 (:reachable audit)))
                    (is (= 1 (:candidates audit)) "only the orphan is collectible")
                    (is (= 0 (:deleted audit)))
                    (worker/gc-unreachable! env "db-a" 0 true)))
@@ -288,7 +299,7 @@
                    (is (nil? (get @objects (block-key orphan))))
                    (is (every? #(contains? @objects (block-key %))
                                [root-a child-a root-b child-b
-                                checkpoint resumable-child])
+                                checkpoint resumable-child ingress-workload])
                        "other heads and resumable checkpoint graphs survive")
                    (swap! objects assoc
                           (str prefix "scheduler/resumable/db-a/task/current")
@@ -298,18 +309,31 @@
                                     "expected-head" "stale-head"
                                     "status" "completed"
                                     "checkpoint" (str checkpoint)})))
+                   (swap! objects assoc
+                          (str prefix "scheduler/ingress/task/current")
+                          (js/JSON.stringify
+                           (clj->js {"format" "kotobase/resumable-ingress-job"
+                                    "status" "failed"
+                                    "deadline-at" 0
+                                    "workload" (str ingress-workload)})))
                    (worker/gc-unreachable! env "db-a" 0 true)))
           (.then (fn [stale-sweep]
                    (is (= 0 (:active-resumable-roots stale-sweep)))
                    (is (= 1 (:stale-resumable-pointers stale-sweep)))
-                   (is (= 2 (:block-candidates stale-sweep)))
-                   (is (= 1 (:pointer-candidates stale-sweep)))
-                   (is (= 3 (:deleted stale-sweep)))
+                   (is (= 0 (:active-ingress-roots stale-sweep)))
+                   (is (= 1 (:stale-ingress-pointers stale-sweep)))
+                   (is (= 3 (:block-candidates stale-sweep)))
+                   (is (= 2 (:pointer-candidates stale-sweep)))
+                   (is (= 5 (:deleted stale-sweep)))
                    (is (nil? (get @objects
                                   (str prefix
                                        "scheduler/resumable/db-a/task/current"))))
                    (is (nil? (get @objects (block-key checkpoint))))
                    (is (nil? (get @objects (block-key resumable-child))))
+                   (is (nil? (get @objects (block-key ingress-workload))))
+                   (is (nil? (get @objects
+                                  (str prefix
+                                       "scheduler/ingress/task/current"))))
                    (swap! objects assoc (block-key orphan) orphan-bytes)
                    (let [head-list-calls (atom 0)
                          fenced-bucket

@@ -1248,19 +1248,55 @@
                       (sort-by :key)
                       vec))))))
 
+(defn- all-r2-ingress-roots! [e bucket]
+  (let [fetch-job
+        (fn [object]
+          (let [key (gobj/get object "key")]
+            (-> (.get bucket key)
+                (.then
+                 (fn [stored]
+                   (when stored
+                     (-> (.text stored)
+                         (.then
+                          (fn [value]
+                            (let [job (js->clj (js/JSON.parse value))]
+                              (when-let [workload (get job "workload")]
+                                {:key key
+                                 :etag (gobj/get stored "etag")
+                                 :uploaded-ms
+                                 (some-> (gobj/get object "uploaded") .getTime)
+                                 :status (get job "status")
+                                 :deadline-at (get job "deadline-at")
+                                 :workload workload})))))))))))]
+    (-> (list-r2-blocks! bucket (str (prefix e) "scheduler/ingress/"))
+        (.then
+         (fn [objects]
+           (let [jobs (filterv #(str/ends-with? (gobj/get % "key") "/current")
+                               objects)]
+             (if (seq jobs)
+               (js/Promise.all (clj->js (mapv fetch-job jobs)))
+               (js/Promise.resolve #js [])))))
+        (.then (fn [roots]
+                 (->> (array-seq roots)
+                      (remove nil?)
+                      (sort-by :key)
+                      vec))))))
+
 (defn- gc-root-snapshot! [e bucket]
   (-> (js/Promise.all #js [(all-r2-heads! e bucket)
                            (all-r2-retention-roots! e bucket)
-                           (all-r2-resumable-roots! e bucket)])
+                           (all-r2-resumable-roots! e bucket)
+                           (all-r2-ingress-roots! e bucket)])
       (.then (fn [values]
                {:heads (aget values 0)
                 :roots (aget values 1)
-                :resumable-roots (aget values 2)}))
+                :resumable-roots (aget values 2)
+                :ingress-roots (aget values 3)}))
       (.catch (fn [error]
                 (js/Promise.reject
                  (js/Error. (str "GC root snapshot failed: " error)))))))
 
-(defn- gc-audit! [e bucket {:keys [heads roots resumable-roots]}
+(defn- gc-audit! [e bucket {:keys [heads roots resumable-roots ingress-roots]}
                   grace-ms now-ms]
   (let [head-by-key (into {} (map (juxt :key :value)) heads)
         active-resumable-roots
@@ -1270,13 +1306,25 @@
                            (get head-by-key (head-key e db-id)))))
                  resumable-roots)
         active-roots (filterv #(retention/active? (:root %) now-ms) roots)
+        active-ingress-roots
+        (filterv (fn [{:keys [status deadline-at]}]
+                   (and (contains? #{"queued" "running"} status)
+                        (> (or deadline-at 0) now-ms)))
+                 ingress-roots)
         root-cids (concat (map :value heads)
                           (map #(get-in % [:root "manifest-cid"]) active-roots)
-                          (map :checkpoint active-resumable-roots))
+                          (map :checkpoint active-resumable-roots)
+                          (map :workload active-ingress-roots))
         cutoff (- now-ms grace-ms)
         stale-resumable-pointer-keys
         (->> resumable-roots
              (remove (set active-resumable-roots))
+             (filter (fn [{:keys [uploaded-ms]}]
+                       (and uploaded-ms (< uploaded-ms cutoff))))
+             (mapv :key))
+        stale-ingress-pointer-keys
+        (->> ingress-roots
+             (remove (set active-ingress-roots))
              (filter (fn [{:keys [uploaded-ms]}]
                        (and uploaded-ms (< uploaded-ms cutoff))))
              (mapv :key))]
@@ -1304,14 +1352,21 @@
               :resumable-roots (count resumable-roots)
               :active-resumable-roots (count active-resumable-roots)
               :stale-resumable-pointers (count stale-resumable-pointer-keys)
+              :ingress-roots (count ingress-roots)
+              :active-ingress-roots (count active-ingress-roots)
+              :stale-ingress-pointers (count stale-ingress-pointer-keys)
               :retention-roots (count roots)
               :active-retention-roots (count active-roots)
               :safe-epoch (retention/minimum-safe-epoch (mapv :root roots) now-ms)
-              :candidate-keys (into candidates stale-resumable-pointer-keys)
+              :candidate-keys (into candidates
+                                    (concat stale-resumable-pointer-keys
+                                            stale-ingress-pointer-keys))
               :block-candidates (count candidates)
-              :pointer-candidates (count stale-resumable-pointer-keys)
+              :pointer-candidates (+ (count stale-resumable-pointer-keys)
+                                     (count stale-ingress-pointer-keys))
               :candidates (+ (count candidates)
-                             (count stale-resumable-pointer-keys))})))
+                             (count stale-resumable-pointer-keys)
+                             (count stale-ingress-pointer-keys))})))
         (.catch (fn [error]
                   (js/Promise.reject
                    (js/Error. (str "GC mark audit failed: " error))))))))
@@ -1321,7 +1376,9 @@
   and every active retention root. A resumable pointer is active only while
   its expected head is still the current head for its database; stale or
   explicitly released pointers are swept after the same grace period and
-  two-snapshot fence as unreachable blocks. It then optionally sweeps shared
+  two-snapshot fence as unreachable blocks. Queued/running ingress driver
+  workloads remain roots through their deadline; failed/expired job pointers
+  follow the same fenced sweep. It then optionally sweeps shared
   blocks older than GRACE-MS. Leased reader and
   replication roots expire at NOW-MS; legal-hold and release roots remain until
   CAS-released. A second complete head/root ETag snapshot fences detected
