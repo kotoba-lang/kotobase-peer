@@ -51,6 +51,7 @@
             [arrangement.datalog :as datalog]
             [chain.core :as cd]
             [datom.core :as dc]
+            [kotobase-peer.transactor :as transactor]
             [kotobase-peer.statistics :as stats]))   ; canonical datom model (kotoba : kotobase = Clojure : Datomic)
 
 (defn- verified-node [get-fn expected-cid]
@@ -1389,6 +1390,33 @@
                                                 {:chain-cid-before current-cid :chain-cid-after new-cid :tx-data quads}
                                                 (attempt actual (inc attempts)))))))))))]
           (attempt expected-chain-cid 0))))))
+
+(defn commit-serialized-batch!
+  "Publish one `transactor/plan-head-batches` item as one chain commit and one
+  HeadCAS, then return acknowledgements for every coalesced logical request.
+  The batch must target HEAD-KEY; batching never crosses mutable heads. Like
+  `commit-serialized!`, TX-DATA must already be normalized. REQUEST-ID is an
+  acknowledgement correlation id, not a durable exactly-once ledger; an ingress
+  retry protocol must deduplicate before planning or use the effective path."
+  ([put! get-fn cas! head-key expected-chain-cid batch encrypt-fn]
+   (commit-serialized-batch! put! get-fn cas! head-key expected-chain-cid
+                             batch encrypt-fn default-max-cas-retries))
+  ([put! get-fn cas! head-key expected-chain-cid batch encrypt-fn max-retries]
+   (let [batch (transactor/validate-batch batch)]
+     (when-not (= head-key (:head-key batch))
+       (throw (ex-info "Transactor batch/head mismatch"
+                       {:head-key head-key :batch-head (:head-key batch)})))
+     #?(:clj
+        (transactor/batch-receipt
+         batch
+         (commit-serialized-with-report! put! get-fn cas! head-key
+                                         expected-chain-cid (:tx-data batch)
+                                         encrypt-fn max-retries))
+        :cljs
+        (-> (commit-serialized-with-report! put! get-fn cas! head-key
+                                            expected-chain-cid (:tx-data batch)
+                                            encrypt-fn max-retries)
+            (.then #(transactor/batch-receipt batch %)))))))
 
 (defn novelty-size
   "How many not-yet-folded tx blocks sit on `chain-cid`'s current state —

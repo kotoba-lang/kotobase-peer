@@ -146,6 +146,20 @@ assert.equal(casResult.finalHead, 4);
 assert.equal(casResult.lostUpdates, 0);
 assert.equal(casObjects.size, 0, "benchmark objects and head are deleted in finally");
 
+const batchResponse = await worker.fetch(new Request(
+  `${origin}/bench/write-batch?samples=8&batchSize=2&shards=2`,
+  {method: "POST", headers: {Authorization: "Bearer cas-capability"}}), casEnv);
+assert.equal(batchResponse.status, 200);
+const batchResult = await batchResponse.json();
+assert.deepEqual({samples: batchResult.samples, batches: batchResult.batches,
+                  batchSize: batchResult.batchSize, shards: batchResult.shards,
+                  finalWrites: batchResult.finalWrites,
+                  lostUpdates: batchResult.lostUpdates,
+                  casPerLogicalWrite: batchResult.casPerLogicalWrite},
+                 {samples: 8, batches: 4, batchSize: 2, shards: 2,
+                  finalWrites: 8, lostUpdates: 0, casPerLogicalWrite: 0.5});
+assert.equal(casObjects.size, 0, "batched transactor objects and heads are deleted");
+
 const gcObjects = new Map();
 let gcVersion = 0;
 const gcEnv = {E2E_BEARER_TOKEN: "gc-capability", MERKLE_BUCKET: {
@@ -210,4 +224,4 @@ assert.deepEqual({firstClaimed: schedulerResult.firstClaimed,
                   finalOwner: "murakumo-b", finalStatus: "completed"});
 assert.equal(gcObjects.size, 0, "scheduler drill objects are deleted in finally");
 
-console.log(JSON.stringify({ tests: 19, assertions: 58, outcome: "succeeded" }));
+console.log(JSON.stringify({ tests: 20, assertions: 61, outcome: "succeeded" }));

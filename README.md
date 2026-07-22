@@ -372,6 +372,23 @@ single-head contention result is intentionally not hidden: p50 was 293 ms,
 must shard heads or batch through a transactor. See
 `bench/results/2026-07-22-r2-head-cas-write.edn`.
 
+`kotobase-peer.transactor/plan-head-batches` is the provider-neutral hot-head
+boundary. It preserves request order within each actor/tenant head, coalesces
+bounded request/datom groups into one canonical transaction, and never batches
+across heads. `execution-waves` runs at most one batch per head while allowing
+independent heads in parallel; `commit-serialized-batch!` publishes one planned
+batch with one HeadCAS and returns acknowledgements for every logical request.
+Request IDs correlate acknowledgements; they are not silently treated as a
+second storage model or an exactly-once ledger. Production ingress must durably
+deduplicate retries before planning (or normalize them through the effective
+datom path).
+The R2 host drill is Bearer-protected, uses a unique prefix, and cleans every
+head/block in `finally`. For 32 logical writes, the previous concurrent
+single-head baseline needed 508 CAS attempts and 10,717 ms. Eight actor/tenant
+heads with four writes per batch needed 8 attempts, lost no writes, and took
+515 ms (62.14 logical writes/s): 63.5x fewer CAS attempts and 20.8x lower wall
+time. See `bench/results/2026-07-23-r2-batched-sharded-write.edn`.
+
 This is currently a behavior-preserving shadow substrate: existing
 `commit!`/`hot-datoms`/`fold!` remain the live path until read equivalence and
 CLJ/CLJS CID determinism gates pass. New storage work must target the
