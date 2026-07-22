@@ -135,7 +135,7 @@
 ;; ============================================================================
 
 (defn gc-live-cids
-  "M4: Collect all CIDs reachable from a manifest.
+  "M4: Collect all CIDs reachable from a manifest and supplied previous manifests.
 
    Walks:
    - Manifest's CID itself
@@ -144,7 +144,7 @@
    - Values within statistics (may contain IPLD Links)
 
    Returns set of live CID strings."
-  [manifest]
+  [manifest & previous-manifests]
   (let [cids (atom #{})
         ;; Normalize CID to string format, handling both Link objects and raw strings
         normalize-cid (fn [c]
@@ -169,8 +169,8 @@
                            (doseq [run-ref runs]
                              (visit-run-ref run-ref)))))
 
-        visit-node (fn [node]
-                    (add-cid! (:cid manifest))
+        visit-node (fn [node m]
+                    (add-cid! (:cid m))
                     (when-let [prev-link (get node "previous")]
                       (add-cid! prev-link))
                     (when-let [indexes (get node "indexes")]
@@ -178,7 +178,10 @@
                     (when-let [stats (get node "statistics")]
                       (doseq [v (vals stats)]
                         (swap! cids into (lsm/linked-cids v)))))]
-    (visit-node (:node manifest))
+    (visit-node (:node manifest) manifest)
+    (doseq [previous-manifest previous-manifests]
+      (when previous-manifest
+        (visit-node (:node previous-manifest) previous-manifest)))
     @cids))
 
 (defn gc-candidates
@@ -189,8 +192,8 @@
 
    In production, host would iterate through manifest chain (old → new)
    and mark blocks as live before GC sweep."
-  [current-manifest all-stored-cids]
-  (let [live-from-manifest (gc-live-cids current-manifest)]
+  [current-manifest all-stored-cids & previous-manifests]
+  (let [live-from-manifest (apply gc-live-cids current-manifest previous-manifests)]
     (set/difference all-stored-cids live-from-manifest)))
 
 ;; ============================================================================

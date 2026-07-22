@@ -45,10 +45,8 @@
                       :previous (:cid manifest-1)})
 
           all-cids #{(:cid run-1) (:cid run-2) (:cid manifest-1) (:cid manifest-2) "orphan-cid"}
-          candidates (compaction/gc-candidates manifest-2 all-cids)]
-      ;; Pure marking sees direct links only; recursive host GC resolves the
-      ;; previous manifest before deciding whether run-1 remains live.
-      (is (= #{(:cid run-1) "orphan-cid"} candidates)))))
+          candidates (compaction/gc-candidates manifest-2 all-cids manifest-1)]
+      (is (= #{"orphan-cid"} candidates)))))
 
 (deftest m4-safe-epoch-pin-prevents-gc
   (testing "minimum-safe-epoch should consider all reader and replica epochs"

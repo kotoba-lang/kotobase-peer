@@ -37,20 +37,29 @@
                                        0.0)}))
 
 (defn build-index-statistics
-  "M5: Build histograms for all indexes in a manifest.
+  "M5: Build histograms for all indexes in a manifest. Full run objects
+   produce prefix histograms; persisted run refs fall back to their counts.
 
    Returns map: {:eavt {...} :aevt {...} :avet {...} :vaet {...}}"
   [manifest]
-  (let [indexes-map (get (:node manifest) "indexes")]
+  (let [indexes-map (get (:node manifest) "indexes")
+        epoch (:epoch manifest)]
     (into {}
           (map (fn [[index-name levels]]
                  (let [index (keyword index-name)
                        refs (mapcat val levels)
-                       cardinality (reduce + (map #(get % "count" 0) refs))]
-                   [index {:index index
-                           :full-cardinality cardinality
-                           :prefix-cardinalities {}
-                           :average-cardinality-per-prefix 0.0}]))
+                       rows (->> refs
+                                 (mapcat #(if-let [node (:node %)]
+                                            (get node "rows") []))
+                                 (filter #(<= (get % "epoch") epoch))
+                                 vec)]
+                   (if (seq rows)
+                     [index (build-cardinality-histogram index rows)]
+                     (let [cardinality (reduce + (map #(get % "count" 0) refs))]
+                       [index {:index index
+                               :full-cardinality cardinality
+                               :prefix-cardinalities {}
+                               :average-cardinality-per-prefix 0.0}]))))
                indexes-map))))
 
 ;; ============================================================================
