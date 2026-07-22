@@ -131,24 +131,38 @@
                               (get run-ref "blocks")))
           root-key (str "paged/blocks/" (ipld/link-cid (get run-ref "cid")))
           gets (atom [])
+          track-concurrency? (atom false)
+          active-data-gets (atom 0)
+          max-data-gets (atom 0)
           bucket
           #js {:get
                (fn [key]
                  (swap! gets conj key)
                  (let [value (if (= key "paged/heads/db-blocks")
-                               head-cid (get blocks key))]
-                   (js/Promise.resolve
-                    (when value
-                      #js {:etag "stable"
-                           :text (fn [] (js/Promise.resolve value))
-                           :arrayBuffer
+                               head-cid (get blocks key))
+                       response
+                       (when value
+                         #js {:etag "stable"
+                              :text (fn [] (js/Promise.resolve value))
+                              :arrayBuffer
+                              (fn []
+                                (js/Promise.resolve
+                                 (if (string? value)
+                                   (.-buffer (.encode (js/TextEncoder.) value))
+                                   (.slice (.-buffer value) (.-byteOffset value)
+                                           (+ (.-byteOffset value)
+                                              (.-byteLength value))))))})]
+                   (if (and @track-concurrency? (contains? data-cids key))
+                     (js/Promise.
+                      (fn [resolve _]
+                        (let [active (swap! active-data-gets inc)]
+                          (swap! max-data-gets max active)
+                          (js/setTimeout
                            (fn []
-                             (js/Promise.resolve
-                              (if (string? value)
-                                (.-buffer (.encode (js/TextEncoder.) value))
-                                (.slice (.-buffer value) (.-byteOffset value)
-                                        (+ (.-byteOffset value)
-                                           (.-byteLength value))))))}))))}
+                             (swap! active-data-gets dec)
+                             (resolve response))
+                           1))))
+                     (js/Promise.resolve response))))}
           env #js {"MERKLE_BUCKET" bucket "MERKLE_S3_PREFIX" "paged"}]
       (letfn [(step [after rows scanned]
                 (-> (worker/find-index-prefix-page!
@@ -162,6 +176,8 @@
                            (do
                              (is (= 300 (count next-rows)))
                              (is (= [1 2 1 2 1] next-scanned))
+                             (is (= 2 @max-data-gets)
+                                 "a cursor inside a block overlaps its successor GET")
                              (is (not-any? #{root-key} @gets)
                                  "manifest block descriptors bypass the run root")
                              (is (= 7 (count (filter data-cids @gets)))
@@ -177,6 +193,7 @@
                (is (some #{root-key} @gets)
                    "the full reader validates the run root")
                (reset! gets [])
+               (reset! track-concurrency? true)
                (step nil [] [])))
             (.catch (fn [error]
                       (is false (str "subblock prefix page rejected: " error))
