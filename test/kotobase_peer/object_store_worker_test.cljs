@@ -236,6 +236,9 @@
                          (str prefix "scheduler/resumable/db-a/task/current")
                          (js/JSON.stringify
                           (clj->js {"format" "kotobase/resumable-pointer"
+                                   "db-id" "db-a"
+                                   "expected-head" root-a
+                                   "status" "completed"
                                    "checkpoint" (str checkpoint)}))
                          (block-key root-a) root-a-bytes
                          (block-key child-a) child-a-bytes
@@ -286,6 +289,26 @@
                                [root-a child-a root-b child-b
                                 checkpoint resumable-child])
                        "other heads and resumable checkpoint graphs survive")
+                   (swap! objects assoc
+                          (str prefix "scheduler/resumable/db-a/task/current")
+                          (js/JSON.stringify
+                           (clj->js {"format" "kotobase/resumable-pointer"
+                                    "db-id" "db-a"
+                                    "expected-head" "stale-head"
+                                    "status" "completed"
+                                    "checkpoint" (str checkpoint)})))
+                   (worker/gc-unreachable! env "db-a" 0 true)))
+          (.then (fn [stale-sweep]
+                   (is (= 0 (:active-resumable-roots stale-sweep)))
+                   (is (= 1 (:stale-resumable-pointers stale-sweep)))
+                   (is (= 2 (:block-candidates stale-sweep)))
+                   (is (= 1 (:pointer-candidates stale-sweep)))
+                   (is (= 3 (:deleted stale-sweep)))
+                   (is (nil? (get @objects
+                                  (str prefix
+                                       "scheduler/resumable/db-a/task/current"))))
+                   (is (nil? (get @objects (block-key checkpoint))))
+                   (is (nil? (get @objects (block-key resumable-child))))
                    (swap! objects assoc (block-key orphan) orphan-bytes)
                    (let [head-list-calls (atom 0)
                          fenced-bucket

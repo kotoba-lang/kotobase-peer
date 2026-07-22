@@ -1227,6 +1227,10 @@
                               (when-let [checkpoint (get pointer "checkpoint")]
                                 {:key key
                                  :etag (gobj/get stored "etag")
+                                 :uploaded (gobj/get object "uploaded")
+                                 :db-id (get pointer "db-id")
+                                 :expected-head (get pointer "expected-head")
+                                 :status (get pointer "status")
                                  :checkpoint checkpoint})))))))))))]
     (-> (list-r2-blocks! bucket (str (prefix e) "scheduler/resumable/"))
         (.then
@@ -1257,10 +1261,24 @@
 
 (defn- gc-audit! [e bucket {:keys [heads roots resumable-roots]}
                   grace-ms now-ms]
-  (let [active-roots (filterv #(retention/active? (:root %) now-ms) roots)
+  (let [head-by-key (into {} (map (juxt :key :value)) heads)
+        active-resumable-roots
+        (filterv (fn [{:keys [db-id expected-head status]}]
+                   (and (contains? #{"running" "completed"} status)
+                        (= expected-head
+                           (get head-by-key (head-key e db-id)))))
+                 resumable-roots)
+        active-roots (filterv #(retention/active? (:root %) now-ms) roots)
         root-cids (concat (map :value heads)
                           (map #(get-in % [:root "manifest-cid"]) active-roots)
-                          (map :checkpoint resumable-roots))]
+                          (map :checkpoint active-resumable-roots))
+        cutoff (- now-ms grace-ms)
+        stale-resumable-pointer-keys
+        (->> resumable-roots
+             (remove (set active-resumable-roots))
+             (filter (fn [{:keys [uploaded]}]
+                       (and uploaded (< (.getTime uploaded) cutoff))))
+             (mapv :key))]
     (-> (js/Promise.all
          #js [(-> (js/Promise.all
                     (clj->js (map #(reachable-cids! e %) root-cids)))
@@ -1269,7 +1287,6 @@
         (.then
          (fn [result]
            (let [reachable (aget result 0)
-                 cutoff (- now-ms grace-ms)
                  candidates
                  (->> (aget result 1)
                       (filter
@@ -1284,18 +1301,26 @@
              {:reachable (count reachable)
               :heads (count heads)
               :resumable-roots (count resumable-roots)
+              :active-resumable-roots (count active-resumable-roots)
+              :stale-resumable-pointers (count stale-resumable-pointer-keys)
               :retention-roots (count roots)
               :active-retention-roots (count active-roots)
               :safe-epoch (retention/minimum-safe-epoch (mapv :root roots) now-ms)
-              :candidate-keys candidates
-              :candidates (count candidates)})))
+              :candidate-keys (into candidates stale-resumable-pointer-keys)
+              :block-candidates (count candidates)
+              :pointer-candidates (count stale-resumable-pointer-keys)
+              :candidates (+ (count candidates)
+                             (count stale-resumable-pointer-keys))})))
         (.catch (fn [error]
                   (js/Promise.reject
                    (js/Error. (str "GC mark audit failed: " error))))))))
 
 (defn gc-unreachable!
   "Globally mark from every mutable R2 head, resumable execution checkpoint,
-  and every active retention root,
+  and every active retention root. A resumable pointer is active only while
+  its expected head is still the current head for its database; stale or
+  explicitly released pointers are swept after the same grace period and
+  two-snapshot fence as unreachable blocks,
   then optionally sweep shared blocks older than GRACE-MS. Leased reader and
   replication roots expire at NOW-MS; legal-hold and release roots remain until
   CAS-released. A second complete head/root ETag snapshot fences detected
