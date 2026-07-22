@@ -286,6 +286,17 @@
                 :entries [{:key "c" :value 3} {:key "d" :value 4}]})
         composed (view/compose-view-segments
                   {:view-id :feed :epoch 9 :segments [left right]})
+        metadata-composed
+        (view/compose-view-segments
+         {:view-id :feed :epoch 9
+          :segments [(-> left
+                         (dissoc :pack-bytes :effects)
+                         (assoc :pack-byte-count
+                                (get-in left [:bundle :node "pack-bytes"])))
+                     (-> right
+                         (dissoc :pack-bytes :effects)
+                         (assoc :pack-byte-count
+                                (get-in right [:bundle :node "pack-bytes"])))]})
         bundle (get-in composed [:bundle :node])
         plan (view/range-query-plan
               {:bundle bundle :lower "a" :upper "d"})
@@ -300,6 +311,8 @@
     (is (= 2 (get bundle "segment-count")))
     (is (nil? (get bundle "pack-cid")))
     (is (= 4 (count (get bundle "blocks"))))
+    (is (= (get bundle "pack-bytes")
+           (get-in metadata-composed [:bundle :node "pack-bytes"])))
     (is (= 2 (:estimated-requests plan))
         "adjacent blocks coalesce only within the same physical pack")
     (is (= #{(str (:pack-cid left)) (str (:pack-cid right))}

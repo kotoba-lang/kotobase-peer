@@ -320,8 +320,12 @@
                   "segmented" true
                   "segment-count" (count segments)
                   "count" (reduce + (map :count segments))
-                  "pack-bytes" (reduce + (map #(byte-count (:pack-bytes %))
-                                               segments))
+                  "pack-bytes"
+                  (reduce +
+                          (map #(or (:pack-byte-count %)
+                                    (some-> (:pack-bytes %) byte-count)
+                                    (get-in % [:bundle :node "pack-bytes"]))
+                               segments))
                   "blocks" blocks}
                    source-manifest
                    (assoc "source-manifest" (ipld/link source-manifest))

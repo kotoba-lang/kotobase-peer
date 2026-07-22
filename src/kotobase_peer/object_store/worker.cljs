@@ -1212,20 +1212,55 @@
                     (sort-by :key)
                     vec)))))
 
+(defn- all-r2-resumable-roots! [e bucket]
+  (let [fetch-pointer
+        (fn [object]
+          (let [key (gobj/get object "key")]
+            (-> (.get bucket key)
+                (.then
+                 (fn [stored]
+                   (when stored
+                     (-> (.text stored)
+                         (.then
+                          (fn [value]
+                            (let [pointer (js->clj (js/JSON.parse value))]
+                              (when-let [checkpoint (get pointer "checkpoint")]
+                                {:key key
+                                 :etag (gobj/get stored "etag")
+                                 :checkpoint checkpoint})))))))))))]
+    (-> (list-r2-blocks! bucket (str (prefix e) "scheduler/resumable/"))
+        (.then
+         (fn [objects]
+           (let [pointers
+                 (filterv #(str/ends-with? (gobj/get % "key") "/current")
+                          objects)]
+             (if (seq pointers)
+               (js/Promise.all (clj->js (mapv fetch-pointer pointers)))
+               (js/Promise.resolve #js [])))))
+        (.then (fn [roots]
+                 (->> (array-seq roots)
+                      (remove nil?)
+                      (sort-by :key)
+                      vec))))))
+
 (defn- gc-root-snapshot! [e bucket]
   (-> (js/Promise.all #js [(all-r2-heads! e bucket)
-                           (all-r2-retention-roots! e bucket)])
+                           (all-r2-retention-roots! e bucket)
+                           (all-r2-resumable-roots! e bucket)])
       (.then (fn [values]
                {:heads (aget values 0)
-                :roots (aget values 1)}))
+                :roots (aget values 1)
+                :resumable-roots (aget values 2)}))
       (.catch (fn [error]
                 (js/Promise.reject
                  (js/Error. (str "GC root snapshot failed: " error)))))))
 
-(defn- gc-audit! [e bucket {:keys [heads roots]} grace-ms now-ms]
+(defn- gc-audit! [e bucket {:keys [heads roots resumable-roots]}
+                  grace-ms now-ms]
   (let [active-roots (filterv #(retention/active? (:root %) now-ms) roots)
         root-cids (concat (map :value heads)
-                          (map #(get-in % [:root "manifest-cid"]) active-roots))]
+                          (map #(get-in % [:root "manifest-cid"]) active-roots)
+                          (map :checkpoint resumable-roots))]
     (-> (js/Promise.all
          #js [(-> (js/Promise.all
                     (clj->js (map #(reachable-cids! e %) root-cids)))
@@ -1248,6 +1283,7 @@
                       (mapv #(gobj/get % "key")))]
              {:reachable (count reachable)
               :heads (count heads)
+              :resumable-roots (count resumable-roots)
               :retention-roots (count roots)
               :active-retention-roots (count active-roots)
               :safe-epoch (retention/minimum-safe-epoch (mapv :root roots) now-ms)
@@ -1258,7 +1294,8 @@
                    (js/Error. (str "GC mark audit failed: " error))))))))
 
 (defn gc-unreachable!
-  "Globally mark from every mutable R2 head and every active retention root,
+  "Globally mark from every mutable R2 head, resumable execution checkpoint,
+  and every active retention root,
   then optionally sweep shared blocks older than GRACE-MS. Leased reader and
   replication roots expire at NOW-MS; legal-hold and release roots remain until
   CAS-released. A second complete head/root ETag snapshot fences detected

@@ -223,16 +223,26 @@
           child-b (ipld/cid child-b-bytes)
           root-b-bytes (ipld/encode {"child" (ipld/link child-b)})
           root-b (ipld/cid root-b-bytes)
+          resumable-child-bytes (ipld/encode {"value" "resume"})
+          resumable-child (ipld/cid resumable-child-bytes)
+          checkpoint-bytes (ipld/encode {"spill" (ipld/link resumable-child)})
+          checkpoint (ipld/cid checkpoint-bytes)
           orphan-bytes (ipld/encode {"orphan" true})
           orphan (ipld/cid orphan-bytes)
           prefix "test/"
           block-key #(str prefix "blocks/" %)
           objects (atom {(str prefix "heads/db-a") root-a
                          (str prefix "heads/db-b") root-b
+                         (str prefix "scheduler/resumable/db-a/task/current")
+                         (js/JSON.stringify
+                          (clj->js {"format" "kotobase/resumable-pointer"
+                                   "checkpoint" (str checkpoint)}))
                          (block-key root-a) root-a-bytes
                          (block-key child-a) child-a-bytes
                          (block-key root-b) root-b-bytes
                          (block-key child-b) child-b-bytes
+                         (block-key checkpoint) checkpoint-bytes
+                         (block-key resumable-child) resumable-child-bytes
                          (block-key orphan) orphan-bytes})
           old-date (js/Date. 0)
           bytes-object (fn [value]
@@ -264,7 +274,8 @@
       (-> (worker/gc-unreachable! env "db-a" 0 false)
           (.then (fn [audit]
                    (is (= 2 (:heads audit)))
-                   (is (= 4 (:reachable audit)))
+                   (is (= 1 (:resumable-roots audit)))
+                   (is (= 6 (:reachable audit)))
                    (is (= 1 (:candidates audit)) "only the orphan is collectible")
                    (is (= 0 (:deleted audit)))
                    (worker/gc-unreachable! env "db-a" 0 true)))
@@ -272,8 +283,9 @@
                    (is (= 1 (:deleted sweep)))
                    (is (nil? (get @objects (block-key orphan))))
                    (is (every? #(contains? @objects (block-key %))
-                               [root-a child-a root-b child-b])
-                       "blocks reachable only from the other database head survive")
+                               [root-a child-a root-b child-b
+                                checkpoint resumable-child])
+                       "other heads and resumable checkpoint graphs survive")
                    (swap! objects assoc (block-key orphan) orphan-bytes)
                    (let [head-list-calls (atom 0)
                          fenced-bucket
