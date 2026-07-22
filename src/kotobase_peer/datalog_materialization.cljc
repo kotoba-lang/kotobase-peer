@@ -8,10 +8,10 @@
             [kotobase-peer.merkle-lsm :as lsm]
             [kotobase-peer.statistics :as statistics]))
 
-(defn- datalog-var? [value]
+(defn datalog-var? [value]
   (and (symbol? value) (str/starts-with? (name value) "?")))
 
-(defn- simple-query? [query]
+(defn positive-conjunctive-query? [query]
   (and (not (:rules query))
        (every? #(and (vector? %) (= 3 (count %))) (:where query))
        (every? datalog-var? (:find query))))
@@ -21,9 +21,9 @@
   Multi-clause queries need an arrangement/frontier loader and must not use
   this shortcut merely because their final result is small."
   [query]
-  (and (simple-query? query) (= 1 (count (:where query)))))
+  (and (positive-conjunctive-query? query) (= 1 (count (:where query)))))
 
-(defn- change-bindings
+(defn change-bindings
   "Unify one effective datom delta with a positive triple clause."
   [clause {:keys [e a v]}]
   (reduce
@@ -38,6 +38,90 @@
        :else (reduced nil)))
    {}
    (map vector clause [e a v])))
+
+(defn change-frontier-seeds
+  "Return distinct bindings produced by anchoring CHANGES to QUERY clauses."
+  [query changes]
+  (when-not (positive-conjunctive-query? query)
+    (throw (ex-info "Join frontier requires positive conjunctive Datalog" {})))
+  (->> changes
+       (mapcat (fn [change]
+                 (keep #(change-bindings % change) (:where query))))
+       distinct vec))
+
+(defn- resolved-term [bindings term]
+  (cond
+    (= term '_) ::unbound
+    (datalog-var? term) (if (contains? bindings term)
+                          (get bindings term) ::unbound)
+    :else term))
+
+(defn clause-lookup
+  "Choose an index/component prefix for CLAUSE under BINDINGS. Nil means the
+  clause cannot be read without an unbounded all-datom scan."
+  [clause bindings]
+  (let [[e-term a-term v-term] clause
+        e (resolved-term bindings e-term)
+        a (resolved-term bindings a-term)
+        v (resolved-term bindings v-term)
+        bound? #(not= ::unbound %)]
+    (cond
+      (bound? e)
+      {:index :eavt
+       :components (cond-> [e] (bound? a) (conj a) (and (bound? a) (bound? v)) (conj v))}
+
+      (and (bound? a) (bound? v))
+      {:index :avet
+       :components (cond-> [a v] (bound? e) (conj e))}
+
+      (bound? a)
+      {:index :aevt :components [a]}
+
+      :else nil)))
+
+(defn unify-datom
+  "Extend BINDINGS when EAV matches CLAUSE, otherwise return nil."
+  [clause bindings [e a v]]
+  (reduce
+   (fn [result [term actual]]
+     (cond
+       (= term '_) result
+       (datalog-var? term)
+       (if (and (contains? result term) (not= (get result term) actual))
+         (reduced nil) (assoc result term actual))
+       (= term actual) result
+       :else (reduced nil)))
+   bindings (map vector clause [e a v])))
+
+(defn frontier-next-bindings
+  "Join one frontier state against already MVCC-visible EAV datoms."
+  [clause bindings datoms]
+  (->> datoms (keep #(unify-datom clause bindings %)) distinct vec))
+
+(defn frontier-step-plan
+  "Choose the most selective lookupable remaining clause for every current
+  binding. Returns nil when the frontier would require an all-datom scan."
+  [query remaining-clause-indexes bindings]
+  (let [clauses (vec (:where query))
+        rank {:eavt 0 :avet 1 :aevt 2}
+        candidates
+        (keep
+         (fn [clause-index]
+           (let [clause (nth clauses clause-index)
+                 lookups (mapv #(clause-lookup clause %) bindings)]
+             (when (every? some? lookups)
+               {:clause-index clause-index :clause clause
+                :lookups (mapv (fn [binding lookup]
+                                 {:bindings binding :lookup lookup})
+                               bindings lookups)
+                :score [(apply max (map #(get rank (:index %) 9) lookups))
+                        (- (apply min (map #(count (:components %)) lookups)))
+                        clause-index]})))
+         remaining-clause-indexes)]
+    (when-let [selected (first (sort-by :score candidates))]
+      (assoc selected :remaining
+             (vec (remove #{(:clause-index selected)}
+                          remaining-clause-indexes))))))
 
 (defn- query-with-bindings
   [db query visible? inputs bindings]
@@ -74,7 +158,7 @@
   they do not need to contain unrelated entities."
   [{:keys [db-before db-after query visible? inputs effective-deltas]
     :or {inputs []}}]
-  (when-not (and (simple-query? query) (fn? visible?))
+  (when-not (and (positive-conjunctive-query? query) (fn? visible?))
     (throw (ex-info "Affected results require a positive conjunctive query and visible?"
                     {})))
   (let [assertions (filterv #(= :assert (:op %)) effective-deltas)
@@ -110,7 +194,7 @@
   (when-not (fn? visible?)
     (throw (ex-info "Materialized query requires visible?" {})))
   (let [current (set current-result)]
-    (if (simple-query? query)
+    (if (positive-conjunctive-query? query)
       (let [candidates (affected-query-results
                         {:db-before db-before :db-after db-after :query query
                          :visible? visible? :inputs inputs

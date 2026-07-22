@@ -30,6 +30,33 @@
     (is (= #{["alice" "Alice"] ["bob" "Bob"]} (:result result)))
     (is (= [{:result ["bob" "Bob"] :op :assert}] (:changes result)))))
 
+(deftest join-frontier-plans-bound-index-lookups
+  (let [query {:find '[?team]
+               :where '[[?team "member" ?person]
+                        [?person "role" "admin"]]}
+        seeds (materialization/change-frontier-seeds
+               query [{:e "alice" :a "role" :v "admin"}])
+        seed (first seeds)]
+    (is (= #{'{?person "alice"}} (set seeds)))
+    (is (= {:index :avet :components ["member" "alice"]}
+           (materialization/clause-lookup
+            '[?team "member" ?person] seed)))
+    (is (= {:index :eavt :components ["ops" "member" "alice"]}
+           (materialization/clause-lookup
+            '[?team "member" ?person]
+            '{?team "ops" ?person "alice"})))
+    (is (= [{'?person "alice" '?team "ops"}]
+           (materialization/frontier-next-bindings
+            '[?team "member" ?person] seed
+            [["ops" "member" "alice"]
+             ["sales" "member" "bob"]])))
+    (is (= 1 (:clause-index
+              (materialization/frontier-step-plan query [0 1] [seed])))
+        "the fully bound EAVT anchor is evaluated before an AVET join")))
+
+(deftest join-frontier-refuses-an-unbounded-variable-clause
+  (is (nil? (materialization/clause-lookup '[?e ?a ?v] {}))))
+
 (deftest retraction-checks-for-an-alternative-derivation
   (let [query {:find '[?team]
                :where '[[?team "member" ?person]

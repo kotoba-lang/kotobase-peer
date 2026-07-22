@@ -338,8 +338,8 @@
 (declare manifest-window! index-run-refs load-runs! all-r2-retention-roots!
          find-entities!)
 
-(defn- eavt-run-refs!
-  [e db-id base-cid max-depth read-context]
+(defn- collect-index-run-refs!
+  [e db-id base-cid index max-depth read-context]
   (letfn [(collect [cid remaining refs]
             (cond
               (nil? cid) (js/Promise.resolve refs)
@@ -361,12 +361,15 @@
                                (some-> (get directory "previous") ipld/link-cid)
                                (dec remaining)
                                (into refs
-                                     (lsm/range-directory-refs directory :eavt))))))
+                                     (lsm/range-directory-refs directory index))))))
                        (collect
                         (some-> (get manifest "previous") ipld/link-cid)
                         (dec remaining)
-                        (into refs (index-run-refs [{:node manifest}] :eavt)))))))))]
+                        (into refs (index-run-refs [{:node manifest}] index)))))))))]
     (collect base-cid max-depth [])))
+
+(defn- eavt-run-refs! [e db-id base-cid max-depth read-context]
+  (collect-index-run-refs! e db-id base-cid :eavt max-depth read-context))
 
 (defn find-latest-entity!
   "Return the MVCC-visible EAVT datom set for one exact entity."
@@ -493,6 +496,58 @@
                                               (group-by
                                                #(first
                                                  (get % "components")))))))))))))))))))))))
+
+(defn find-index-prefixes!
+  "Return MVCC-visible physical rows matching exact component PREFIXES in one
+  index. The manifest chain is walked once and overlapping selected runs are
+  loaded once by CID. Prefix first components are strings in the current host
+  contract (entity or attribute); unsupported types fail closed."
+  ([e db-id index prefixes]
+   (find-index-prefixes! e db-id index prefixes 256))
+  ([e db-id index prefixes max-depth]
+   (let [prefixes (vec (distinct (map vec prefixes)))]
+     (when-not (and (lsm/indexes index) (seq prefixes)
+                    (every? #(and (seq %) (string? (first %))) prefixes))
+       (throw (ex-info "Invalid Merkle index prefix batch"
+                       {:index index :prefixes prefixes})))
+     (-> (resolve-database-head! e db-id)
+         (.then
+          (fn [{:keys [base-cid]}]
+            (if-not base-cid
+              []
+              (-> (get-node! e base-cid)
+                  (.then
+                   (fn [base-manifest]
+                     (let [query-epoch (get base-manifest "epoch")]
+                       (-> (collect-index-run-refs!
+                            e db-id base-cid index max-depth
+                            {:index index :prefix-count (count prefixes)})
+                           (.then
+                            (fn [refs]
+                              (let [selected
+                                    (->> prefixes
+                                         (mapcat
+                                          #(lsm/select-run-refs-by-first-component
+                                            refs (first %)))
+                                         (reduce
+                                          (fn [by-cid ref]
+                                            (assoc by-cid
+                                                   (str (ipld/link-cid
+                                                         (get ref "cid")))
+                                                   ref)) {})
+                                         vals vec)
+                                    matches-prefix?
+                                    (fn [row]
+                                      (let [components (get row "components")]
+                                        (some #(= % (subvec components 0
+                                                            (min (count %)
+                                                                 (count components))))
+                                              prefixes)))]
+                                (-> (load-runs! e selected)
+                                    (.then
+                                     (fn [runs]
+                                       (->> (lsm/visible-rows runs query-epoch)
+                                            (filter matches-prefix?) vec)))))))))))))))))))
 
 (defn- manifest-window!
   [e head-cid limit]
