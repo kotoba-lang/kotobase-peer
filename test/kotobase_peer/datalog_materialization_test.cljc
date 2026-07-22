@@ -97,6 +97,7 @@
           :db-id "tenant-a" :new-epoch 1
           :expected-head "old-publication"
           :previous-base-manifest (:cid old-manifest)
+          :base-statistics {"catalog-directory" (ipld/link (:cid old-manifest))}
           :query-statistics
           {:visibility-scope "tenant-a/public" :epoch 0
            :clauses [{:pattern [nil "role" "admin"] :rows 1}
@@ -110,8 +111,14 @@
         plan (:plan refresh)
         base-cid (get-in plan [:result :base-manifest])
         bundle (get-in refresh [:views 0 :view :bundle :node])
-        effects (:effects plan)]
+        effects (:effects plan)
+        base-node (->> effects
+                       (filter #(= base-cid (:cid %)))
+                       first :bytes ipld/decode)]
     (is (= 2 (get-in refresh [:query-statistics :clauses 0 :rows])))
+    (is (= (:cid old-manifest)
+           (ipld/link-cid
+            (get-in base-node ["statistics" "catalog-directory"]))))
     (is (= :differential (get-in refresh [:views 0 :maintenance :mode])))
     (is (= base-cid (ipld/link-cid (get bundle "source-manifest"))))
     (is (= (get-in old-view [:bundle :cid])

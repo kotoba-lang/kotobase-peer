@@ -270,6 +270,9 @@ explicitly readable during migration. The real two-contender R2 drill produced
 one winner and a root whose base/statistics/bundle/pack artifacts were all
 present; see `bench/results/2026-07-23-r2-atomic-derived-publication.edn`.
 Object-store entity readers and compaction now resolve either head format.
+Prefix/exact entity readers merge every selected EAVT run at the resolved base
+epoch before grouping, so newer assertions win and tombstones cannot leak stale
+datoms into host-side refresh state.
 Compaction rewrites only the physical base manifest, deterministically rebases
 each current query bundle's `source-manifest`, preserves statistics/view packs,
 puts those immutable blocks first, and finally CASes a replacement publication

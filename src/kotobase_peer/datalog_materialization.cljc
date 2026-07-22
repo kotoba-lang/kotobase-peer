@@ -120,7 +120,7 @@
   :previous-epoch, and :previous-bundle. REGISTERED-VIEW-IDS is the complete
   registry at the expected head; all registered views are refreshed together."
   [{:keys [db-before tx-data db-id tenant new-epoch safe-epoch expected-head
-           previous-base-manifest query-statistics view-specs
+           previous-base-manifest base-statistics query-statistics view-specs
            registered-view-ids target-run-rows]
     :or {safe-epoch 0 target-run-rows 4096}}]
   (let [view-ids (mapv (comp str :view-id) view-specs)]
@@ -140,6 +140,7 @@
                      {:db-id db-id :tenant tenant :epoch new-epoch
                       :safe-epoch safe-epoch :previous previous-base-manifest
                       :expected expected-head :datoms effective-deltas
+                      :statistics (or base-statistics {})
                       :target-run-rows target-run-rows})
           base-cid (get-in base-plan [:manifest :cid])
           refreshed-statistics

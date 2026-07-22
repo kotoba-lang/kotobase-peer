@@ -335,104 +335,88 @@
   [e root expected-etag released-at]
   (cas-retention-root! e (retention/release-node root released-at) expected-etag))
 
-(declare manifest-window! index-run-refs load-runs! all-r2-retention-roots!)
+(declare manifest-window! index-run-refs load-runs! all-r2-retention-roots!
+         find-entities!)
 
 (defn find-latest-entity!
-  "Walk newest-first manifests and return the first EAVT datom set for entity.
-  This is the correctness-oriented cutover reader; compaction/range indexes can
-  later replace its bounded manifest walk without changing callers."
+  "Return the MVCC-visible EAVT datom set for one exact entity."
   ([e db-id entity] (find-latest-entity! e db-id entity 256))
   ([e db-id entity max-depth]
-   (letfn [(scan-refs [refs previous depth]
-             (let [refs (lsm/select-run-refs-by-first-component refs entity)
-                   loads (mapv #(get-node! e (ipld/link-cid (get % "cid"))) refs)]
-               (-> (js/Promise.all (clj->js loads))
-                   (.then
-                    (fn [runs]
-                      (let [rows (->> (array-seq runs)
-                                      (mapcat #(get % "rows"))
-                                      (filter #(= entity
-                                                  (first (get % "components"))))
-                                      vec)]
-                        (if (seq rows)
-                          rows
-                          (scan previous (inc depth)))))))))
-           (scan [manifest-cid depth]
-             (cond
-               (nil? manifest-cid) (js/Promise.resolve nil)
-               (>= depth max-depth)
-               (js/Promise.reject
-                (ex-info "Merkle manifest scan depth exceeded"
-                         {:db-id db-id :entity entity :max-depth max-depth}))
-               :else
-               (-> (get-node! e manifest-cid)
-                   (.then
-                    (fn [manifest]
-                      (if-let [directory-link
-                               (get-in manifest ["statistics" "range-directory"])]
-                        (-> (get-node! e (ipld/link-cid directory-link))
-                            (.then
-                             (fn [directory]
-                               (scan-refs
-                                (lsm/range-directory-refs directory :eavt)
-                                (some-> (get directory "previous") ipld/link-cid)
-                                depth))))
-                        (scan-refs
-                         (index-run-refs [{:node manifest}] :eavt)
-                         (some-> (get manifest "previous") ipld/link-cid)
-                         depth)))))))]
-     (-> (resolve-database-head! e db-id)
-         (.then (fn [{:keys [base-cid]}] (scan base-cid 0)))))))
+   (-> (find-entities! e db-id entity max-depth)
+       (.then #(get % entity)))))
 
 (defn find-entities!
   "Return {entity [EAVT rows]} for every entity whose id starts with PREFIX.
-  A checkpoint directory replaces the compacted portion of the manifest walk."
+  A checkpoint directory replaces the compacted portion of the manifest walk.
+  All selected runs are MVCC-merged at the resolved base-manifest epoch before
+  tombstones are removed and entities are grouped."
   ([e db-id prefix] (find-entities! e db-id prefix 256))
   ([e db-id prefix max-depth]
    (-> (resolve-database-head! e db-id)
        (.then
-        (fn [{head-cid :base-cid}]
-          (letfn [(collect [cid remaining refs]
-                    (cond
-                      (nil? cid) (js/Promise.resolve refs)
-                      (zero? remaining)
-                      (js/Promise.reject
-                       (ex-info "Merkle entity scan depth exceeded"
-                                {:db-id db-id :prefix prefix
-                                 :max-depth max-depth}))
-                      :else
-                      (-> (get-node! e cid)
-                          (.then
-                           (fn [manifest]
-                             (if-let [directory-link
-                                      (get-in manifest ["statistics" "range-directory"])]
-                               (-> (get-node! e (ipld/link-cid directory-link))
-                                   (.then
-                                    (fn [directory]
-                                      (collect
-                                       (some-> (get directory "previous") ipld/link-cid)
-                                       (dec remaining)
-                                       (into refs
-                                             (lsm/range-directory-refs
-                                              directory :eavt))))))
-                               (collect
-                                (some-> (get manifest "previous") ipld/link-cid)
-                                (dec remaining)
-                                (into refs
-                                      (index-run-refs [{:node manifest}] :eavt)))))))))]
-            (-> (collect head-cid max-depth [])
+        (fn [{:keys [base-cid]}]
+          (if-not base-cid
+            {}
+            (-> (get-node! e base-cid)
                 (.then
-                 (fn [refs]
-                   (-> (load-runs!
-                        e (lsm/select-run-refs-by-first-component refs prefix))
-                       (.then
-                        (fn [runs]
-                          (->> runs
-                               (mapcat #(get-in % [:node "rows"]))
-                               (filter (fn [row]
-                                         (str/starts-with?
-                                          (str (first (get row "components"))) prefix)))
-                               (group-by #(first (get % "components"))))))))))))))))
+                 (fn [base-manifest]
+                   (let [query-epoch (get base-manifest "epoch")]
+                     (letfn [(collect [cid remaining refs]
+                               (cond
+                                 (nil? cid) (js/Promise.resolve refs)
+                                 (zero? remaining)
+                                 (js/Promise.reject
+                                  (ex-info "Merkle entity scan depth exceeded"
+                                           {:db-id db-id :prefix prefix
+                                            :max-depth max-depth}))
+                                 :else
+                                 (-> (get-node! e cid)
+                                     (.then
+                                      (fn [manifest]
+                                        (if-let [directory-link
+                                                 (get-in manifest
+                                                         ["statistics"
+                                                          "range-directory"])]
+                                          (-> (get-node! e
+                                                         (ipld/link-cid
+                                                          directory-link))
+                                              (.then
+                                               (fn [directory]
+                                                 (collect
+                                                  (some->
+                                                   (get directory "previous")
+                                                   ipld/link-cid)
+                                                  (dec remaining)
+                                                  (into
+                                                   refs
+                                                   (lsm/range-directory-refs
+                                                    directory :eavt))))))
+                                          (collect
+                                           (some-> (get manifest "previous")
+                                                   ipld/link-cid)
+                                           (dec remaining)
+                                           (into refs
+                                                 (index-run-refs
+                                                  [{:node manifest}]
+                                                  :eavt)))))))))]
+                       (-> (collect base-cid max-depth [])
+                           (.then
+                            (fn [refs]
+                              (-> (load-runs!
+                                   e (lsm/select-run-refs-by-first-component
+                                      refs prefix))
+                                  (.then
+                                   (fn [runs]
+                                     (->> (lsm/visible-rows runs query-epoch)
+                                          (filter
+                                           (fn [row]
+                                             (str/starts-with?
+                                              (str (first
+                                                    (get row "components")))
+                                              prefix)))
+                                          (group-by
+                                           #(first
+                                             (get % "components")))))))))))))))))))))
 
 (defn- manifest-window!
   [e head-cid limit]

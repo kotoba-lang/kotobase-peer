@@ -11,6 +11,60 @@
     (is (= "test-prefix/blocks/bafy-block" (worker/block-key env "bafy-block")))
     (is (= "test-prefix/objects/bafy-pack" (worker/object-key env "bafy-pack")))))
 
+(deftest entity-readers-apply-mvcc-and-tombstones-across-manifests
+  (async done
+    (let [first-plan (lsm/flush-plan
+                      {:db-id "db-a" :epoch 1
+                       :datoms [{:e "alice" :a "role" :v "admin"}
+                                {:e "bob" :a "role" :v "admin"}]})
+          second-plan (lsm/flush-plan
+                       {:db-id "db-a" :epoch 2
+                        :previous (get-in first-plan [:manifest :cid])
+                        :datoms [{:e "alice" :a "role" :v "admin" :op :retract}
+                                 {:e "alice" :a "name" :v "Alice"}
+                                 {:e "bob" :a "role" :v "admin" :op :retract}]})
+          blocks (into {}
+                       (map (fn [{:keys [cid bytes]}]
+                              [(str "test/blocks/" cid) bytes]))
+                       (filter #(= :block/put (:effect/type %))
+                               (concat (:effects first-plan)
+                                       (:effects second-plan))))
+          head-cid (get-in second-plan [:manifest :cid])
+          bucket
+          #js {:get
+               (fn [key]
+                 (let [value (if (= key "test/heads/db-a")
+                               head-cid (get blocks key))]
+                   (js/Promise.resolve
+                    (when value
+                      #js {:etag "stable"
+                           :text (fn [] (js/Promise.resolve value))
+                           :arrayBuffer
+                           (fn []
+                             (js/Promise.resolve
+                              (if (string? value)
+                                (.-buffer (.encode (js/TextEncoder.) value))
+                                (.slice (.-buffer value) (.-byteOffset value)
+                                        (+ (.-byteOffset value)
+                                           (.-byteLength value))))))}))))}
+          env #js {"MERKLE_BUCKET" bucket "MERKLE_S3_PREFIX" "test"}]
+      (-> (worker/find-entities! env "db-a" "")
+          (.then
+           (fn [entities]
+             (is (= #{"alice"} (set (keys entities))))
+             (is (= [["alice" "name" "Alice"]]
+                    (mapv #(get % "components") (get entities "alice"))))
+             (worker/find-latest-entity! env "db-a" "alice")))
+          (.then
+           (fn [rows]
+             (is (= [["alice" "name" "Alice"]]
+                    (mapv #(get % "components") rows)))
+             (done)))
+          (.catch
+           (fn [error]
+             (is false (str "MVCC entity read rejected: " error))
+             (done)))))))
+
 (deftest atomic-publication-persists-everything-before-head-cas
   (async done
     (let [entries (atom {})
