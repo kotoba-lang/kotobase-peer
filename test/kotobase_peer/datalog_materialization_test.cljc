@@ -65,6 +65,31 @@
     (is (= #{["alice"] ["bob"]} (:result result)))
     (is (= [{:result ["bob"] :op :assert}] (:changes result)))))
 
+(deftest affected-result-membership-does-not-require-the-complete-view
+  (let [query {:find '[?person ?name]
+               :where '[[?person "name" ?name]]}
+        before (db-with [["alice" "name" "Alice"]
+                         ["unrelated" "name" "Unchanged"]])
+        {:keys [db-after effective-deltas]}
+        (peer/transact-effective
+         before [[:db/retract "alice" "name" "Alice"]
+                 ["alice" "name" "Alicia"]])
+        affected (materialization/affected-query-results
+                  {:db-before before :db-after db-after :query query
+                   :visible? visible? :effective-deltas effective-deltas})
+        result (materialization/maintain-query-delta
+                {:db-before before :db-after db-after :query query
+                 :visible? visible?
+                 :current-result #{["alice" "Alice"]}
+                 :current-result-complete? false
+                 :effective-deltas effective-deltas})]
+    (is (materialization/bounded-single-clause-query? query))
+    (is (= #{["alice" "Alice"] ["alice" "Alicia"]} affected))
+    (is (nil? (:result result)))
+    (is (= [{:result ["alice" "Alice"] :op :retract}
+            {:result ["alice" "Alicia"] :op :assert}]
+           (:changes result)))))
+
 (deftest full-datalog-forms-use-correct-recompute-fallback
   (let [query {:find '[?person]
                :where '[[?person "name" _]
