@@ -11,6 +11,56 @@
     (is (= "test-prefix/blocks/bafy-block" (worker/block-key env "bafy-block")))
     (is (= "test-prefix/objects/bafy-pack" (worker/object-key env "bafy-pack")))))
 
+(deftest atomic-publication-persists-everything-before-head-cas
+  (async done
+    (let [entries (atom {})
+          head-touched? (atom false)
+          fail-object? (atom false)
+          bucket
+          #js {:get (fn [key]
+                      (let [{:keys [value etag]} (get @entries key)]
+                        (js/Promise.resolve
+                         (when value
+                           #js {:etag etag
+                                :text (fn [] (js/Promise.resolve value))}))))
+               :put (fn [key value opts]
+                      (cond
+                        (and @fail-object? (str/includes? key "/objects/"))
+                        (js/Promise.reject (js/Error. "injected object failure"))
+
+                        (str/includes? key "/heads/")
+                        (do
+                          (reset! head-touched? true)
+                          (is (contains? @entries "test/blocks/root"))
+                          (is (contains? @entries "test/objects/pack"))
+                          (swap! entries assoc key {:value value :etag "head-v1"})
+                          (js/Promise.resolve #js {:etag "head-v1"}))
+
+                        :else
+                        (do (swap! entries assoc key {:value value :etag "immutable"})
+                            (js/Promise.resolve #js {:etag "immutable"}))))}
+          env #js {"MERKLE_BUCKET" bucket "MERKLE_S3_PREFIX" "test"}
+          plan {:effects [{:effect/type :block/put :cid "base" :bytes #js [1]}
+                          {:effect/type :object/put :cid "pack" :bytes #js [2]}
+                          {:effect/type :block/put :cid "root" :bytes #js [3]}
+                          {:effect/type :head/cas :db-id "db-a"
+                           :expected nil :next "root"}]}]
+      (-> (worker/apply-atomic-publication! env plan)
+          (.then (fn [result]
+                   (is (:published? result))
+                   (is @head-touched?)
+                   (reset! entries {})
+                   (reset! head-touched? false)
+                   (reset! fail-object? true)
+                   (worker/apply-atomic-publication! env plan)))
+          (.then (fn [_]
+                   (is false "injected immutable failure should reject")
+                   (done)))
+          (.catch (fn [_]
+                    (is (not @head-touched?)
+                        "head remains untouched after immutable write failure")
+                    (done)))))))
+
 (defn- cas-bucket []
   (let [state (atom {:value nil :version 0})
         bucket
