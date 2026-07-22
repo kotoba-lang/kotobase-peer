@@ -4,6 +4,7 @@
             [ipld.core :as ipld]
             [kotobase-peer.merkle-lsm :as lsm]
             [kotobase-peer.object-store.worker :as worker]
+            [kotobase-peer.resumable-execution :as resumable]
             [kotobase-peer.retention :as retention]))
 
 (deftest immutable-object-and-block-namespaces-are-distinct
@@ -470,3 +471,103 @@
           (.catch (fn [error]
                     (is false (str "scheduler promise rejected: " error))
                     (done)))))))
+
+(deftest resumable-execution-spills-resumes-and-fences-stale-workers
+  (async done
+    (let [prefix "test/"
+          entries (atom {(str prefix "heads/db-r")
+                         {:value "head-1" :etag "v-head"}})
+          version (atom 0)
+          bucket
+          #js {:get
+               (fn [key]
+                 (let [{:keys [value etag]} (get @entries key)]
+                   (js/Promise.resolve
+                    (when value
+                      #js {:etag etag
+                           :text (fn [] (js/Promise.resolve value))
+                           :arrayBuffer
+                           (fn []
+                             (let [bytes (if (string? value)
+                                           (.encode (js/TextEncoder.) value)
+                                           value)]
+                               (js/Promise.resolve
+                                (.slice (.-buffer bytes)
+                                        (.-byteOffset bytes)
+                                        (+ (.-byteOffset bytes)
+                                           (.-byteLength bytes))))))}))))
+               :put
+               (fn [key value opts]
+                 (let [current (get @entries key)
+                       condition (when opts (.-onlyIf opts))
+                       matches (when condition (.-etagMatches condition))
+                       absent (when condition (.-etagDoesNotMatch condition))
+                       won? (cond
+                              matches (= matches (:etag current))
+                              (= "*" absent) (nil? current)
+                              :else true)]
+                   (if-not won?
+                     (js/Promise.resolve nil)
+                     (let [etag (str "v" (swap! version inc))]
+                       (swap! entries assoc key {:value value :etag etag})
+                       (js/Promise.resolve #js {:etag etag}))))) }
+          env #js {"MERKLE_BUCKET" bucket "MERKLE_S3_PREFIX" "test"}
+          workload (ipld/cid (ipld/encode {"query" "frontier"}))
+          task (resumable/task
+                {:kind :join-frontier :db-id "db-r"
+                 :expected-head "head-1" :workload-cid workload
+                 :max-items 2 :max-bytes 1024})
+          claim-opts {:task task :owner "worker-a" :token "token-a"
+                      :now-ms 1000 :lease-ms 100}]
+      (-> (worker/claim-resumable-execution! env claim-opts)
+          (.then
+           (fn [claim]
+             (is (:claimed? claim))
+             (is (= 1 (get-in claim [:pointer "attempt"])))
+             (-> (worker/claim-resumable-execution!
+                  env (assoc claim-opts :owner "worker-b"
+                             :token "token-b" :now-ms 1001))
+                 (.then
+                  (fn [contender]
+                    (is (= :leased (:reason contender)))
+                    claim)))))
+          (.then
+           (fn [claim]
+             (worker/advance-resumable-execution!
+              env (merge claim
+                         {:ordinal 0 :cursor-after {"offset" 2}
+                          :payload [{"binding" "alice"}]
+                          :item-count 1 :byte-count 24
+                          :now-ms 1020 :lease-ms 100}))))
+          (.then
+           (fn [advanced]
+             (is (:advanced? advanced))
+             (is (= 1 (get-in advanced [:checkpoint "next-ordinal"])))
+             (is (= {"offset" 2} (get-in advanced [:checkpoint "cursor"])))
+             (worker/get-resumable-pointer! env "db-r" (str (:cid task)))))
+          (.then
+           (fn [loaded]
+             (is (= 1 (get-in loaded [:checkpoint "next-ordinal"])))
+             (worker/finish-resumable-execution!
+              env (assoc loaded :task task :status :completed
+                         :result-cid workload))))
+          (.then
+           (fn [finished]
+             (is (:finished? finished))
+             (is (= "completed" (get-in finished
+                                         [:checkpoint "status"])))
+             (is (some #(str/includes? % "/blocks/") (keys @entries)))
+             (swap! entries assoc (str prefix "heads/db-r")
+                    {:value "head-2" :etag "v-head-2"})
+             (worker/claim-resumable-execution!
+              env (assoc claim-opts :owner "worker-c"
+                         :token "token-c" :now-ms 1200))))
+          (.then
+           (fn [stale]
+             (is (= :stale-head (:reason stale)))
+             (done)))
+          (.catch
+           (fn [error]
+             (is false (str "resumable execution rejected: " error "\n"
+                            (.-stack error)))
+             (done)))))))

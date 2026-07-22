@@ -9,6 +9,7 @@
             [kotobase-peer.atomic-publication :as publication]
             [kotobase-peer.compaction :as compaction]
             [kotobase-peer.merkle-lsm :as lsm]
+            [kotobase-peer.resumable-execution :as resumable]
             [kotobase-peer.retention :as retention]
             [kotobase-peer.object-store.s3-sigv4 :as sigv4]))
 
@@ -23,6 +24,9 @@
 (defn compaction-checkpoint-key [e db-id task-id token]
   (str (prefix e) "scheduler/compaction/" (js/encodeURIComponent db-id)
        "/checkpoints/" task-id "/" (js/encodeURIComponent token)))
+(defn resumable-pointer-key [e db-id task-id]
+  (str (prefix e) "scheduler/resumable/" (js/encodeURIComponent db-id)
+       "/" task-id "/current"))
 (defn retention-root-key [e db-id kind id]
   (str (prefix e) "roots/" (js/encodeURIComponent db-id) "/"
        (name kind) "/" (js/encodeURIComponent id)))
@@ -921,6 +925,208 @@
                   (.then #(into completed (array-seq %)))))))
    (js/Promise.resolve [])
    (compaction/bounded-batches max-concurrency database-opts)))
+
+(defn get-resumable-pointer!
+  "Read the mutable attempt pointer and its immutable checkpoint. The pointer
+  is coordination only; checkpoint CID verification remains in get-node!."
+  [e db-id task-id]
+  (if-let [bucket (env e "MERKLE_BUCKET")]
+    (-> (.get bucket (resumable-pointer-key e db-id task-id))
+        (.then
+         (fn [object]
+           (if-not object
+             {:pointer nil :checkpoint nil :etag nil}
+             (-> (.text object)
+                 (.then
+                  (fn [value]
+                    (let [pointer (js->clj (js/JSON.parse value))]
+                      (-> (get-node! e (get pointer "checkpoint"))
+                          (.then
+                           (fn [checkpoint]
+                             {:pointer pointer :checkpoint checkpoint
+                              :etag (gobj/get object "etag")})))))))))))
+    (js/Promise.reject
+     (js/Error. "Resumable execution currently requires an R2 binding"))))
+
+(defn claim-resumable-execution!
+  "Claim or reclaim one deterministic snapshot-pinned task. Task and initial
+  checkpoint are immutable blocks written before the small R2 ETag-CAS pointer.
+  Active attempts are not stolen."
+  [e {:keys [task owner token now-ms lease-ms]
+      :or {lease-ms 60000}}]
+  (let [now-ms (or now-ms (js/Date.now))
+        token (or token (str (random-uuid)))
+        task-id (str (:cid task))
+        db-id (get-in task [:node "db-id"])
+        expected-head (get-in task [:node "expected-head"])]
+    (when-not (and (:bytes task) (string? owner) (seq owner)
+                   (string? token) (seq token) (integer? now-ms)
+                   (pos-int? lease-ms))
+      (throw (ex-info "Invalid resumable execution claim"
+                      {:owner owner :now-ms now-ms :lease-ms lease-ms})))
+    (if-let [bucket (env e "MERKLE_BUCKET")]
+      (-> (get-head e db-id)
+          (.then
+           (fn [{current-head :value}]
+             (if (not= expected-head current-head)
+               {:claimed? false :reason :stale-head
+                :expected-head expected-head :current-head current-head}
+               (-> (get-resumable-pointer! e db-id task-id)
+                   (.then
+                    (fn [{current :pointer :keys [etag]}]
+                      (if (and current
+                               (= "running" (get current "status"))
+                               (> (get current "expires-at" 0) now-ms))
+                        {:claimed? false :reason :leased
+                         :owner (get current "owner")
+                         :expires-at (get current "expires-at")}
+                        (let [attempt (inc (or (get current "attempt") 0))
+                              checkpoint
+                              (resumable/initial-checkpoint
+                               {:task task :token token :attempt attempt})
+                              pointer
+                              {"format" "kotobase/resumable-pointer"
+                               "version" 1
+                               "task-id" task-id
+                               "db-id" db-id
+                               "expected-head" expected-head
+                               "checkpoint" (str (:cid checkpoint))
+                               "owner" owner "token" token
+                               "attempt" attempt
+                               "expires-at" (+ now-ms lease-ms)
+                               "status" "running"}
+                              condition (if etag
+                                          #js {:etagMatches etag}
+                                          #js {:etagDoesNotMatch "*"})]
+                          (-> (js/Promise.all
+                               #js [(put-block! e (:cid task) (:bytes task))
+                                    (put-block! e (:cid checkpoint)
+                                                (:bytes checkpoint))])
+                              (.then
+                               (fn [_]
+                                 (-> (.put bucket
+                                           (resumable-pointer-key e db-id task-id)
+                                           (js/JSON.stringify (clj->js pointer))
+                                           #js {:onlyIf condition})
+                                     (.then
+                                      (fn [result]
+                                        (if result
+                                          {:claimed? true :task task
+                                           :pointer pointer
+                                           :checkpoint (:node checkpoint)
+                                           :etag (gobj/get result "etag")}
+                                          {:claimed? false
+                                           :reason :cas-lost}))))))))))))))))
+      (js/Promise.reject
+       (js/Error. "Resumable execution currently requires an R2 binding")))))
+
+(defn advance-resumable-execution!
+  "Persist one spill and successor checkpoint, then advance the mutable pointer
+  with ETag CAS. A moved database head or pointer fences publication; immutable
+  orphan blocks remain safe for GC."
+  [e {:keys [task pointer checkpoint etag ordinal cursor-after payload
+             item-count byte-count now-ms lease-ms]
+      :or {lease-ms 60000}}]
+  (let [db-id (get pointer "db-id")
+        task-id (get pointer "task-id")
+        token (get pointer "token")
+        attempt (get pointer "attempt")
+        expected-head (get pointer "expected-head")
+        advanced (resumable/advance
+                  {:task task :checkpoint checkpoint :token token
+                   :attempt attempt :ordinal ordinal
+                   :cursor-after cursor-after :payload payload
+                   :item-count item-count :byte-count byte-count})
+        now-ms (or now-ms (js/Date.now))]
+    (when-not (and (= task-id (str (:cid task)))
+                   (= (get pointer "checkpoint")
+                      (str (resumable/checkpoint-cid checkpoint))))
+      (throw (ex-info "Resumable advance pointer/checkpoint mismatch"
+                      {:task-id task-id
+                       :checkpoint (get pointer "checkpoint")})))
+    (if-let [bucket (env e "MERKLE_BUCKET")]
+      (-> (get-head e db-id)
+          (.then
+           (fn [{current-head :value}]
+             (if (not= expected-head current-head)
+               {:advanced? false :reason :stale-head
+                :current-head current-head}
+               (-> (js/Promise.all
+                    #js [(put-block! e (get-in advanced [:spill :cid])
+                                     (get-in advanced [:spill :bytes]))
+                         (put-block! e (get-in advanced [:checkpoint :cid])
+                                     (get-in advanced [:checkpoint :bytes]))])
+                   (.then
+                    (fn [_]
+                      (let [next-pointer
+                            (assoc pointer
+                                   "checkpoint"
+                                   (str (get-in advanced [:checkpoint :cid]))
+                                   "expires-at" (+ now-ms lease-ms))]
+                        (-> (.put bucket
+                                  (resumable-pointer-key e db-id task-id)
+                                  (js/JSON.stringify (clj->js next-pointer))
+                                  #js {:onlyIf #js {:etagMatches etag}})
+                            (.then
+                             (fn [result]
+                               (if result
+                                 {:advanced? true :task task
+                                  :pointer next-pointer
+                                  :checkpoint
+                                  (get-in advanced [:checkpoint :node])
+                                  :spill (get-in advanced [:spill :node])
+                                  :etag (gobj/get result "etag")}
+                                 {:advanced? false
+                                  :reason :pointer-fenced}))))))))))))
+      (js/Promise.reject
+       (js/Error. "Resumable execution currently requires an R2 binding")))))
+
+(defn finish-resumable-execution!
+  "Publish a terminal immutable checkpoint and CAS the pointer to terminal.
+  Completion is fenced by both the expected database head and pointer ETag."
+  [e {:keys [task pointer checkpoint etag status result-cid error]}]
+  (let [db-id (get pointer "db-id")
+        task-id (get pointer "task-id")
+        expected-head (get pointer "expected-head")
+        terminal (resumable/finish
+                  {:task task :checkpoint checkpoint
+                   :token (get pointer "token")
+                   :attempt (get pointer "attempt")
+                   :status status :result-cid result-cid :error error})]
+    (when-not (and (= task-id (str (:cid task)))
+                   (= (get pointer "checkpoint")
+                      (str (resumable/checkpoint-cid checkpoint))))
+      (throw (ex-info "Resumable finish pointer/checkpoint mismatch"
+                      {:task-id task-id
+                       :checkpoint (get pointer "checkpoint")})))
+    (if-let [bucket (env e "MERKLE_BUCKET")]
+      (-> (get-head e db-id)
+          (.then
+           (fn [{current-head :value}]
+             (if (not= expected-head current-head)
+               {:finished? false :reason :stale-head
+                :current-head current-head}
+               (-> (put-block! e (:cid terminal) (:bytes terminal))
+                   (.then
+                    (fn [_]
+                      (let [next-pointer
+                            (assoc pointer
+                                   "checkpoint" (str (:cid terminal))
+                                   "status" (name status))]
+                        (-> (.put bucket
+                                  (resumable-pointer-key e db-id task-id)
+                                  (js/JSON.stringify (clj->js next-pointer))
+                                  #js {:onlyIf #js {:etagMatches etag}})
+                            (.then
+                             (fn [result]
+                               (if result
+                                 {:finished? true :pointer next-pointer
+                                  :checkpoint (:node terminal)
+                                  :etag (gobj/get result "etag")}
+                                 {:finished? false
+                                  :reason :pointer-fenced}))))))))))))
+      (js/Promise.reject
+       (js/Error. "Resumable execution currently requires an R2 binding")))))
 
 (defn reachable-cids!
   "Walk decoded IPLD links from ROOT-CID and return a Promise<set<CID>>."
