@@ -1227,7 +1227,8 @@
                               (when-let [checkpoint (get pointer "checkpoint")]
                                 {:key key
                                  :etag (gobj/get stored "etag")
-                                 :uploaded (gobj/get object "uploaded")
+                                 :uploaded-ms (some-> (gobj/get object "uploaded")
+                                                      .getTime)
                                  :db-id (get pointer "db-id")
                                  :expected-head (get pointer "expected-head")
                                  :status (get pointer "status")
@@ -1276,8 +1277,8 @@
         stale-resumable-pointer-keys
         (->> resumable-roots
              (remove (set active-resumable-roots))
-             (filter (fn [{:keys [uploaded]}]
-                       (and uploaded (< (.getTime uploaded) cutoff))))
+             (filter (fn [{:keys [uploaded-ms]}]
+                       (and uploaded-ms (< uploaded-ms cutoff))))
              (mapv :key))]
     (-> (js/Promise.all
          #js [(-> (js/Promise.all
@@ -1320,8 +1321,8 @@
   and every active retention root. A resumable pointer is active only while
   its expected head is still the current head for its database; stale or
   explicitly released pointers are swept after the same grace period and
-  two-snapshot fence as unreachable blocks,
-  then optionally sweep shared blocks older than GRACE-MS. Leased reader and
+  two-snapshot fence as unreachable blocks. It then optionally sweeps shared
+  blocks older than GRACE-MS. Leased reader and
   replication roots expire at NOW-MS; legal-hold and release roots remain until
   CAS-released. A second complete head/root ETag snapshot fences detected
   publication, renewal, and release races. DB-ID remains for source compatibility."

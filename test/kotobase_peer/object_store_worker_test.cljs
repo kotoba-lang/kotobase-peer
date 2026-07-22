@@ -247,7 +247,6 @@
                          (block-key checkpoint) checkpoint-bytes
                          (block-key resumable-child) resumable-child-bytes
                          (block-key orphan) orphan-bytes})
-          old-date (js/Date. 0)
           bytes-object (fn [value]
                          #js {:arrayBuffer
                               (fn []
@@ -267,7 +266,9 @@
                        (let [wanted (.-prefix opts)
                              listed (->> (keys @objects)
                                          (filter #(.startsWith % wanted))
-                                         (mapv (fn [key] #js {:key key :uploaded old-date})))]
+                                         (mapv (fn [key]
+                                                 #js {:key key
+                                                      :uploaded (js/Date. 0)})))]
                          (js/Promise.resolve #js {:objects (clj->js listed)
                                                  :truncated false})))
                :delete (fn [keys]
