@@ -94,6 +94,34 @@
     (is (= (:head tail) (:next-work decoded)))
     (is (= [{'?person "head"}] (:bindings decoded)))))
 
+(deftest join-frontier-work-preserves-a-bounded-prefix-cursor
+  (let [bindings (mapv (fn [n] {'?person (str "person-" n)}) (range 12))
+        scan {:clause-index 0 :index :avet :after "member|person-4"}
+        chain (materialization/build-frontier-work-chain
+               {:snapshot :after :remaining [0 1]
+                :bindings bindings :scan scan :max-bytes 220})
+        by-cid (into {} (map (juxt :cid :node) (:nodes chain)))]
+    (is (< 1 (count (:nodes chain))))
+    (loop [cid (:head chain) decoded []]
+      (if cid
+        (let [work (materialization/decode-frontier-work (get by-cid cid))]
+          (is (= scan (:scan work)))
+          (recur (:next-work work) (into decoded (:bindings work))))
+        (is (= bindings decoded))))))
+
+(deftest join-frontier-work-rejects-malformed-prefix-cursors
+  (doseq [scan [{:clause-index 0 :index :unknown :after "x"}
+                {:clause-index 1 :index :avet :after "x"}
+                {:clause-index 0 :index :avet :after ""}]]
+    (is (thrown-with-msg?
+         #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core.ExceptionInfo)
+         #"Invalid join frontier"
+         (materialization/build-frontier-work-chain
+          {:snapshot :after :remaining [0]
+           :bindings [{'?person "alice"}]
+           :scan scan
+           :max-bytes 512})))))
+
 (deftest join-frontier-single-oversized-binding-fails-closed
   (is (thrown-with-msg?
        #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core.ExceptionInfo)
