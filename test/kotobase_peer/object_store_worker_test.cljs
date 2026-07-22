@@ -40,6 +40,7 @@
                          (str "test/blocks/" cid))))
                set)
           gets (atom [])
+          first-prefix-page (atom nil)
           head-cid (get-in second-plan [:manifest :cid])
           bucket
           #js {:get
@@ -90,6 +91,23 @@
                     (mapv #(get % "components") rows)))
              (is (= 1 (count (filter #{"test/heads/db-a"} @gets)))
                  "an index-prefix batch resolves the head once")
+             (worker/find-index-prefix-page!
+              env "db-a" :aevt [["name"] ["role"]] {:limit 1})))
+          (.then
+           (fn [page]
+             (reset! first-prefix-page page)
+             (is (= [["name" "alice" "Alice"]]
+                    (mapv #(get % "components") (:rows page))))
+             (is (false? (:done? page)))
+             (worker/find-index-prefix-page!
+              env "db-a" :aevt [["name"] ["role"]]
+              {:limit 1 :after (:cursor page)})))
+          (.then
+           (fn [page]
+             (is (empty? (:rows page))
+                 "a tombstone-only logical page still advances")
+             (is (string? (:cursor page)))
+             (is (not= (:cursor @first-prefix-page) (:cursor page)))
              (done)))
           (.catch
            (fn [error]
