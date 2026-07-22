@@ -5,7 +5,8 @@
             [ipld.core :as ipld]
             [chain.core :as cd]
             [arrangement.core :as qs]
-            [kotobase-peer.core :as eng])
+            [kotobase-peer.core :as eng]
+            [kotobase-peer.transactor :as transactor])
   #?(:clj (:import [javax.crypto Cipher Mac]
                    [javax.crypto.spec SecretKeySpec GCMParameterSpec]
                    [java.util Base64])))
@@ -1094,6 +1095,26 @@
        (is (= (:chain-cid-after report) (get @heads "actor:alice"))))))
 
 #?(:clj
+   (deftest commit-serialized-batch-uses-one-cas
+     (let [{:keys [put! get-fn]} (mem-store)
+           head (atom nil)
+           cas-calls (atom 0)
+           cas! (fn [_ expected new]
+                  (swap! cas-calls inc)
+                  (if (= @head expected) (do (reset! head new) new) @head))
+           batch (first (transactor/plan-head-batches
+                         [{:request-id 1 :head-key "actor:alice"
+                           :tx-data [{:s "alice" :p "role" :o "admin"}]}
+                          {:request-id 2 :head-key "actor:alice"
+                           :tx-data [{:s "alice" :p "team" :o "infra"}]}]))
+           receipt (eng/commit-serialized-batch!
+                    put! get-fn cas! "actor:alice" nil batch test-encrypt-fn)]
+       (is (= 1 @cas-calls))
+       (is (= [1 2] (:request-ids receipt)))
+       (is (= 2 (count (:tx-data receipt))))
+       (is (= @head (:chain-cid-after receipt))))))
+
+#?(:clj
    (deftest since-shows-only-commits-after-a-seq
      (let [{:keys [put! get-fn]} (mem-store)
            c0 (eng/commit! put! get-fn [{:s "alice" :p "role" :o "v1"}] nil test-encrypt-fn)
@@ -1893,6 +1914,30 @@
              (.then (fn [report]
                       (is (= #{:chain-cid-before :chain-cid-after :tx-data} (set (keys report))))
                       (is (= (:chain-cid-after report) (get @heads "actor:alice")))
+                      (done))))))))
+
+#?(:cljs
+   (deftest commit-serialized-batch-uses-one-asynchronous-cas
+     (async done
+       (let [{:keys [put! get-fn]} (mem-store)
+             head (atom nil)
+             cas-calls (atom 0)
+             cas! (fn [_ expected new]
+                    (swap! cas-calls inc)
+                    (js/Promise.resolve
+                     (if (= @head expected) (do (reset! head new) new) @head)))
+             batch (first (transactor/plan-head-batches
+                           [{:request-id 1 :head-key "actor:alice"
+                             :tx-data [{:s "alice" :p "role" :o "admin"}]}
+                            {:request-id 2 :head-key "actor:alice"
+                             :tx-data [{:s "alice" :p "team" :o "infra"}]}]))]
+         (-> (eng/commit-serialized-batch!
+              put! get-fn cas! "actor:alice" nil batch test-encrypt-fn)
+             (.then (fn [receipt]
+                      (is (= 1 @cas-calls))
+                      (is (= [1 2] (:request-ids receipt)))
+                      (is (= 2 (count (:tx-data receipt))))
+                      (is (= @head (:chain-cid-after receipt)))
                       (done))))))))
 
 #?(:cljs

@@ -1,0 +1,41 @@
+{:date "2026-07-23"
+ :backend :cloudflare-r2
+ :execution {:mode "wrangler remote preview"
+             :bucket "kotobase-merkle-lsm"
+             :scope "isolated bench/write-batch UUID prefix"
+             :cleanup "all batch blocks and shard heads deleted in finally"
+             :logical-writes 32
+             :payload-bytes-per-logical-write 256}
+ :baseline {:shape :single-head-concurrent
+            :concurrency 32
+            :wall-ms 10717
+            :logical-writes-per-sec 2.986
+            :total-cas-attempts 508
+            :max-cas-attempts 32
+            :lost-updates 0
+            :receipt "2026-07-22-r2-head-cas-write.edn"}
+ :results
+ [{:shape :single-head-batched
+   :heads 1 :batch-size 8 :batches 4
+   :p50-batch-ms 270 :p95-batch-ms 271 :wall-ms 1541
+   :logical-writes-per-sec 20.766 :cas-per-logical-write 0.125
+   :total-cas-attempts 4 :max-cas-attempts 1 :lost-updates 0}
+  {:shape :fully-sharded
+   :heads 32 :batch-size 1 :batches 32
+   :p50-batch-ms 1356 :p95-batch-ms 1641 :wall-ms 1954
+   :logical-writes-per-sec 16.377 :cas-per-logical-write 1.0
+   :total-cas-attempts 32 :max-cas-attempts 1 :lost-updates 0}
+  {:shape :batched-and-sharded
+   :heads 8 :batch-size 4 :batches 8
+   :p50-batch-ms 292 :p95-batch-ms 381 :wall-ms 515
+   :logical-writes-per-sec 62.136 :cas-per-logical-write 0.25
+   :total-cas-attempts 8 :max-cas-attempts 1 :lost-updates 0}]
+ :improvement-vs-baseline {:wall-time-ratio 20.81
+                           :cas-attempt-ratio 63.5
+                           :throughput-ratio 20.81}
+ :correctness {:per-head-order-preserved true
+               :cross-head-batching false
+               :one-in-flight-batch-per-head true
+               :all-final-head-counts-sum-to-32 true
+               :lost-updates 0}
+ :interpretation "Bounded batching plus actor/tenant head sharding removes retry storms without changing the datom/IPLD chain format or making R2 part of the pure kernel. Fully sharding every request overdrives remote concurrency; the measured 8-head x 4-request hybrid is the best of the tested shapes."}

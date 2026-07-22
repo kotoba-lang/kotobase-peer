@@ -110,6 +110,62 @@ async function benchmarkR2Cas(env, samples, concurrency) {
   }
 }
 
+async function advanceHeadBy(bucket, key, width) {
+  let attempts = 0;
+  while (attempts < 100) {
+    attempts += 1;
+    const object = await bucket.get(key);
+    const expected = object ? await object.text() : null;
+    const next = String((expected === null ? 0 : Number(expected)) + width);
+    const result = await r2CompareExchange(bucket, key, expected, next);
+    if (result.won) return attempts;
+  }
+  throw new Error("R2 batched CAS contention retry limit exceeded");
+}
+
+async function benchmarkR2Transactor(env, samples, batchSize, shards) {
+  const runId = crypto.randomUUID();
+  const prefix = `bench/write-batch/${runId}/`;
+  const headKeys = Array.from({length: shards}, (_, shard) => `${prefix}heads/${shard}`);
+  const blockKeys = [];
+  const batchLatencies = [];
+  const attempts = [];
+  const shardRequests = Array.from({length: shards}, () => []);
+  for (let sequence = 0; sequence < samples; sequence += 1)
+    shardRequests[sequence % shards].push(sequence);
+  const startedAll = performance.now();
+  try {
+    await Promise.all(shardRequests.map(async (requests, shard) => {
+      for (let offset = 0; offset < requests.length; offset += batchSize) {
+        const batch = requests.slice(offset, offset + batchSize);
+        const blockKey = `${prefix}blocks/${shard}/${offset / batchSize}`;
+        blockKeys.push(blockKey);
+        const started = performance.now();
+        await env.MERKLE_BUCKET.put(
+          blockKey, new Uint8Array(256 * batch.length).fill(batch[0] % 251));
+        attempts.push(await advanceHeadBy(env.MERKLE_BUCKET, headKeys[shard], batch.length));
+        batchLatencies.push(performance.now() - started);
+      }
+    }));
+    const values = await Promise.all(headKeys.map(async key => {
+      const head = await env.MERKLE_BUCKET.get(key);
+      return head ? Number(await head.text()) : 0;
+    }));
+    const wallMs = performance.now() - startedAll;
+    const finalWrites = values.reduce((a, b) => a + b, 0);
+    return {backend: "cloudflare-r2", samples, batchSize, shards,
+      batches: batchLatencies.length, finalWrites, lostUpdates: samples - finalWrites,
+      casPerLogicalWrite: batchLatencies.length / samples,
+      p50BatchMs: percentile(batchLatencies, 0.50),
+      p95BatchMs: percentile(batchLatencies, 0.95),
+      wallMs, logicalWritesPerSec: samples * 1000 / wallMs,
+      totalCasAttempts: attempts.reduce((a, b) => a + b, 0),
+      maxCasAttempts: Math.max(...attempts)};
+  } finally {
+    await Promise.all([...blockKeys, ...headKeys].map(key => env.MERKLE_BUCKET.delete(key)));
+  }
+}
+
 async function listAll(bucket, prefix) {
   const objects = [];
   let cursor;
@@ -317,10 +373,10 @@ const E2E_PAGE = `<!doctype html><html lang="en"><head><meta charset="utf-8">
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    if (["/bench/write-cas", "/bench/orphan-gc", "/bench/compaction-lease"].includes(url.pathname) &&
+    if (["/bench/write-cas", "/bench/write-batch", "/bench/orphan-gc", "/bench/compaction-lease"].includes(url.pathname) &&
         !env.E2E_BEARER_TOKEN)
       return response({ error: "write benchmark capability is not configured" }, 503);
-    if (["/bench/write-cas", "/bench/orphan-gc", "/bench/compaction-lease"].includes(url.pathname) &&
+    if (["/bench/write-cas", "/bench/write-batch", "/bench/orphan-gc", "/bench/compaction-lease"].includes(url.pathname) &&
         !authorized(request, env))
       return response({ error: "unauthorized" }, 401);
     if (["/e2e/config", "/e2e/bundle", "/e2e/object", "/e2e/key"].includes(url.pathname) &&
@@ -412,6 +468,12 @@ export default {
       const samples = Math.min(256, Math.max(1, Number(url.searchParams.get("samples") || 32)));
       const concurrency = Math.min(32, Math.max(1, Number(url.searchParams.get("concurrency") || 8)));
       return response(await benchmarkR2Cas(env, samples, concurrency));
+    }
+    if (request.method === "POST" && url.pathname === "/bench/write-batch") {
+      const samples = Math.min(1024, Math.max(1, Number(url.searchParams.get("samples") || 32)));
+      const batchSize = Math.min(128, Math.max(1, Number(url.searchParams.get("batchSize") || 8)));
+      const shards = Math.min(samples, Math.max(1, Number(url.searchParams.get("shards") || 1)));
+      return response(await benchmarkR2Transactor(env, samples, batchSize, shards));
     }
     if (request.method === "POST" && url.pathname === "/bench/orphan-gc") {
       return response(await benchmarkR2OrphanGc(env));
