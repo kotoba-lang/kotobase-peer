@@ -296,7 +296,7 @@
                      (-> right
                          (dissoc :pack-bytes :effects)
                          (assoc :pack-byte-count
-                                (get-in right [:bundle :node "pack-bytes"]))) ]})
+                                (get-in right [:bundle :node "pack-bytes"])))]})
         bundle (get-in composed [:bundle :node])
         plan (view/range-query-plan
               {:bundle bundle :lower "a" :upper "d"})
