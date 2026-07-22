@@ -216,6 +216,16 @@ is neither committed nor sent in the page URL. Tenant responses are
 `private, immutable` and vary on authorization. See
 `bench/results/2026-07-21-browser-r2-load-auth.edn` for the real R2 receipt.
 
+Encrypted views keep plaintext logical block CIDs separate from ciphertext
+storage CIDs. Each bundle descriptor carries its key ID, algorithm, nonce,
+plaintext length, and ciphertext range. The browser retrieves a DEK only
+through the authorized, no-store host endpoint, decrypts each selected block
+with WebCrypto AES-256-GCM, then resumes the pure kernel and verifies the
+plaintext IPLD CID before decode. Rotating a key therefore replaces the
+ciphertext pack and bundle while preserving logical block identity. The real
+encrypted R2/browser result is recorded in
+`bench/results/2026-07-22-browser-r2-encrypted-view.edn`.
+
 This is currently a behavior-preserving shadow substrate: existing
 `commit!`/`hot-datoms`/`fold!` remain the live path until read equivalence and
 CLJ/CLJS CID determinism gates pass. New storage work must target the

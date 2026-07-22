@@ -129,6 +129,23 @@
         bytes (ipld/encode node)]
     {:node node :bytes bytes :cid (ipld/cid bytes)}))
 
+(defn- store-block [block key-id encrypt-block-fn]
+  (if-not encrypt-block-fn
+    (assoc block :stored-bytes (:bytes block))
+    (let [{:keys [bytes algorithm nonce]} (encrypt-block-fn
+                                            {:key-id key-id
+                                             :block-cid (:cid block)
+                                             :plaintext (:bytes block)})]
+      (when-not (and bytes (string? algorithm) nonce)
+        (throw (ex-info "Block encryption must return bytes, algorithm, and nonce"
+                        {:key-id key-id})))
+      (assoc block
+             :stored-bytes bytes
+             :encryption {"algorithm" algorithm
+                          "key-id" key-id
+                          "nonce" nonce}
+             :stored-cid (ipld/cid bytes)))))
+
 (defn build-view
   "Build a deterministic packed materialized view.
 
@@ -137,12 +154,17 @@
   granularity. The result contains one :object/put for the packed bytes and one
   :block/put for the small query bundle."
   [{:keys [view-id epoch entries block-rows source-manifest plan-cid sorted?
-           previous-bundle mode]
+           previous-bundle mode key-id encrypt-block-fn]
     :or {block-rows 512}}]
   (when-not (and (integer? epoch) (not (neg? epoch)))
     (throw (ex-info "View epoch must be a non-negative integer" {:epoch epoch})))
   (when-not (and (integer? block-rows) (pos? block-rows))
     (throw (ex-info "View block rows must be positive" {:block-rows block-rows})))
+  (when-not (= (boolean key-id) (boolean encrypt-block-fn))
+    (throw (ex-info "Encrypted views require both key-id and encrypt-block-fn"
+                    {:key-id key-id})))
+  (when (and key-id (not (string? key-id)))
+    (throw (ex-info "View encryption key-id must be a string" {:key-id key-id})))
   (let [row-seq (map (fn [{:keys [key value op] :or {op :assert}}]
                        (when-not (string? key)
                          (throw (ex-info "View key must be a string" {:key key})))
@@ -160,13 +182,14 @@
                (->> row-seq
                     (sort-by (juxt #(get % "key") #(pr-str (get % "value"))))
                     vec))
-        blocks (mapv #(encode-block view-id epoch (vec %))
+        blocks (mapv #(store-block (encode-block view-id epoch (vec %))
+                                   key-id encrypt-block-fn)
                      (partition-all block-rows rows))
-        pack-bytes (concat-bytes (map :bytes blocks))
+        pack-bytes (concat-bytes (map :stored-bytes blocks))
         pack-cid (ipld/cid pack-bytes)
         descriptors (loop [offset 0, blocks blocks, result []]
                       (if-let [block (first blocks)]
-                        (let [length (byte-count (:bytes block))
+                        (let [length (byte-count (:stored-bytes block))
                               filter-data (build-bloom
                                            (map #(get % "key")
                                                 (get (:node block) "rows")))]
@@ -179,7 +202,11 @@
                                          "count" (get (:node block) "count")
                                          "min-key" (get (:node block) "min-key")
                                          "max-key" (get (:node block) "max-key")}
-                                         filter-data (assoc "filter" filter-data)))))
+                                         filter-data (assoc "filter" filter-data)
+                                         (:encryption block)
+                                         (assoc "plaintext-length" (byte-count (:bytes block))
+                                                "stored-cid" (ipld/link (:stored-cid block))
+                                                "encryption" (:encryption block))))))
                         result))
         bundle-node (cond->
                      {"format" "kotobase/query-bundle"
@@ -314,10 +341,41 @@
                       {:expected expected :actual actual})))
     (ipld/decode bytes)))
 
+(defn finish-logical-blocks-rows
+  "Verify/decode already decrypted logical blocks in descriptor order. Async
+  browser crypto stays a host concern; this resumes the pure query kernel."
+  [plan plaintext-blocks]
+  (let [descriptors (:descriptors plan)]
+    (when-not (= (count descriptors) (count plaintext-blocks))
+      (throw (ex-info "Materialized view logical block count mismatch"
+                      {:expected (count descriptors)
+                       :actual (count plaintext-blocks)})))
+    (->> (map vector descriptors plaintext-blocks)
+         (mapcat (fn [[descriptor bytes]]
+                   (get (decode-range descriptor bytes) "rows")))
+         (filter (fn [row]
+                   (let [key (get row "key")]
+                     (and (or (nil? (:lower plan))
+                              (not (neg? (compare key (:lower plan)))))
+                          (or (nil? (:upper plan))
+                              (not (pos? (compare key (:upper plan)))))))))
+         vec)))
+
+(defn finish-logical-blocks-query
+  "Finish a base query from host-decrypted blocks, preserving CID verification."
+  [plan plaintext-blocks]
+  (let [limit (or (:limit plan)
+                  #?(:clj Long/MAX_VALUE :cljs js/Number.MAX_SAFE_INTEGER))]
+    (->> (finish-logical-blocks-rows plan plaintext-blocks)
+         (filter #(= "assert" (get % "op")))
+         (take limit)
+         (mapv #(get % "value")))))
+
 (defn finish-range-rows
   "Verify/decode RANGE-BYTES and return bounded physical rows, including
   tombstones. Delta-chain merge consumes this lower-level browser primitive."
-  [plan range-bytes]
+  ([plan range-bytes] (finish-range-rows plan range-bytes nil))
+  ([plan range-bytes decrypt-block-fn]
   (let [lower (:lower plan)
         upper (:upper plan)
         logical-ranges
@@ -334,33 +392,42 @@
                                 (get descriptor "length"))])
                 (:descriptors fetch)))
          (:fetches plan) range-bytes)]
-    (->> logical-ranges
-         (mapcat (fn [[descriptor bytes]]
-                   (get (decode-range descriptor bytes) "rows")))
-         (filter (fn [row]
-                   (let [key (get row "key")]
-                     (and (or (nil? lower) (not (neg? (compare key lower))))
-                          (or (nil? upper) (not (pos? (compare key upper))))))))
-         vec)))
+    (finish-logical-blocks-rows
+     (assoc plan :lower lower :upper upper)
+     (mapv (fn [[descriptor stored-bytes]]
+             (if-let [encryption (get descriptor "encryption")]
+               (if decrypt-block-fn
+                 (decrypt-block-fn
+                  {:key-id (get encryption "key-id")
+                   :algorithm (get encryption "algorithm")
+                   :nonce (get encryption "nonce")
+                   :block-cid (ipld/link-cid (get descriptor "cid"))
+                   :ciphertext stored-bytes})
+                 (throw (ex-info "Encrypted view block requires decrypt-block-fn"
+                                 {:key-id (get encryption "key-id")})))
+               stored-bytes))
+           logical-ranges)))))
 
 (defn finish-range-query
   "Finish one base-view query. This is the pure browser/Wasm execution kernel;
   storage and fetch remain host effects."
-  [plan range-bytes]
+  ([plan range-bytes] (finish-range-query plan range-bytes nil))
+  ([plan range-bytes decrypt-block-fn]
   (let [limit (or (:limit plan) #?(:clj Long/MAX_VALUE :cljs js/Number.MAX_SAFE_INTEGER))]
-    (->> (finish-range-rows plan range-bytes)
+    (->> (finish-range-rows plan range-bytes decrypt-block-fn)
          (filter #(= "assert" (get % "op")))
          (take limit)
-         (mapv #(get % "value")))))
+         (mapv #(get % "value"))))))
 
 (defn query-packed
   "In-memory oracle/benchmark helper using the same range plan and CID checks
   as a browser, but slicing a complete pack already supplied by the host."
-  [bundle pack-bytes {:keys [lower upper limit]}]
+  ([bundle pack-bytes query] (query-packed bundle pack-bytes query nil))
+  ([bundle pack-bytes {:keys [lower upper limit]} decrypt-block-fn]
   (let [plan (range-query-plan {:bundle bundle :lower lower :upper upper :limit limit})
         ranges (mapv #(slice-bytes pack-bytes (:offset %) (:length %))
                      (:fetches plan))]
-    {:plan plan :values (finish-range-query plan ranges)}))
+    {:plan plan :values (finish-range-query plan ranges decrypt-block-fn)})))
 
 (defn range-query-plan-chain
   "Plan the same bounded query against BUNDLES ordered newest first. Fetching

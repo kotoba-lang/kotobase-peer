@@ -1,11 +1,11 @@
 const OBJECT_KEY = "bench/materialized-view-pack-v1-8346444";
 const OBJECT_BYTES = 8_346_444;
 const E2E_PACK_KEY = "bench/e2e/view-pack-v1";
-const E2E_PACK_BYTES = 63_090;
+const E2E_PACK_BYTES = 63_250;
 const E2E_BUNDLE_KEY = "bench/e2e/query-bundle-v1";
-const E2E_BUNDLE_CID = "bafyreiczu47uqhv2mbid765rkv2zukfu7l664kblf22oodrkm72swyd3ge";
+const E2E_BUNDLE_CID = "bafyreic6llgakz2qbgd3mxmw3zd47v3srwr5fc3vkug5ou77yjtzc6tk4y";
 const E2E_QUERY_KEY = "tenant-a/000000500";
-const E2E_ASSET_VERSION = "load-auth-v2";
+const E2E_ASSET_VERSION = "encrypted-v1";
 
 function percentile(values, p) {
   const sorted = [...values].sort((a, b) => a - b);
@@ -95,7 +95,7 @@ const E2E_PAGE = `<!doctype html><html lang="en"><head><meta charset="utf-8">
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    if (["/e2e/config", "/e2e/bundle", "/e2e/object"].includes(url.pathname) &&
+    if (["/e2e/config", "/e2e/bundle", "/e2e/object", "/e2e/key"].includes(url.pathname) &&
         !authorized(request, env)) {
       return response({ error: "unauthorized" }, 401);
     }
@@ -123,6 +123,13 @@ export default {
     }
     if (request.method === "GET" && url.pathname === "/e2e/config") {
       const result = response({ bundleCid: E2E_BUNDLE_CID, queryKey: E2E_QUERY_KEY });
+      result.headers.set("cache-control", "no-store");
+      result.headers.set("vary", "authorization");
+      return result;
+    }
+    if (request.method === "GET" && url.pathname === "/e2e/key") {
+      if (!env.E2E_DEK_B64) return response({ error: "E2E DEK is not configured" }, 503);
+      const result = response({ keyId: "tenant-a/dek-v1", key: env.E2E_DEK_B64 });
       result.headers.set("cache-control", "no-store");
       result.headers.set("vary", "authorization");
       return result;
@@ -175,7 +182,8 @@ export default {
         "content-type": "text/html; charset=utf-8", "cache-control": "no-store",
       }});
     }
-    if (request.method === "GET" && url.pathname === "/e2e") {
+    if (request.method === "GET" &&
+        (url.pathname === "/e2e" || url.pathname === "/e2e/encrypted-v1")) {
       return new Response(E2E_PAGE, { headers: {
         "content-type": "text/html; charset=utf-8", "cache-control": "no-store",
       }});

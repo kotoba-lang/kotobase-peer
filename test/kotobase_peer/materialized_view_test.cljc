@@ -9,6 +9,22 @@
            :value {"id" i "title" (str "post-" i)}})
         (range n)))
 
+(defn- xor-bytes [bytes key-byte]
+  #?(:clj
+     (byte-array (map #(unchecked-byte (bit-xor key-byte (bit-and 255 %))) bytes))
+     :cljs
+     (js/Uint8Array. (clj->js (mapv #(bit-xor key-byte %) bytes)))))
+
+(defn- test-encryptor [key-byte]
+  (fn [{:keys [plaintext]}]
+    {:bytes (xor-bytes plaintext key-byte)
+     :algorithm "test/xor-v1"
+     :nonce #?(:clj (byte-array [1 2 3]) :cljs (js/Uint8Array. #js [1 2 3]))}))
+
+(defn- test-decryptor [keys]
+  (fn [{:keys [key-id ciphertext]}]
+    (xor-bytes ciphertext (get keys key-id))))
+
 (deftest packed-view-is-deterministic-and-independently-addressed
   (let [a (view/build-view {:view-id :posts/by-time :epoch 7
                             :block-rows 4 :entries (entries 10)})
@@ -64,6 +80,47 @@
        :cljs (aset corrupt 0 (bit-xor 1 (aget corrupt 0))))
     (is (thrown? #?(:clj Exception :cljs js/Error)
                  (view/decode-range descriptor corrupt)))))
+
+(deftest encrypted-blocks-preserve-range-addressing-and-plaintext-cids
+  (let [built (view/build-view {:view-id :private/feed :epoch 3
+                                :block-rows 4 :entries (entries 10)
+                                :key-id "tenant-a/dek-v1"
+                                :encrypt-block-fn (test-encryptor 91)})
+        bundle (get-in built [:bundle :node])
+        descriptor (first (get bundle "blocks"))
+        result (view/query-packed bundle (:pack-bytes built)
+                                  {:lower "tenant-a/00000003"
+                                   :upper "tenant-a/00000006"}
+                                  (test-decryptor {"tenant-a/dek-v1" 91}))]
+    (is (= "tenant-a/dek-v1" (get-in descriptor ["encryption" "key-id"])))
+    (is (= "test/xor-v1" (get-in descriptor ["encryption" "algorithm"])))
+    (is (ipld/link? (get descriptor "stored-cid")))
+    (is (= (range 3 7) (map #(get % "id") (:values result))))
+    (is (= 1 (get-in result [:plan :estimated-requests])))
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (view/query-packed bundle (:pack-bytes built)
+                                    {:lower "tenant-a/00000003"
+                                     :upper "tenant-a/00000003"})))
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (view/query-packed bundle (:pack-bytes built)
+                                    {:lower "tenant-a/00000003"
+                                     :upper "tenant-a/00000003"}
+                                    (test-decryptor {"tenant-a/dek-v1" 17}))))))
+
+(deftest key-rotation-changes-envelope-not-logical-block-cid
+  (let [v1 (view/build-view {:view-id :private/feed :epoch 3
+                             :block-rows 5 :entries (entries 10)
+                             :key-id "tenant-a/dek-v1"
+                             :encrypt-block-fn (test-encryptor 41)})
+        v2 (view/build-view {:view-id :private/feed :epoch 3
+                             :block-rows 5 :entries (entries 10)
+                             :key-id "tenant-a/dek-v2"
+                             :encrypt-block-fn (test-encryptor 73)})]
+    (is (= (map :cid (:blocks v1)) (map :cid (:blocks v2))))
+    (is (not= (:pack-cid v1) (:pack-cid v2)))
+    (is (not= (get-in v1 [:bundle :cid]) (get-in v2 [:bundle :cid])))
+    (is (= "tenant-a/dek-v2"
+           (get-in v2 [:bundle :node "blocks" 0 "encryption" "key-id"])))))
 
 (deftest block-bloom-has-no-false-negatives-and-prunes-exact-misses
   (let [built (view/build-view {:view-id :lookup :epoch 1

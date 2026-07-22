@@ -1,0 +1,43 @@
+{:date "2026-07-22"
+ :target "https://kotobase-view-bench.04-feasts-minded.workers.dev/e2e/encrypted-v1"
+ :worker-version "c0493960-6a36-4047-9a77-7c0416385e73"
+ :asset-version "encrypted-v1"
+ :backend :cloudflare-r2
+ :browser "Headless Chrome 151"
+ :fixture {:rows 1000
+           :encryption "AES-256-GCM"
+           :key-id "tenant-a/dek-v1"
+           :key-storage :worker-secret
+           :key-recorded? false
+           :pack-cid "bafyreiaoczu4mt55b7zqsgv4g26whohnweb6oyd5bjrivits7du2yypvky"
+           :pack-bytes 63250
+           :bundle-cid "bafyreic6llgakz2qbgd3mxmw3zd47v3srwr5fc3vkug5ou77yjtzc6tk4y"
+           :bundle-bytes 4756}
+ :path [:bearer-authorize
+        :fetch-dek-no-store
+        :import-webcrypto-key
+        :fetch-ciphertext-range
+        :aes-gcm-decrypt-block
+        :verify-plaintext-block-cid
+        :decode-dag-cbor
+        :render]
+ :point {:cold {:samples 10 :p50-ms 47.2 :p95-ms 63.8 :p99-ms 63.8
+                :min-ms 41.7 :max-ms 82.4}
+         :warm {:samples 20 :p50-ms 2.8 :p95-ms 3.5 :p99-ms 3.5
+                :min-ms 2.7 :max-ms 43.1}
+         :requests 1 :ciphertext-range-bytes 6364
+         :value {"id" 500 "title" "Post 500"}}
+ :range {:cold {:samples 10 :p50-ms 48.6 :p95-ms 54.7 :p99-ms 54.7
+                :min-ms 45.3 :max-ms 57.8}
+         :rows 200 :requests 1 :ciphertext-range-bytes 19092}
+ :concurrent {:batches 5 :concurrency 8 :samples 40
+              :latency {:p50-ms 90.5 :p95-ms 140.4 :p99-ms 142.3
+                        :min-ms 47.6 :max-ms 144.8}
+              :batch-wall {:p50-ms 100.4 :p95-ms 136.6 :p99-ms 136.6
+                           :min-ms 82.3 :max-ms 145.5}}
+ :authorization {:unauthorized-key-status 401 :authorized-key-status 200}
+ :http {:data-range-requests 80 :key-requests 1}
+ :total-harness-ms 1801.2
+ :plaintext-cid-verified-every-query? true
+ :console-errors []
+ :outcome :succeeded}

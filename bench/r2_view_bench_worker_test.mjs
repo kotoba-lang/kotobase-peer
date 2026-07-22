@@ -46,7 +46,7 @@ assert.match(await page.text(), /Kotobase Browser Range Benchmark/);
 const config = await worker.fetch(new Request(`${origin}/e2e/config`), env);
 assert.equal(config.status, 200);
 assert.deepEqual(await config.json(), {
-  bundleCid: "bafyreiczu47uqhv2mbid765rkv2zukfu7l664kblf22oodrkm72swyd3ge",
+  bundleCid: "bafyreic6llgakz2qbgd3mxmw3zd47v3srwr5fc3vkug5ou77yjtzc6tk4y",
   queryKey: "tenant-a/000000500",
 });
 
@@ -59,19 +59,21 @@ const e2eRange = await worker.fetch(new Request(`${origin}/e2e/object`, {
   headers: { Range: "bytes=100-199" },
 }), env);
 assert.equal(e2eRange.status, 206);
-assert.equal(e2eRange.headers.get("content-range"), "bytes 100-199/63090");
+assert.equal(e2eRange.headers.get("content-range"), "bytes 100-199/63250");
 assert.deepEqual(calls.at(-1).options, { range: { offset: 100, length: 100 } });
 
 const e2ePage = await worker.fetch(new Request(`${origin}/e2e`), env);
 assert.equal(e2ePage.status, 200);
 assert.match(await e2ePage.text(), /bundle CID → plan → R2 Range/);
 assert.match(await (await worker.fetch(new Request(`${origin}/e2e`), env)).text(),
-             /view-e2e\.js\?v=load-auth-v2/);
+             /view-e2e\.js\?v=encrypted-v1/);
+assert.equal((await worker.fetch(new Request(`${origin}/e2e/encrypted-v1`), env)).status, 200);
 
 const browserAsset = await worker.fetch(new Request(`${origin}/view-e2e.js`), env);
 assert.equal(await browserAsset.text(), "compiled browser asset");
 
-const protectedEnv = { ...env, E2E_BEARER_TOKEN: "test-capability" };
+const protectedEnv = { ...env, E2E_BEARER_TOKEN: "test-capability",
+                       E2E_DEK_B64: "fixture-key" };
 const callsBeforeDenied = calls.length;
 const denied = await worker.fetch(new Request(`${origin}/e2e/object`, {
   headers: { Range: "bytes=100-199" },
@@ -87,4 +89,11 @@ assert.equal(calls.at(-1).key, "bench/e2e/view-pack-v1");
 assert.match(allowed.headers.get("cache-control"), /private/);
 assert.equal(allowed.headers.get("vary"), "authorization");
 
-console.log(JSON.stringify({ tests: 12, assertions: 31, outcome: "succeeded" }));
+const key = await worker.fetch(new Request(`${origin}/e2e/key`, {
+  headers: { Authorization: "Bearer test-capability" },
+}), protectedEnv);
+assert.equal(key.status, 200);
+assert.deepEqual(await key.json(), { keyId: "tenant-a/dek-v1", key: "fixture-key" });
+assert.equal(key.headers.get("cache-control"), "no-store");
+
+console.log(JSON.stringify({ tests: 13, assertions: 35, outcome: "succeeded" }));
