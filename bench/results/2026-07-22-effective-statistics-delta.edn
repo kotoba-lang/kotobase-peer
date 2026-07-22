@@ -1,0 +1,21 @@
+{:date "2026-07-22"
+ :scope :hot-arrangement-transactor
+ :entry :kotobase-peer.core/transact-with-statistics
+ :normalizer :kotobase-peer.core/transact-effective
+ :fixture {:raw-ops 10000
+           :duplicate-asserts 9997
+           :missing-retracts 1
+           :effective-retracts 1
+           :effective-asserts 1}
+ :result {:effective-deltas 2 :pruned-noops 9998 :pruned-percent 99.98}
+ :benchmark {:runtime :jvm :samples 30
+             :p50-ms 10.059 :p95-ms 23.901208}
+ :semantics {:ordered? true
+             :duplicate-assert-pruned? true
+             :missing-retract-pruned? true
+             :entity-retract-expanded? true
+             :statistics-same-epoch? true}
+ :tests {:clj {:tests 176 :assertions 449}
+         :cljs {:tests 170 :assertions 443}
+         :lint-errors 0}
+ :outcome :succeeded}

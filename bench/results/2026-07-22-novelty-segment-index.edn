@@ -1,0 +1,22 @@
+{:date "2026-07-22"
+ :command "clojure -M:persisted-effective-bench 10000 30"
+ :environment {:runtime "OpenJDK 26.0.1"
+               :store :in-memory
+               :crypto :identity
+               :segment-entries 16}
+ :fixture {:folded-datoms 10000 :accumulating-writes 30 :samples 30}
+ :full-hydration-baseline {:p50-ms 91.542333
+                           :p95-ms 121.489666
+                           :average-block-gets 44.0}
+ :segmented-no-op {:p50-ms 16.8445
+                   :p95-ms 20.438042
+                   :average-block-gets 4.0
+                   :blocks-written 0
+                   :cas-calls 0}
+ :segmented-effective-commit {:p50-ms 35.71875
+                              :p95-ms 46.060417
+                              :average-block-gets 7.366666666666666
+                              :commits 30}
+ :previous-per-node-index {:average-block-gets 19.5}
+ :comparison {:effective-block-get-reduction-percent 62.22}
+ :interpretation "Metadata traversal is O(novelty/16), bounded to four segment reads by the default fold threshold of 64. This is block-based and append-bounded, but not an unbounded O(log novelty) tree; prompt folding remains part of the latency contract."}

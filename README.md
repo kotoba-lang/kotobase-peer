@@ -280,6 +280,55 @@ back to visible scans. Refreshing 10,000 deltas across three clauses measured
 p50 24.87 ms on the JVM. The epoch-pinned R2/browser receipt is
 `bench/results/2026-07-22-browser-r2-statistics-refresh.edn`.
 
+`transact-effective` is the pure boundary between raw transaction requests and
+those statistics: duplicate asserts and missing/double retracts produce no
+delta, while entity retracts expand the entity's currently asserted triples in
+deterministic order. `transact-with-statistics` applies that normalized result
+and refreshes the scoped statistics at the same epoch. A 10,000-op fixture with
+9,998 no-ops produced two effective deltas in p50 10.06 ms. See
+`bench/results/2026-07-22-effective-statistics-delta.edn`.
+
+`commit-serialized-effective!` carries normalization through the durable CAS
+publication boundary. It hydrates and CID-verifies the actual winning head,
+persists only effective assert/retract deltas, and re-runs normalization after a
+lost race. A semantic no-op creates no block, chain entry, or CAS operation.
+This correctness-first path currently performs a full head
+hydration; already-normalized writers can retain the O(tx)
+`commit-serialized!` append path. See
+`bench/results/2026-07-22-persisted-effective-cas.edn`.
+
+The persisted path now uses `hydrate-transaction-slice`: one range-pruned EAVT
+prefix read per distinct transaction subject plus one replay of the bounded
+unfolded novelty set. Unrelated snapshot rows are never hydrated, while
+retract/reassert and retractEntity semantics remain identical to a full replay.
+On cljs, `:async-get-fn` routes these prefixes directly through the asynchronous
+prolly-tree scanner. See
+`bench/results/2026-07-22-persisted-effective-prefix.edn`.
+
+New novelty queue nodes also carry keyed blinded subject tokens. Effective
+writes supply the same `blind-fn` used by the indexed arrangement, so a slice
+walk can reject unrelated tx blocks before fetching or decrypting their
+ciphertext. Nodes written through the legacy `commit!` arity have no tokens and
+remain readable through a conservative fallback. With 30 distinct unfolded
+writes, effective commits averaged 19.5 total block gets instead of fetching
+every novelty ciphertext; the remaining linear cost is the queue-node walk.
+See `bench/results/2026-07-22-novelty-subject-index.edn`.
+
+The subject directory is now grouped into immutable 16-entry metadata
+segments. The head points only to the newest segment; full segments link to the
+previous segment, while appends rewrite at most one bounded partial segment.
+At the default fold threshold this caps directory reads at four blocks instead
+of 64 queue nodes. Thirty accumulating writes averaged 7.37 total block gets,
+down from 19.5 with the per-node directory. See
+`bench/results/2026-07-22-novelty-segment-index.edn`.
+
+Bounded partial folds now preserve both queue-node subject tokens and rebuild
+the remaining segment directory; folding no longer silently drops the pruning
+optimization. `fold-serialized-if-needed!` combines the fold threshold,
+bounded `max-novelty`, and HeadCAS publication into one scheduler primitive.
+Below threshold it writes no blocks and performs no CAS; after contention it
+re-evaluates the actual winning head before deciding or folding.
+
 This is currently a behavior-preserving shadow substrate: existing
 `commit!`/`hot-datoms`/`fold!` remain the live path until read equivalence and
 CLJ/CLJS CID determinism gates pass. New storage work must target the
@@ -348,8 +397,8 @@ entirely chain's job. Neither library needed to change.
 ## Test
 
 ```bash
-clojure -M:test              # JVM      -- 94 tests / 196 assertions
-npm run test:cljs            # cljs     -- 85 tests / 180 assertions (real shadow-cljs build + node, not nbb)
+clojure -M:test              # JVM      -- 183 tests / 479 assertions
+npm run test:cljs            # cljs     -- 171 tests / 447 assertions (real shadow-cljs build + node, not nbb)
 ```
 
 Both 0 failures, 0 errors. Counts differ slightly because some assertions

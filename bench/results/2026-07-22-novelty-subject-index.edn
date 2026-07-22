@@ -1,0 +1,22 @@
+{:date "2026-07-22"
+ :command "clojure -M:persisted-effective-bench 10000 30"
+ :environment {:runtime "OpenJDK 26.0.1"
+               :store :in-memory
+               :crypto :identity
+               :layout "10,000 folded datoms followed by 30 distinct-subject novelty writes"}
+ :fixture {:entities 10000 :samples 30 :subjects-per-transaction 1}
+ :full-hydration-baseline {:p50-ms 84.055583
+                           :p95-ms 189.461
+                           :average-block-gets 44.0}
+ :indexed-no-op {:p50-ms 16.960375
+                 :p95-ms 20.136708
+                 :average-block-gets 4.0
+                 :blocks-written 0
+                 :cas-calls 0}
+ :indexed-effective-commit {:p50-ms 33.897541
+                            :p95-ms 43.886875
+                            :average-block-gets 19.5
+                            :commits 30}
+ :correctness-probe {:novelty-nodes 20
+                     :matching-ciphertexts-decrypted 1}
+ :interpretation "Blind subject tokens prune unrelated encrypted tx blocks without exposing plaintext subjects. Total gets still grow with novelty because the persistent queue nodes themselves must be walked; a block-level summary/tree is the next optimization."}

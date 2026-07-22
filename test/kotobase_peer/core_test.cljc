@@ -854,6 +854,213 @@
        (is (= c2 (get @heads "actor:alice")) "the retried commit is the one that actually won"))))
 
 #?(:clj
+   (deftest commit-serialized-effective-prunes-persisted-no-ops
+     (let [{:keys [put! get-fn store]} (mem-store)
+           heads (atom {})
+           cas-calls (atom 0)
+           cas! (fn [head-key expected new]
+                  (swap! cas-calls inc)
+                  (if (= (get @heads head-key) expected)
+                    (do (swap! heads assoc head-key new) new)
+                    (get @heads head-key)))
+           initial (eng/commit-serialized-effective!
+                    put! get-fn cas! "actor:alice" nil
+                    [{:s "alice" :p "role" :o "admin"}]
+                    test-encrypt-fn test-blind-fn test-decrypt-fn)
+           blocks-before (count @store)
+           calls-before @cas-calls
+           no-op (eng/commit-serialized-effective!
+                  put! get-fn cas! "actor:alice" (:chain-cid-after initial)
+                  [{:s "alice" :p "role" :o "admin"}
+                   {:s "alice" :p "missing" :o "value" :op :retract}]
+                  test-encrypt-fn test-blind-fn test-decrypt-fn)]
+       (is (false? (:committed? no-op)))
+       (is (= (:chain-cid-before no-op) (:chain-cid-after no-op)))
+       (is (empty? (:effective-deltas no-op)))
+       (is (= blocks-before (count @store)) "semantic no-op writes no CAS blocks")
+       (is (= calls-before @cas-calls) "semantic no-op does not touch mutable head"))))
+
+#?(:clj
+   (deftest transaction-slice-is-prefix-pruned-and-novelty-correct
+     (let [{:keys [put! get-fn]} (mem-store)
+           seed (mapv (fn [i] [(str "entity-" i) "role" "user"]) (range 1000))
+           c0 (eng/commit! put! get-fn seed nil test-encrypt-fn)
+           folded (eng/fold! put! get-fn c0 test-blind-fn test-encrypt-fn test-decrypt-fn)
+           c1 (eng/commit! put! get-fn
+                           [[:db/retract "entity-42" "role" "user"]
+                            [:db/add "entity-42" "role" "admin"]
+                            [:db/add "unrelated" "role" "guest"]]
+                           folded test-encrypt-fn)
+           slice (eng/hydrate-transaction-slice
+                  get-fn c1 [[:db/add "entity-42" "role" "admin"]]
+                  test-blind-fn test-decrypt-fn)]
+       (is (= #{"entity-42"} (set (keys (:spo slice))))
+           "snapshot prefix and novelty replay exclude unrelated subjects")
+       (is (= #{"admin"} (get-in slice [:spo "entity-42" "role"])))
+       (is (empty? (:effective-deltas
+                    (eng/transact-effective slice
+                                            [[:db/add "entity-42" "role" "admin"]])))))))
+
+#?(:clj
+   (deftest transaction-slice-skips-unrelated-indexed-novelty-ciphertexts
+     (let [{:keys [put! get-fn]} (mem-store)
+           heads (atom {})
+           cas! (fn [head-key expected new]
+                  (if (= (get @heads head-key) expected)
+                    (do (swap! heads assoc head-key new) new)
+                    (get @heads head-key)))
+           head (reduce (fn [head i]
+                          (:chain-cid-after
+                           (eng/commit-serialized-effective!
+                            put! get-fn cas! "actors" head
+                            [[(str "entity-" i) "role" "user"]]
+                            test-encrypt-fn test-blind-fn test-decrypt-fn)))
+                        nil (range 20))
+           decrypts (atom 0)
+           reads (atom 0)
+           counted-get (fn [cid] (swap! reads inc) (get-fn cid))
+           counting-decrypt (fn [ciphertext]
+                              (swap! decrypts inc)
+                              (test-decrypt-fn ciphertext))
+           slice (eng/hydrate-transaction-slice
+                  counted-get head [["entity-7" "role" "user"]]
+                  test-blind-fn counting-decrypt)]
+       (is (= #{"user"} (get-in slice [:spo "entity-7" "role"])))
+       (is (= 1 @decrypts)
+           "20 novelty entries are classified by blind token; only the matching tx ciphertext is opened")
+       (is (<= @reads 6)
+           "20 entries fit in two metadata segments instead of requiring 20 queue-node reads"))))
+
+#?(:clj
+   (deftest partial-fold-preserves-subject-segment-pruning
+     (let [{:keys [put! get-fn]} (mem-store)
+           heads (atom {})
+           cas! (fn [head-key expected new]
+                  (if (= (get @heads head-key) expected)
+                    (do (swap! heads assoc head-key new) new)
+                    (get @heads head-key)))
+           head (reduce (fn [head i]
+                          (:chain-cid-after
+                           (eng/commit-serialized-effective!
+                            put! get-fn cas! "actors" head
+                            [[(str "entity-" i) "role" "user"]]
+                            test-encrypt-fn test-blind-fn test-decrypt-fn)))
+                        nil (range 20))
+           folded (eng/fold! put! get-fn head ipld/link? 5
+                             test-blind-fn test-encrypt-fn test-decrypt-fn)
+           reads (atom 0)
+           decrypts (atom 0)
+           counted-get (fn [cid] (swap! reads inc) (get-fn cid))
+           slice (eng/hydrate-transaction-slice
+                  counted-get folded [["entity-10" "role" "user"]]
+                  test-blind-fn
+                  (fn [ciphertext] (swap! decrypts inc) (test-decrypt-fn ciphertext)))]
+       (is (= 15 (eng/novelty-size get-fn folded)))
+       (is (= #{"user"} (get-in slice [:spo "entity-10" "role"])))
+       (is (= 1 @decrypts) "only the matching remaining novelty ciphertext is opened")
+       (is (<= @reads 7) "remaining entries are rebuilt into one verified metadata segment"))))
+
+#?(:clj
+   (deftest fold-serialized-if-needed-enforces-threshold-and-bounded-progress
+     (let [{:keys [put! get-fn store]} (mem-store)
+           heads (atom {})
+           cas-calls (atom 0)
+           cas! (fn [head-key expected new]
+                  (swap! cas-calls inc)
+                  (if (= (get @heads head-key) expected)
+                    (do (swap! heads assoc head-key new) new)
+                    (get @heads head-key)))
+           head3 (reduce (fn [head i]
+                           (:chain-cid-after
+                            (eng/commit-serialized-effective!
+                             put! get-fn cas! "actors" head
+                             [[(str "entity-" i) "role" "user"]]
+                             test-encrypt-fn test-blind-fn test-decrypt-fn)))
+                         nil (range 3))
+           blocks-before (count @store)
+           calls-before @cas-calls
+           below (eng/fold-serialized-if-needed!
+                  put! get-fn cas! "actors" head3
+                  test-blind-fn test-encrypt-fn test-decrypt-fn
+                  {:threshold 4 :max-novelty 2})
+           blocks-after-below (count @store)
+           calls-after-below @cas-calls
+           head4 (:chain-cid-after
+                  (eng/commit-serialized-effective!
+                   put! get-fn cas! "actors" head3
+                   [["entity-3" "role" "user"]]
+                   test-encrypt-fn test-blind-fn test-decrypt-fn))
+           folded (eng/fold-serialized-if-needed!
+                   put! get-fn cas! "actors" head4
+                   test-blind-fn test-encrypt-fn test-decrypt-fn
+                   {:threshold 4 :max-novelty 2})]
+       (is (false? (:committed? below)))
+       (is (= blocks-before blocks-after-below) "below threshold writes no blocks")
+       (is (= calls-before calls-after-below) "below threshold performs no CAS")
+       (is (true? (:committed? folded)))
+       (is (= 4 (:novelty-before folded)))
+       (is (= 2 (:novelty-after folded)) "one scheduler invocation makes bounded progress")
+       (is (= (:chain-cid-after folded) (get @heads "actors"))))))
+
+#?(:clj
+   (deftest commit-serialized-effective-publishes-only-effective-deltas
+     (let [{:keys [put! get-fn]} (mem-store)
+           heads (atom {})
+           cas! (fn [head-key expected new]
+                  (if (= (get @heads head-key) expected)
+                    (do (swap! heads assoc head-key new) new)
+                    (get @heads head-key)))
+           initial (eng/commit-serialized-effective!
+                    put! get-fn cas! "actor:alice" nil
+                    [{:s "alice" :p "role" :o "admin"}]
+                    test-encrypt-fn test-blind-fn test-decrypt-fn)
+           report (eng/commit-serialized-effective!
+                   put! get-fn cas! "actor:alice" (:chain-cid-after initial)
+                   [[:db/retract "alice" "role" "admin"]
+                    [:db/add "alice" "role" "user"]
+                    [:db/add "alice" "role" "user"]]
+                   test-encrypt-fn test-blind-fn test-decrypt-fn)
+           rows (eng/hot-datoms get-fn (:chain-cid-after report)
+                                (constantly true) test-blind-fn test-decrypt-fn)]
+       (is (true? (:committed? report)))
+       (is (= [:retract :assert] (mapv :op (:effective-deltas report))))
+       (is (= #{{:e "alice" :a "role" :v_edn "\"user\"" :added true}}
+              (set rows))))))
+
+#?(:clj
+   (deftest commit-serialized-effective-renormalizes-after-lost-cas
+     (let [{:keys [put! get-fn]} (mem-store)
+           heads (atom {})
+           cas-calls (atom 0)
+           cas! (fn [head-key expected new]
+                  (swap! cas-calls inc)
+                  (if (= (get @heads head-key) expected)
+                    (do (swap! heads assoc head-key new) new)
+                    (get @heads head-key)))
+           c0 (:chain-cid-after
+               (eng/commit-serialized-effective!
+                put! get-fn cas! "actor:alice" nil
+                [[:db/add "alice" "role" "admin"]]
+                test-encrypt-fn test-blind-fn test-decrypt-fn))
+           c1 (:chain-cid-after
+               (eng/commit-serialized-effective!
+                put! get-fn cas! "actor:alice" c0
+                [[:db/add "alice" "role" "user"]
+                 [:db/add "alice" "status" "active"]]
+                test-encrypt-fn test-blind-fn test-decrypt-fn))
+           calls-before @cas-calls
+           stale-report (eng/commit-serialized-effective!
+                         put! get-fn cas! "actor:alice" c0
+                         [[:db/add "alice" "role" "user"]]
+                         test-encrypt-fn test-blind-fn test-decrypt-fn)]
+       (is (false? (:committed? stale-report)))
+       (is (= c1 (:chain-cid-after stale-report)))
+       (is (= 1 (:attempts stale-report)))
+       (is (= (inc calls-before) @cas-calls)
+           "first stale attempt loses CAS; retry becomes no-op and performs no second CAS")
+       (is (= [0 1] (mapv :seq (eng/chain get-fn c1))) "head has no duplicate commit"))))
+
+#?(:clj
    (deftest commit-serialized-throws-on-persistent-contention
      (let [{:keys [put! get-fn]} (mem-store)
            always-losing-cas! (fn [head-key expected new] nil)]
@@ -1598,6 +1805,37 @@
                                (done))))))))))
 
 #?(:cljs
+   (deftest commit-serialized-effective-prunes-persisted-no-ops
+     (async done
+       (let [{:keys [put! get-fn store]} (mem-store)
+             heads (atom {})
+             cas-calls (atom 0)
+             cas! (fn [head-key expected new]
+                    (swap! cas-calls inc)
+                    (if (= (get @heads head-key) expected)
+                      (do (swap! heads assoc head-key new) new)
+                      (get @heads head-key)))]
+         (-> (eng/commit-serialized-effective!
+              put! get-fn cas! "actor:alice" nil
+              [[:db/add "alice" "role" "admin"]]
+              test-encrypt-fn test-blind-fn test-decrypt-fn)
+             (.then (fn [initial]
+                      (let [blocks-before (count @store)
+                            calls-before @cas-calls]
+                        (-> (eng/commit-serialized-effective!
+                             put! get-fn cas! "actor:alice" (:chain-cid-after initial)
+                             [[:db/add "alice" "role" "admin"]
+                              [:db/retract "alice" "missing" "value"]]
+                             test-encrypt-fn test-blind-fn test-decrypt-fn)
+                            (.then (fn [report]
+                                     (is (false? (:committed? report)))
+                                     (is (= (:chain-cid-before report)
+                                            (:chain-cid-after report)))
+                                     (is (= blocks-before (count @store)))
+                                     (is (= calls-before @cas-calls))
+                                     (done))))))))))))
+
+#?(:cljs
    (deftest commit-serialized-throws-on-persistent-contention
      (async done
        (let [{:keys [put! get-fn]} (mem-store)
@@ -2233,6 +2471,46 @@
       (let [db' (eng/transact db [[:db/retractEntity "e1"] ["e1" ":a/x" "v9"]])]
         (is (= [{:e "e1" :a ":a/x" :v_edn "\"v9\"" :added true}]
                (eng/datoms db' {:index :eavt :components ["e1"]} everything)))))))
+
+(deftest transact-effective-emits-only-state-transitions
+  (let [db (eng/transact (eng/empty-db)
+                         [["e1" "role" "admin"] ["e1" "name" "Alice"]])
+        result (eng/transact-effective
+                db
+                [[:db/add "e1" "role" "admin"]
+                 [:db/retract "missing" "role" "admin"]
+                 [:db/retract "e1" "role" "admin"]
+                 [:db/retract "e1" "role" "admin"]
+                 [:db/add "e1" "role" "user"]])]
+    (is (= [{:e "e1" :a "role" :v "admin" :op :retract}
+            {:e "e1" :a "role" :v "user" :op :assert}]
+           (:effective-deltas result)))
+    (is (= #{"user"} (get (qs/entity-attrs (:db-after result) "e1") "role")))))
+
+(deftest transact-effective-expands-entity-retraction-deterministically
+  (let [db (eng/transact (eng/empty-db)
+                         [["e1" "role" "admin"] ["e1" "name" "Alice"]])
+        result (eng/transact-effective db [[:db/retractEntity "e1"]])]
+    (is (= [{:e "e1" :a "name" :v "Alice" :op :retract}
+            {:e "e1" :a "role" :v "admin" :op :retract}]
+           (:effective-deltas result)))
+    (is (empty? (qs/entity-attrs (:db-after result) "e1")))))
+
+(deftest transact-with-statistics-refreshes-from-effective-deltas
+  (let [db (eng/transact (eng/empty-db) [["e1" "role" "admin"]])
+        statistics {:visibility-scope "tenant-a/public-v1" :epoch 4
+                    :clauses [{:pattern [nil "role" nil] :rows 1}
+                              {:pattern [nil "role" "admin"] :rows 1}]}
+        result (eng/transact-with-statistics
+                db
+                [[:db/add "e1" "role" "admin"]
+                 [:db/retract "missing" "role" "admin"]
+                 [:db/retract "e1" "role" "admin"]
+                 [:db/add "e2" "role" "user"]]
+                statistics 5)]
+    (is (= 5 (get-in result [:query-statistics :epoch])))
+    (is (= [1 0] (mapv :rows (get-in result [:query-statistics :clauses]))))
+    (is (= 2 (count (:effective-deltas result))))))
 
 #?(:clj
    (deftest commit-retraction-cancels-across-blocks-and-fold

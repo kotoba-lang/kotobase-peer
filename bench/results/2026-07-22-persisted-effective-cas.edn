@@ -1,0 +1,15 @@
+{:date "2026-07-22"
+ :command "clojure -M:persisted-effective-bench 10000 20"
+ :environment {:runtime "OpenJDK 26.0.1"
+               :store :in-memory
+               :crypto :identity
+               :note "Measures normalization, verified head hydration, IPLD encode/decode, block writes, and CAS logic; excludes network and production crypto."}
+ :fixture {:entities 10000 :samples 20}
+ :no-op {:p50-ms 66.285833
+         :p95-ms 124.226292
+         :blocks-written 0
+         :cas-calls 0}
+ :effective {:p50-ms 51.68275
+             :p95-ms 57.297583
+             :commits 20}
+ :interpretation "Persisted no-op pruning is exact, but latency is O(graph) because each attempt fully hydrates the current head. The next optimization is a persisted current-membership arrangement/proof so normalization reads only transaction-touched keys."}
