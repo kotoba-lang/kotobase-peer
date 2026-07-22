@@ -9,6 +9,7 @@
 
 (def format-version 1)
 (def indexes #{:eavt :aevt :avet :vaet})
+(def default-run-block-rows 128)
 (def ^:private max-safe-integer 9007199254740991)
 (def ^:private integer-width 16)
 
@@ -78,12 +79,45 @@
         cid (ipld/cid bytes)]
     {:node node :bytes bytes :cid cid :effects [(block-put cid bytes)]}))
 
+(declare partition-logical-groups row-logical-key)
+
+(defn- build-row-block [index tenant ordinal rows]
+  (let [keys' (mapv #(get % "key") rows)
+        logical-keys (mapv row-logical-key rows)
+        encoded-block
+        (encoded {"format" "kotobase/merkle-run-block"
+                  "version" format-version
+                  "index" (name index)
+                  "tenant" (str tenant)
+                  "ordinal" ordinal
+                  "count" (count rows)
+                  "min-key" (first keys')
+                  "max-key" (peek keys')
+                  "logical-min" (first logical-keys)
+                  "logical-max" (peek logical-keys)
+                  "rows" rows})]
+    (assoc encoded-block
+           :descriptor {"cid" (ipld/link (:cid encoded-block))
+                        "ordinal" ordinal
+                        "count" (count rows)
+                        "min-key" (first keys')
+                        "max-key" (peek keys')
+                        "logical-min" (first logical-keys)
+                        "logical-max" (peek logical-keys)})))
+
 (defn build-run
   "Build a canonical immutable sorted run.
 
   ENTRY input is {:components [...] :epoch n :op :assert|:retract :value v}.
-  The returned value includes :node/:bytes/:cid and a single BlockPut effect."
-  [index tenant entries]
+  Large runs use logical-key-aligned data blocks; effects put those blocks
+  before the small run root. Inline legacy-compatible rows remain for small runs."
+  ([index tenant entries]
+   (build-run index tenant entries {:block-rows default-run-block-rows}))
+  ([index tenant entries {:keys [block-rows]
+                          :or {block-rows default-run-block-rows}}]
+  (when-not (pos-int? block-rows)
+    (throw (ex-info "Run block rows must be a positive integer"
+                    {:block-rows block-rows})))
   (let [rows (->> entries
                   (map (fn [{:keys [components epoch op value]}]
                          (when-not (#{:assert :retract} op)
@@ -102,21 +136,36 @@
                               sort vec)
         component-min (first first-components)
         component-max (peek first-components)
+        blocks (when (> (count rows) block-rows)
+                 (->> rows
+                      (partition-by #(get % "components"))
+                      (partition-logical-groups block-rows)
+                      (map-indexed
+                       (fn [ordinal groups]
+                         (build-row-block index tenant ordinal
+                                          (vec (mapcat identity groups)))))
+                      vec))
         node (cond-> {"format" "kotobase/merkle-run"
                       "version" format-version
                       "index" (name index)
                       "tenant" (str tenant)
                       "count" (count rows)
                       "min-key" (first keys')
-                      "max-key" (peek keys')
-                      "rows" rows}
+                      "max-key" (peek keys')}
+               blocks (assoc "blocks" (mapv :descriptor blocks)
+                             "block-rows" block-rows)
+               (nil? blocks) (assoc "rows" rows)
                component-min (assoc "first-component-min" component-min
-                                    "first-component-max" component-max))]
-    (cond-> (assoc (encoded node)
+                                    "first-component-max" component-max))
+        root (encoded node)]
+    (cond-> (assoc root
+                   :effects (vec (concat (mapcat :effects blocks)
+                                         (:effects root)))
                    :index index :tenant (str tenant) :count (count rows)
-                   :min-key (first keys') :max-key (peek keys'))
+                   :min-key (first keys') :max-key (peek keys')
+                   :rows rows :blocks blocks)
       component-min (assoc :first-component-min component-min
-                           :first-component-max component-max))))
+                           :first-component-max component-max)))))
 
 (defn- datom-entry [index epoch {:keys [e a v op] :or {op :assert}}]
   (let [components (case index
@@ -125,8 +174,6 @@
                      :avet [a v e]
                      :vaet [v a e])]
     {:components components :epoch epoch :op op :value v}))
-
-(declare partition-logical-groups)
 
 (defn build-run-ranges
   "Build deterministic, logical-key-aligned runs of at most TARGET-ROWS.
@@ -176,14 +223,16 @@
 
 (defn run-ref
   "Manifest-safe metadata for a run returned by build-run."
-  [{:keys [cid count min-key max-key first-component-min first-component-max]}]
+  [{:keys [cid count min-key max-key first-component-min first-component-max
+           blocks]}]
   (cond-> {"cid" (ipld/link cid)
            "count" count
            "min-key" min-key
            "max-key" max-key}
     first-component-min
     (assoc "first-component-min" first-component-min
-           "first-component-max" first-component-max)))
+           "first-component-max" first-component-max)
+    (seq blocks) (assoc "blocks" (mapv :descriptor blocks))))
 
 (defn select-run-refs-by-first-component
   "Select refs whose first-component range can contain a string PREFIX.
@@ -330,7 +379,7 @@
            :manifest manifest)))
 
 (defn- run-rows [run]
-  (get (:node run) "rows"))
+  (or (:rows run) (get (:node run) "rows")))
 
 (defn- logical-id [row]
   (get row "components"))

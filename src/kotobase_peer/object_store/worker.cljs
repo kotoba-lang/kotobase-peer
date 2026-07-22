@@ -339,8 +339,34 @@
   [e root expected-etag released-at]
   (cas-retention-root! e (retention/release-node root released-at) expected-etag))
 
-(declare manifest-window! index-run-refs load-runs! all-r2-retention-roots!
+(declare manifest-window! index-run-refs load-run! load-runs! all-r2-retention-roots!
          find-entities!)
+
+(defn- validated-run-block-rows [descriptor block expected-index expected-tenant]
+  (let [rows (get block "rows")
+        first-row (first rows)
+        last-row (peek rows)]
+    (when-not
+     (and (= "kotobase/merkle-run-block" (get block "format"))
+          (= lsm/format-version (get block "version"))
+          (= (get descriptor "ordinal") (get block "ordinal"))
+          (= (get descriptor "count") (count rows) (get block "count"))
+          (= (get descriptor "min-key") (get block "min-key")
+             (get first-row "key"))
+          (= (get descriptor "max-key") (get block "max-key")
+             (get last-row "key"))
+          (= (get descriptor "logical-min") (get block "logical-min")
+             (lsm/row-logical-key first-row))
+          (= (get descriptor "logical-max") (get block "logical-max")
+             (lsm/row-logical-key last-row))
+          (or (nil? expected-index)
+              (= (name expected-index) (get block "index")))
+          (or (nil? expected-tenant)
+              (= (str expected-tenant) (get block "tenant"))))
+      (throw (ex-info "Malformed Merkle run data block"
+                      {:descriptor descriptor
+                       :index expected-index :tenant expected-tenant})))
+    rows))
 
 (defn- collect-index-run-refs!
   [e db-id base-cid index max-depth read-context]
@@ -601,23 +627,70 @@
                                                            (min (count %)
                                                                 (count components))))
                                              prefixes)))]
-                               (-> (reduce
-                                    (fn [pending ref]
-                                      (.then
-                                       pending
-                                       (fn [state]
-                                         (-> (get-node!
-                                              e (ipld/link-cid (get ref "cid")))
-                                             (.then
-                                              (fn [run]
-                                                (lsm/visible-page-add-run
-                                                 state (get run "rows") query-epoch
-                                                 after limit matches-prefix?)))))))
-                                    (js/Promise.resolve {}) selected)
-                                   (.then
-                                    (fn [state]
-                                      (assoc (lsm/visible-page-result state limit)
-                                             :scanned-runs (count selected)))))))))))))))))))
+                               (letfn [(cutoff [candidates]
+                                         (when (> (count candidates) limit)
+                                           (nth (sort (keys candidates)) limit)))
+                                       (fold-block [pending descriptor]
+                                         (.then
+                                          pending
+                                          (fn [{:keys [candidates] :as state}]
+                                            (let [lo (get descriptor "logical-min")
+                                                  hi (get descriptor "logical-max")
+                                                  page-cutoff (cutoff candidates)]
+                                              (if (or (and after hi
+                                                           (not (pos? (compare hi after))))
+                                                      (and page-cutoff lo
+                                                           (pos? (compare lo page-cutoff))))
+                                                state
+                                                (-> (get-node!
+                                                     e (ipld/link-cid
+                                                        (get descriptor "cid")))
+                                                    (.then
+                                                     (fn [block]
+                                                       (let [rows
+                                                             (validated-run-block-rows
+                                                              descriptor block index db-id)]
+                                                         (-> state
+                                                           (assoc :candidates
+                                                                  (lsm/visible-page-add-run
+                                                                   candidates
+                                                                   rows
+                                                                   query-epoch after limit
+                                                                   matches-prefix?))
+                                                           (update :scanned-blocks inc)))))))))))
+                                       (fold-ref [pending ref]
+                                         (.then
+                                          pending
+                                          (fn [state]
+                                            (if-let [blocks (seq (get ref "blocks"))]
+                                              (reduce fold-block
+                                                      (js/Promise.resolve
+                                                       (update state :scanned-runs inc))
+                                                      (sort-by #(get % "ordinal") blocks))
+                                              (-> (load-run! e ref)
+                                                  (.then
+                                                   (fn [run]
+                                                     (-> state
+                                                         (assoc :candidates
+                                                                (lsm/visible-page-add-run
+                                                                 (:candidates state)
+                                                                 (:rows run)
+                                                                 query-epoch after limit
+                                                                 matches-prefix?))
+                                                         (update :scanned-runs inc)
+                                                         (update :scanned-blocks inc)))))))))]
+                                 (-> (reduce fold-ref
+                                             (js/Promise.resolve
+                                              {:candidates {} :scanned-runs 0
+                                               :scanned-blocks 0})
+                                             selected)
+                                     (.then
+                                      (fn [state]
+                                        (assoc (lsm/visible-page-result
+                                                (:candidates state) limit)
+                                               :scanned-runs (:scanned-runs state)
+                                               :scanned-blocks
+                                               (:scanned-blocks state))))))))))))))))))))
 
 (defn- manifest-window!
   [e head-cid limit]
@@ -637,11 +710,34 @@
             (mapcat val (get-in node ["indexes" (name index)])))
           manifests))
 
+(defn- load-run! [e ref]
+  (-> (get-node! e (ipld/link-cid (get ref "cid")))
+      (.then
+       (fn [node]
+         (if-let [blocks (seq (get node "blocks"))]
+           (-> (mapv #(get-node! e (ipld/link-cid (get % "cid")))
+                     (sort-by #(get % "ordinal") blocks))
+               clj->js
+               js/Promise.all
+               (.then (fn [loaded]
+                        (let [rows
+                              (vec
+                               (mapcat (fn [descriptor block]
+                                         (validated-run-block-rows
+                                          descriptor block
+                                          (keyword (get node "index"))
+                                          (get node "tenant")))
+                                       (sort-by #(get % "ordinal") blocks)
+                                       (array-seq loaded)))]
+                          (when-not (= (get node "count") (count rows))
+                            (throw (ex-info "Merkle run block count mismatch"
+                                            {:expected (get node "count")
+                                             :actual (count rows)})))
+                          {:node node :rows rows}))))
+           {:node node :rows (get node "rows")})))))
+
 (defn- load-runs! [e refs]
-  (-> (mapv (fn [ref]
-              (-> (get-node! e (ipld/link-cid (get ref "cid")))
-                  (.then (fn [node] {:node node}))))
-            refs)
+  (-> (mapv #(load-run! e %) refs)
       clj->js
       js/Promise.all
       (.then #(vec (array-seq %)))))

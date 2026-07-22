@@ -114,6 +114,74 @@
              (is false (str "MVCC entity read rejected: " error))
              (done)))))))
 
+(deftest prefix-pages-skip-completed-physical-run-blocks
+  (async done
+    (let [plan (lsm/flush-plan
+                {:db-id "db-blocks" :epoch 1 :target-run-rows 4096
+                 :datoms (mapv (fn [n]
+                                 {:e (str "team-" (.padStart (str n) 4 "0"))
+                                  :a "member" :v "alice"})
+                               (range 300))})
+          effects (filter #(= :block/put (:effect/type %)) (:effects plan))
+          blocks (into {} (map (fn [{:keys [cid bytes]}]
+                                 [(str "paged/blocks/" cid) bytes])) effects)
+          head-cid (get-in plan [:manifest :cid])
+          run-ref (first (get-in plan [:manifest :node "indexes" "aevt" "l0"]))
+          data-cids (set (map #(str "paged/blocks/" (ipld/link-cid (get % "cid")))
+                              (get run-ref "blocks")))
+          root-key (str "paged/blocks/" (ipld/link-cid (get run-ref "cid")))
+          gets (atom [])
+          bucket
+          #js {:get
+               (fn [key]
+                 (swap! gets conj key)
+                 (let [value (if (= key "paged/heads/db-blocks")
+                               head-cid (get blocks key))]
+                   (js/Promise.resolve
+                    (when value
+                      #js {:etag "stable"
+                           :text (fn [] (js/Promise.resolve value))
+                           :arrayBuffer
+                           (fn []
+                             (js/Promise.resolve
+                              (if (string? value)
+                                (.-buffer (.encode (js/TextEncoder.) value))
+                                (.slice (.-buffer value) (.-byteOffset value)
+                                        (+ (.-byteOffset value)
+                                           (.-byteLength value))))))}))))}
+          env #js {"MERKLE_BUCKET" bucket "MERKLE_S3_PREFIX" "paged"}]
+      (letfn [(step [after rows scanned]
+                (-> (worker/find-index-prefix-page!
+                     env "db-blocks" :aevt [["member"]]
+                     (cond-> {:limit 64} after (assoc :after after)))
+                    (.then
+                     (fn [page]
+                       (let [next-rows (into rows (:rows page))
+                             next-scanned (conj scanned (:scanned-blocks page))]
+                         (if (:done? page)
+                           (do
+                             (is (= 300 (count next-rows)))
+                             (is (= [1 2 1 2 1] next-scanned))
+                             (is (not-any? #{root-key} @gets)
+                                 "manifest block descriptors bypass the run root")
+                             (is (= 7 (count (filter data-cids @gets)))
+                                 "continuations skip data blocks entirely before the cursor")
+                             (done))
+                           (step (:cursor page) next-rows next-scanned)))))))]
+        (-> (worker/find-index-prefixes!
+             env "db-blocks" :aevt [["member"]])
+            (.then
+             (fn [rows]
+               (is (= 300 (count rows))
+                   "the compatibility full reader hydrates every data block")
+               (is (some #{root-key} @gets)
+                   "the full reader validates the run root")
+               (reset! gets [])
+               (step nil [] [])))
+            (.catch (fn [error]
+                      (is false (str "subblock prefix page rejected: " error))
+                      (done))))))))
+
 (deftest atomic-publication-persists-everything-before-head-cas
   (async done
     (let [entries (atom {})

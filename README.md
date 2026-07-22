@@ -138,6 +138,14 @@ fully materialized hot `db` (backfill/migration tooling, tests).
 `kotobase-peer.merkle-lsm` contains the pure M1 kernel and M2 shadow-flush
 vertical slice replacing full-snapshot folding:
 
+Large immutable runs are stored as a small run root plus logical-key-aligned
+data blocks (128 rows by default).  The block descriptors are copied into the
+manifest run reference, so a bounded prefix page can skip blocks wholly before
+its continuation without fetching the run root or replaying earlier data.
+Legacy inline-row runs remain readable.  A single hot logical key is never
+split merely to meet the row target and can therefore produce an oversized
+block; that skew case remains an explicit compaction/query-planning boundary.
+
 The Worker object-store adapter supports R2 bindings and signed S3-compatible
 GET/PUT requests. Mutable S3 heads require a provider that implements
 conditional `PutObject`; enable that path explicitly with

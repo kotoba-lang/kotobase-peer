@@ -213,6 +213,29 @@
            (reduce #(add %1 %2 nil) {} [r2 r1]))
         "run fetch order cannot change the page")))
 
+(deftest large-runs-publish-logical-key-aligned-data-subblocks
+  (let [run (lsm/build-run
+             :aevt "tenant-a"
+             (mapv (fn [n]
+                     {:components ["member" (str "team-" n) "alice"]
+                      :epoch 1 :op :assert :value "alice"})
+                   (range 300))
+             {:block-rows 64})
+        descriptors (get-in run [:node "blocks"])
+        ref (lsm/run-ref run)]
+    (is (= 5 (count descriptors)))
+    (is (= 6 (count (:effects run)))
+        "five data blocks and the small run root are independently addressed")
+    (is (nil? (get-in run [:node "rows"])))
+    (is (= descriptors (get ref "blocks")))
+    (is (= (range 5) (map #(get % "ordinal") descriptors)))
+    (is (every? #(<= (get % "count") 64) descriptors))
+    (is (every? (fn [[left right]]
+                  (neg? (compare (get left "logical-max")
+                                 (get right "logical-min"))))
+                (partition 2 1 descriptors)))
+    (is (= 300 (reduce + (map #(get % "count") descriptors))))))
+
 (deftest partitioned-compaction-keeps-one-logical-key-whole
   (let [run (lsm/build-run :eavt "t"
                            (mapv (fn [epoch]
