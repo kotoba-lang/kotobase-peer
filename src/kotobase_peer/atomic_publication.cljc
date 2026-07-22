@@ -30,9 +30,9 @@
                       {:base-manifest base-cid :source-manifest source
                        :view-id (:view-id view)})))
     [(:view-id view)
-     {"bundle" (ipld/link bundle-cid)
-      "pack" (ipld/link (:pack-cid view))
-      "count" (:count view)}]))
+     (cond-> {"bundle" (ipld/link bundle-cid)
+              "count" (:count view)}
+       (:pack-cid view) (assoc "pack" (ipld/link (:pack-cid view))))]))
 
 (defn build-plan
   "Combine an unexecuted Merkle-LSM BASE-PLAN, scoped STATISTICS, and built

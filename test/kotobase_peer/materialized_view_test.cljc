@@ -276,3 +276,32 @@
            :generations [{:bundle (get-in built [:bundle :node])
                           :pack-bytes (:pack-bytes built)}]
            :max-input-bytes 0})))))
+
+(deftest segmented-view-packs-plan-per-descriptor-object-ranges
+  (let [left (view/build-view
+              {:view-id :feed :epoch 9 :block-rows 1
+               :entries [{:key "a" :value 1} {:key "b" :value 2}]})
+        right (view/build-view
+               {:view-id :feed :epoch 9 :block-rows 1
+                :entries [{:key "c" :value 3} {:key "d" :value 4}]})
+        composed (view/compose-view-segments
+                  {:view-id :feed :epoch 9 :segments [left right]})
+        bundle (get-in composed [:bundle :node])
+        plan (view/range-query-plan
+              {:bundle bundle :lower "a" :upper "d"})
+        bytes-by-cid {(str (:pack-cid left)) (:pack-bytes left)
+                      (str (:pack-cid right)) (:pack-bytes right)}
+        ranges (mapv (fn [{:keys [pack-cid offset length]}]
+                       (slice-bytes (get bytes-by-cid (str pack-cid))
+                                    offset length))
+                     (:fetches plan))
+        result (view/finish-range-query plan ranges)]
+    (is (true? (get bundle "segmented")))
+    (is (= 2 (get bundle "segment-count")))
+    (is (nil? (get bundle "pack-cid")))
+    (is (= 4 (count (get bundle "blocks"))))
+    (is (= 2 (:estimated-requests plan))
+        "adjacent blocks coalesce only within the same physical pack")
+    (is (= #{(str (:pack-cid left)) (str (:pack-cid right))}
+           (set (map (comp str :pack-cid) (:fetches plan)))))
+    (is (= [1 2 3 4] result))))

@@ -38,6 +38,28 @@
     (is (every? #{:block/put :object/put}
                 (map :effect/type (pop effects))))))
 
+(deftest segmented-view-publication-omits-the-monolithic-pack-alias
+  (let [{:keys [base statistics]} (fixture)
+        base-cid (get-in base [:manifest :cid])
+        left (view/build-view
+              {:view-id "people/cards" :epoch 7 :source-manifest base-cid
+               :entries [{:key "alice" :value "Alice"}]})
+        right (view/build-view
+               {:view-id "people/cards" :epoch 7 :source-manifest base-cid
+                :entries [{:key "bob" :value "Bob"}]})
+        segmented (view/compose-view-segments
+                   {:view-id "people/cards" :epoch 7
+                    :source-manifest base-cid :segments [left right]})
+        plan (publication/build-plan
+              {:db-id "tenant-a" :expected nil :base-plan base
+               :statistics statistics :views [segmented]})
+        descriptor (get-in plan [:publication :node
+                                 "views" "people/cards"])]
+    (is (= (get-in segmented [:bundle :cid])
+           (ipld/link-cid (get descriptor "bundle"))))
+    (is (nil? (get descriptor "pack")))
+    (is (= 2 (get descriptor "count")))))
+
 (deftest plan-is-deterministic-and-migration-reader-is-explicit
   (let [{:keys [base cards statistics]} (fixture)
         second-view (view/build-view

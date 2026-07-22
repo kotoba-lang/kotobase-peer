@@ -268,6 +268,75 @@
                :query-statistics query-statistics :statistics-scope statistics-scope
                :previous-bundle previous-bundle :mode :delta}))
 
+(defn compose-view-segments
+  "Compose independently built base packs into one immutable query bundle.
+  Segment objects remain separately addressed; each logical block descriptor
+  carries its pack CID and local byte offset. This lets a resumable host publish
+  arbitrarily large views without concatenating every output byte in one
+  invocation. SEGMENTS must be ordered by non-overlapping key range."
+  [{:keys [view-id epoch segments source-manifest plan-cid]}]
+  (let [segments (vec segments)
+        bundles (mapv #(get-in % [:bundle :node]) segments)]
+    (when-not
+     (and (seq segments)
+          (every? #(and (= "kotobase/query-bundle" (get % "format"))
+                        (= (str view-id) (get % "view-id"))
+                        (= epoch (get % "epoch"))
+                        (= "base" (get % "mode"))
+                        (nil? (get % "previous-bundle"))
+                        (or (nil? source-manifest)
+                            (= source-manifest
+                               (some-> (get % "source-manifest")
+                                       ipld/link-cid)))
+                        (or (nil? plan-cid)
+                            (= plan-cid
+                               (some-> (get % "plan-cid") ipld/link-cid))))
+                  bundles))
+      (throw (ex-info "Invalid materialized-view pack segments"
+                      {:view-id view-id :epoch epoch
+                       :segments (count segments)})))
+    (let [blocks
+          (->> (map vector segments bundles)
+               (mapcat
+                (fn [[segment bundle]]
+                  (let [pack-cid (:pack-cid segment)]
+                    (map #(assoc % "pack-cid" (ipld/link pack-cid))
+                         (get bundle "blocks")))))
+               (sort-by #(get % "min-key")) vec)
+          ordered? (every?
+                    (fn [[left right]]
+                      (neg? (compare (get left "max-key")
+                                     (get right "min-key"))))
+                    (partition 2 1 blocks))]
+      (when-not ordered?
+        (throw (ex-info "Materialized-view segments overlap or are unordered"
+                        {:view-id view-id})))
+      (let [node (cond->
+                 {"format" "kotobase/query-bundle"
+                  "version" format-version
+                  "view-id" (str view-id)
+                  "epoch" epoch
+                  "mode" "base"
+                  "segmented" true
+                  "segment-count" (count segments)
+                  "count" (reduce + (map :count segments))
+                  "pack-bytes" (reduce + (map #(byte-count (:pack-bytes %))
+                                               segments))
+                  "blocks" blocks}
+                   source-manifest
+                   (assoc "source-manifest" (ipld/link source-manifest))
+                   plan-cid (assoc "plan-cid" (ipld/link plan-cid)))
+            bytes (ipld/encode node)
+            cid (ipld/cid bytes)]
+        {:view-id (str view-id) :epoch epoch
+         :count (get node "count") :blocks blocks
+         :pack-cid nil :pack-bytes nil
+         :bundle {:node node :bytes bytes :cid cid}
+         :effects (vec (concat (filter #(= :object/put (:effect/type %))
+                                       (mapcat :effects segments))
+                               [{:effect/type :block/put
+                                 :cid cid :bytes bytes}]))}))))
+
 (defn build-datom-projection
   "Bridge the peer's existing RisingWave-style `view-rows` result into a
   browser-addressable packed view. Retractions are absent from current-state
@@ -291,6 +360,13 @@
 (defn- overlaps? [descriptor lower upper]
   (and (or (nil? lower) (not (neg? (compare (get descriptor "max-key") lower))))
        (or (nil? upper) (not (pos? (compare (get descriptor "min-key") upper))))))
+
+(defn descriptor-pack-cid
+  "Resolve the physical pack for one descriptor. Version-1 monolithic bundles
+  inherit bundle.pack-cid; segmented bundles put pack-cid on each descriptor."
+  [bundle descriptor]
+  (some-> (or (get descriptor "pack-cid") (get bundle "pack-cid"))
+          ipld/link-cid))
 
 (defn select-blocks
   "Use only bundle metadata to select blocks overlapping inclusive bounds."
@@ -318,33 +394,38 @@
 (defn coalesce-block-ranges
   "Coalesce physically adjacent logical blocks into bounded object fetches.
   Each logical descriptor remains present for independent CID verification."
-  [descriptors max-range-bytes]
+  ([descriptors max-range-bytes]
+   (coalesce-block-ranges nil descriptors max-range-bytes))
+  ([bundle descriptors max-range-bytes]
   (when-not (and (integer? max-range-bytes) (pos? max-range-bytes))
     (throw (ex-info "Maximum coalesced range must be positive"
                     {:max-range-bytes max-range-bytes})))
   (reduce
    (fn [fetches descriptor]
      (let [offset (get descriptor "offset")
-           length (get descriptor "length")]
+           length (get descriptor "length")
+           pack-cid (descriptor-pack-cid bundle descriptor)]
        (if-let [fetch (peek fetches)]
-         (if (and (= offset (+ (:offset fetch) (:length fetch)))
+         (if (and (= pack-cid (:pack-cid fetch))
+                  (= offset (+ (:offset fetch) (:length fetch)))
                   (<= (+ (:length fetch) length) max-range-bytes))
            (conj (pop fetches)
                  (-> fetch
                      (update :length + length)
                      (update :descriptors conj descriptor)))
-           (conj fetches {:offset offset :length length
+           (conj fetches {:pack-cid pack-cid
+                          :offset offset :length length
                           :descriptors [descriptor]}))
-         [{:offset offset :length length :descriptors [descriptor]}])))
-   [] descriptors))
+         [{:pack-cid pack-cid :offset offset :length length
+           :descriptors [descriptor]}])))
+   [] descriptors)))
 
 (defn range-query-plan
   "Compile a bounded browser query into declarative object Range GET effects."
   [{:keys [bundle lower upper limit max-range-bytes]
     :or {max-range-bytes 1048576}}]
   (let [descriptors (select-blocks bundle lower upper)
-        fetches (coalesce-block-ranges descriptors max-range-bytes)
-        pack-cid (ipld/link-cid (get bundle "pack-cid"))]
+        fetches (coalesce-block-ranges bundle descriptors max-range-bytes)]
     {:view-id (get bundle "view-id")
      :epoch (get bundle "epoch")
      :lower lower :upper upper :limit limit
@@ -352,7 +433,8 @@
      :fetches fetches
      :estimated-requests (count fetches)
      :estimated-bytes (reduce + (map :length fetches))
-     :need (mapv #(object-range-get pack-cid (:offset %) (:length %)) fetches)}))
+     :need (mapv #(object-range-get (:pack-cid %) (:offset %) (:length %))
+                 fetches)}))
 
 (defn batch-point-query-plan
   "Compile non-contiguous exact keys into deduplicated logical blocks and
@@ -364,15 +446,17 @@
         descriptors
         (->> requested-keys
              (mapcat #(select-blocks bundle % %))
-             (sort-by #(get % "offset"))
+             (sort-by (juxt #(str (descriptor-pack-cid bundle %))
+                            #(get % "offset")))
              (reduce (fn [result descriptor]
-                       (if (= (get (peek result) "offset")
-                              (get descriptor "offset"))
+                       (if (and (= (descriptor-pack-cid bundle (peek result))
+                                   (descriptor-pack-cid bundle descriptor))
+                                (= (get (peek result) "offset")
+                                   (get descriptor "offset")))
                          result
                          (conj result descriptor)))
                      []))
-        fetches (coalesce-block-ranges descriptors max-range-bytes)
-        pack-cid (ipld/link-cid (get bundle "pack-cid"))]
+        fetches (coalesce-block-ranges bundle descriptors max-range-bytes)]
     {:view-id (get bundle "view-id")
      :epoch (get bundle "epoch")
      :requested-keys requested-keys
@@ -380,7 +464,8 @@
      :fetches fetches
      :estimated-requests (count fetches)
      :estimated-bytes (reduce + (map :length fetches))
-     :need (mapv #(object-range-get pack-cid (:offset %) (:length %)) fetches)}))
+     :need (mapv #(object-range-get (:pack-cid %) (:offset %) (:length %))
+                 fetches)}))
 
 (defn decode-range
   "Verify and decode one independently addressed block returned by Range GET."
