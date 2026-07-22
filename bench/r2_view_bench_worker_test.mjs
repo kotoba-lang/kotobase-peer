@@ -46,7 +46,7 @@ assert.match(await page.text(), /Kotobase Browser Range Benchmark/);
 const config = await worker.fetch(new Request(`${origin}/e2e/config`), env);
 assert.equal(config.status, 200);
 assert.deepEqual(await config.json(), {
-  bundleCid: "bafyreiah6vcxx4hatnq66ingvubhbdmfi4xyv2jxcmhqvaqml7ktyz23ue",
+  bundleCid: "bafyreihdvnslp2kwkmx4g4ut74fubk7dko4ezq4dkgr5mbuxnahkoz6kee",
   queryKey: "tenant-a/000000500",
 });
 
@@ -66,7 +66,7 @@ const e2ePage = await worker.fetch(new Request(`${origin}/e2e`), env);
 assert.equal(e2ePage.status, 200);
 assert.match(await e2ePage.text(), /bundle CID → plan → R2 Range/);
 assert.match(await (await worker.fetch(new Request(`${origin}/e2e`), env)).text(),
-             /view-e2e\.js\?v=bundle-stats-v1/);
+             /view-e2e\.js\?v=refresh-stats-v1/);
 assert.equal((await worker.fetch(new Request(`${origin}/e2e/encrypted-v1`), env)).status, 200);
 assert.equal((await worker.fetch(new Request(`${origin}/e2e/rotation-v2`), env)).status, 200);
 assert.equal((await worker.fetch(new Request(`${origin}/e2e/join-v1`), env)).status, 200);
@@ -75,6 +75,7 @@ assert.equal((await worker.fetch(new Request(`${origin}/e2e/join-v3`), env)).sta
 assert.equal((await worker.fetch(new Request(`${origin}/e2e/noncontig-v1`), env)).status, 200);
 assert.equal((await worker.fetch(new Request(`${origin}/e2e/cost-join-v1`), env)).status, 200);
 assert.equal((await worker.fetch(new Request(`${origin}/e2e/bundle-stats-v1`), env)).status, 200);
+assert.equal((await worker.fetch(new Request(`${origin}/e2e/refresh-stats-v1`), env)).status, 200);
 
 const browserAsset = await worker.fetch(new Request(`${origin}/view-e2e.js`), env);
 assert.equal(await browserAsset.text(), "compiled browser asset");
@@ -109,4 +110,4 @@ const retired = await worker.fetch(new Request(`${origin}/e2e/key?keyId=tenant-a
 }), { ...protectedEnv, E2E_DEK_V1_B64: undefined });
 assert.equal(retired.status, 404);
 
-console.log(JSON.stringify({ tests: 14, assertions: 43, outcome: "succeeded" }));
+console.log(JSON.stringify({ tests: 14, assertions: 44, outcome: "succeeded" }));

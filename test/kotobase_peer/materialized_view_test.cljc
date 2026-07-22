@@ -54,6 +54,7 @@
         bundled (get-in built [:bundle :node "query-statistics"])]
     (is (= (get-in built [:bundle :cid]) (get-in rebuilt [:bundle :cid])))
     (is (= "tenant-a/public-v1" (get bundled "visibility-scope")))
+    (is (= 1 (get bundled "epoch")))
     (is (= [101 1] (mapv #(get % "rows") (get bundled "clauses"))))))
 
 (deftest query-statistics-require-an-explicit-visibility-scope

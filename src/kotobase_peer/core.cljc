@@ -572,12 +572,17 @@
 (defn- reorderable-triple? [clause]
   (and (vector? clause) (= 3 (count clause))))
 
-(defn- supplied-cardinality [query-statistics statistics-scope pattern]
+(defn- supplied-cardinality [query-statistics statistics-scope query-epoch
+                             max-statistics-age pattern]
   (let [scope (or (get query-statistics "visibility-scope")
                   (:visibility-scope query-statistics))
+        statistics-epoch (or (get query-statistics "epoch")
+                             (:epoch query-statistics))
         clauses (or (get query-statistics "clauses")
                     (:clauses query-statistics))]
-    (when (= statistics-scope scope)
+    (when (and (= statistics-scope scope)
+               (stats/query-statistics-fresh? statistics-epoch query-epoch
+                                                max-statistics-age))
       (some (fn [statistic]
               (when (= pattern (or (get statistic "pattern") (:pattern statistic)))
                 (or (get statistic "rows") (:rows statistic))))
@@ -596,6 +601,8 @@
              input-bindings (into {} (map vector input-vars inputs))
              query-statistics (:query-statistics query)
              statistics-scope (:statistics-scope query)
+             query-epoch (:query-epoch query)
+             max-statistics-age (:max-statistics-age query 0)
              clauses (mapv (fn [id clause]
                              (let [pattern (mapv (fn [term]
                                                    (cond
@@ -605,7 +612,8 @@
                                                      :else term))
                                                  clause)
                                    supplied (supplied-cardinality query-statistics
-                                                                  statistics-scope pattern)]
+                                                                  statistics-scope query-epoch
+                                                                  max-statistics-age pattern)]
                                {:id id
                                 :clause clause
                                 :vars (into #{} (filter datalog-var?) clause)

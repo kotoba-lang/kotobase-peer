@@ -3,9 +3,9 @@ const OBJECT_BYTES = 8_346_444;
 const E2E_PACK_KEY = "bench/e2e/view-pack-v1";
 const E2E_PACK_BYTES = 148_676;
 const E2E_BUNDLE_KEY = "bench/e2e/query-bundle-v1";
-const E2E_BUNDLE_CID = "bafyreiah6vcxx4hatnq66ingvubhbdmfi4xyv2jxcmhqvaqml7ktyz23ue";
+const E2E_BUNDLE_CID = "bafyreihdvnslp2kwkmx4g4ut74fubk7dko4ezq4dkgr5mbuxnahkoz6kee";
 const E2E_QUERY_KEY = "tenant-a/000000500";
-const E2E_ASSET_VERSION = "bundle-stats-v1";
+const E2E_ASSET_VERSION = "refresh-stats-v1";
 
 function percentile(values, p) {
   const sorted = [...values].sort((a, b) => a - b);
@@ -191,7 +191,8 @@ export default {
          url.pathname === "/e2e/join-v2" || url.pathname === "/e2e/join-v3" ||
          url.pathname === "/e2e/noncontig-v1" ||
          url.pathname === "/e2e/cost-join-v1" ||
-         url.pathname === "/e2e/bundle-stats-v1")) {
+         url.pathname === "/e2e/bundle-stats-v1" ||
+         url.pathname === "/e2e/refresh-stats-v1")) {
       return new Response(E2E_PAGE, { headers: {
         "content-type": "text/html; charset=utf-8", "cache-control": "no-store",
       }});

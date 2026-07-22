@@ -260,6 +260,7 @@
                            :join {:kind "materialized-statistics-three-clause"
                                   :statistics-scope (get-in bundle ["query-statistics"
                                                                     "visibility-scope"])
+                                  :statistics-epoch (get-in bundle ["query-statistics" "epoch"])
                                   :order (mapv :id
                                                (stats/plan-clause-order
                                                 (mapv (fn [statistic]

@@ -135,6 +135,49 @@
                      (assoc next-clause :step (count result)
                             :bound-vars-after (into bound (:vars next-clause)))))))))
 
+(defn- matches-triple-pattern? [[s p o] {:keys [e a v]}]
+  (every? true? (map (fn [expected actual]
+                       (or (nil? expected) (= expected actual)))
+                     [s p o] [e a v])))
+
+(defn refresh-query-statistics
+  "Apply effective datom deltas to scoped clause cardinalities at NEW-EPOCH.
+  CHANGES must already be normalized state transitions (`:assert` adds one,
+  `:retract` removes one), not raw duplicate transaction requests. Underflow
+  is rejected so corrupt/drifted statistics cannot be published silently."
+  [{:keys [visibility-scope clauses epoch]} changes new-epoch]
+  (when-not (and (integer? new-epoch) (> new-epoch (or epoch -1)))
+    (throw (ex-info "Statistics refresh epoch must advance"
+                    {:current-epoch epoch :new-epoch new-epoch})))
+  (let [updated
+        (mapv (fn [{:keys [pattern rows] :as clause}]
+                (let [delta (reduce (fn [total {:keys [op] :as change}]
+                                      (if (matches-triple-pattern? pattern change)
+                                        (+ total (case op :assert 1 :retract -1
+                                                       (throw (ex-info "Unknown statistics delta op"
+                                                                       {:op op}))))
+                                        total))
+                                    0 changes)
+                      next-rows (+ rows delta)]
+                  (when (neg? next-rows)
+                    (throw (ex-info "Query statistics cardinality underflow"
+                                    {:pattern pattern :rows rows :delta delta})))
+                  (assoc clause :rows next-rows)))
+              clauses)]
+    {:visibility-scope visibility-scope
+     :epoch new-epoch
+     :clauses updated}))
+
+(defn query-statistics-fresh?
+  "True when scoped statistics may plan QUERY-EPOCH within MAX-AGE epochs.
+  A nil query epoch keeps backward compatibility for callers without MVCC."
+  [statistics-epoch query-epoch max-age]
+  (or (nil? query-epoch)
+      (and (integer? statistics-epoch)
+           (integer? query-epoch)
+           (<= statistics-epoch query-epoch)
+           (<= (- query-epoch statistics-epoch) (or max-age 0)))))
+
 ;; ============================================================================
 ;; Delta-Materialized Arrangements
 ;; ============================================================================

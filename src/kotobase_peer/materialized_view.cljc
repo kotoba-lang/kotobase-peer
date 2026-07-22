@@ -232,6 +232,7 @@
                       query-statistics
                       (assoc "query-statistics"
                              {"visibility-scope" statistics-scope
+                              "epoch" epoch
                               "clauses" (->> query-statistics
                                              (map (fn [{:keys [pattern rows]}]
                                                     {"pattern" pattern "rows" rows}))

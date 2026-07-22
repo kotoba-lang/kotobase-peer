@@ -38,6 +38,29 @@
     (is (= [:edges :authors :posts] (mapv :id plan)))
     (is (= #{'?post '?author} (:bound-vars-after (last plan))))))
 
+(deftest query-statistics-refreshes-from-effective-deltas
+  (let [current {:visibility-scope "tenant-a/public-v1" :epoch 7
+                 :clauses [{:pattern [nil "role" nil] :rows 10}
+                           {:pattern [nil "role" "admin"] :rows 2}]}
+        refreshed (statistics/refresh-query-statistics
+                   current
+                   [{:e "new" :a "role" :v "admin" :op :assert}
+                    {:e "old" :a "role" :v "user" :op :retract}]
+                   8)]
+    (is (= 8 (:epoch refreshed)))
+    (is (= [10 3] (mapv :rows (:clauses refreshed))))
+    (is (statistics/query-statistics-fresh? 8 8 0))
+    (is (statistics/query-statistics-fresh? 8 10 2))
+    (is (false? (statistics/query-statistics-fresh? 8 10 1)))))
+
+(deftest query-statistics-refresh-rejects-drift
+  (is (thrown? #?(:clj Exception :cljs js/Error)
+               (statistics/refresh-query-statistics
+                {:visibility-scope "tenant" :epoch 1
+                 :clauses [{:pattern [nil "role" "admin"] :rows 0}]}
+                [{:e "missing" :a "role" :v "admin" :op :retract}]
+                2))))
+
 (deftest m5-selectivity-estimate-computes-ratio
   (testing "selectivity-estimate should compute cardinality reduction factor"
     (let [histograms {:eavt {:full-cardinality 1000}

@@ -344,7 +344,9 @@
         query {:find '[?name]
                :where '[[?s "name" ?name] [?s "role" "admin"]]
                :statistics-scope "tenant-a/public-v1"
+               :query-epoch 7
                :query-statistics {"visibility-scope" "tenant-a/public-v1"
+                                  "epoch" 7
                                   "clauses" [{"pattern" [nil "name" nil] "rows" 101}
                                              {"pattern" [nil "role" "admin"] "rows" 1}]}}
         plan (eng/datalog-query-plan (eng/empty-db) query visible?)]
@@ -359,6 +361,17 @@
                :statistics-scope "tenant-b/private-v1"
                :query-statistics {"visibility-scope" "tenant-a/public-v1"
                                   "clauses" [{"pattern" [nil "role" "admin"] "rows" 1}]}}
+        plan (eng/datalog-query-plan (eng/empty-db) query (constantly true))]
+    (is (= :visible-scan (-> plan :plan first :estimate-source)))))
+
+(deftest query-plan-falls-back-when-materialized-statistics-are-stale
+  (let [query {:find '[?s] :where '[[?s "role" "admin"]]
+               :statistics-scope "tenant-a/public-v1"
+               :query-epoch 9 :max-statistics-age 1
+               :query-statistics {"visibility-scope" "tenant-a/public-v1"
+                                  "epoch" 7
+                                  "clauses" [{"pattern" [nil "role" "admin"]
+                                              "rows" 1}]}}
         plan (eng/datalog-query-plan (eng/empty-db) query (constantly true))]
     (is (= :visible-scan (-> plan :plan first :estimate-source)))))
 

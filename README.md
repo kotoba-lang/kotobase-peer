@@ -272,6 +272,14 @@ JVM fixture this removes planning scans (p50 59.786 ms → 0.078 ms). The real
 encrypted R2/browser receipt is
 `bench/results/2026-07-22-browser-r2-bundle-statistics.edn`.
 
+`refresh-query-statistics` advances those counts from normalized effective
+assert/retract deltas and rejects epoch regression, unknown operations, and
+cardinality underflow. Statistics carry their source epoch; callers may set
+`:query-epoch` and `:max-statistics-age`, with stale or future metadata falling
+back to visible scans. Refreshing 10,000 deltas across three clauses measured
+p50 24.87 ms on the JVM. The epoch-pinned R2/browser receipt is
+`bench/results/2026-07-22-browser-r2-statistics-refresh.edn`.
+
 This is currently a behavior-preserving shadow substrate: existing
 `commit!`/`hot-datoms`/`fold!` remain the live path until read equivalence and
 CLJ/CLJS CID determinism gates pass. New storage work must target the
