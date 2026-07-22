@@ -338,6 +338,36 @@
 (declare manifest-window! index-run-refs load-runs! all-r2-retention-roots!
          find-entities!)
 
+(defn- eavt-run-refs!
+  [e db-id base-cid max-depth read-context]
+  (letfn [(collect [cid remaining refs]
+            (cond
+              (nil? cid) (js/Promise.resolve refs)
+              (zero? remaining)
+              (js/Promise.reject
+               (ex-info "Merkle entity scan depth exceeded"
+                        (merge {:db-id db-id :max-depth max-depth}
+                               read-context)))
+              :else
+              (-> (get-node! e cid)
+                  (.then
+                   (fn [manifest]
+                     (if-let [directory-link
+                              (get-in manifest ["statistics" "range-directory"])]
+                       (-> (get-node! e (ipld/link-cid directory-link))
+                           (.then
+                            (fn [directory]
+                              (collect
+                               (some-> (get directory "previous") ipld/link-cid)
+                               (dec remaining)
+                               (into refs
+                                     (lsm/range-directory-refs directory :eavt))))))
+                       (collect
+                        (some-> (get manifest "previous") ipld/link-cid)
+                        (dec remaining)
+                        (into refs (index-run-refs [{:node manifest}] :eavt)))))))))]
+    (collect base-cid max-depth [])))
+
 (defn find-latest-entity!
   "Return the MVCC-visible EAVT datom set for one exact entity."
   ([e db-id entity] (find-latest-entity! e db-id entity 256))
@@ -417,6 +447,52 @@
                                           (group-by
                                            #(first
                                              (get % "components")))))))))))))))))))))
+
+(defn find-exact-entities!
+  "Return MVCC-visible EAVT rows for exact string entity ids. The manifest
+  chain is walked once and selected run refs are deduplicated by CID."
+  ([e db-id entities] (find-exact-entities! e db-id entities 256))
+  ([e db-id entities max-depth]
+   (let [entities (set (map str entities))]
+     (if (empty? entities)
+       (js/Promise.resolve {})
+       (-> (resolve-database-head! e db-id)
+           (.then
+            (fn [{:keys [base-cid]}]
+              (if-not base-cid
+                {}
+                (-> (get-node! e base-cid)
+                    (.then
+                     (fn [base-manifest]
+                       (let [query-epoch (get base-manifest "epoch")]
+                         (-> (eavt-run-refs! e db-id base-cid max-depth
+                                             {:entities entities})
+                             (.then
+                              (fn [refs]
+                                (let [selected
+                                      (->> entities
+                                           (mapcat
+                                            #(lsm/select-run-refs-by-first-component
+                                              refs %))
+                                           (reduce
+                                            (fn [by-cid ref]
+                                              (assoc by-cid
+                                                     (str (ipld/link-cid
+                                                           (get ref "cid")))
+                                                     ref)) {})
+                                           vals vec)]
+                                  (-> (load-runs! e selected)
+                                      (.then
+                                       (fn [runs]
+                                         (->> (lsm/visible-rows runs query-epoch)
+                                              (filter
+                                               #(contains?
+                                                 entities
+                                                 (str (first
+                                                       (get % "components")))))
+                                              (group-by
+                                               #(first
+                                                 (get % "components")))))))))))))))))))))))
 
 (defn- manifest-window!
   [e head-cid limit]

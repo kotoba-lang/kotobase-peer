@@ -29,10 +29,21 @@
                        (filter #(= :block/put (:effect/type %))
                                (concat (:effects first-plan)
                                        (:effects second-plan))))
+          eavt-run-keys
+          (->> (concat (:effects first-plan) (:effects second-plan))
+               (keep (fn [{:keys [cid bytes] :as effect}]
+                       (when (and (= :block/put (:effect/type effect))
+                                  (= "kotobase/merkle-run"
+                                     (get (ipld/decode bytes) "format"))
+                                  (= "eavt" (get (ipld/decode bytes) "index")))
+                         (str "test/blocks/" cid))))
+               set)
+          gets (atom [])
           head-cid (get-in second-plan [:manifest :cid])
           bucket
           #js {:get
                (fn [key]
+                 (swap! gets conj key)
                  (let [value (if (= key "test/heads/db-a")
                                head-cid (get blocks key))]
                    (js/Promise.resolve
@@ -59,6 +70,16 @@
            (fn [rows]
              (is (= [["alice" "name" "Alice"]]
                     (mapv #(get % "components") rows)))
+             (reset! gets [])
+             (worker/find-exact-entities! env "db-a" ["alice" "bob"])))
+          (.then
+           (fn [entities]
+             (is (= #{"alice"} (set (keys entities))))
+             (is (= 1 (count (filter #{"test/heads/db-a"} @gets)))
+                 "the exact entity set resolves the head only once")
+             (is (= (count eavt-run-keys)
+                    (count (filter eavt-run-keys @gets)))
+                 "overlapping selected run refs are loaded once by CID")
              (done)))
           (.catch
            (fn [error]
