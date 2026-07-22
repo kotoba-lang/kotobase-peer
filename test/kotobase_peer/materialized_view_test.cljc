@@ -247,3 +247,32 @@
     (is (= (:values result) (:values compacted-result)))
     (is (= "base" (get-in compacted [:bundle :node "mode"])))
     (is (nil? (get-in compacted [:bundle :node "previous-bundle"])))))
+
+(deftest packed-chain-compaction-is-depth-and-byte-bounded
+  (let [bundles [{"pack-bytes" 40} {"pack-bytes" 30}]
+        below (view/packed-chain-compaction-plan
+               {:bundles (take 1 bundles)
+                :max-generations 2 :max-pack-bytes 64})
+        at-depth (view/packed-chain-compaction-plan
+                  {:bundles bundles
+                   :max-generations 2 :max-pack-bytes 80})
+        over-bytes (view/packed-chain-compaction-plan
+                    {:bundles bundles
+                     :max-generations 2 :max-pack-bytes 64})
+        built (view/build-view
+               {:view-id :feed :epoch 1
+                :entries [{:key "a" :value 1}]})]
+    (is (false? (:compact? below)))
+    (is (true? (:within-budget? below)))
+    (is (true? (:compact? at-depth)))
+    (is (true? (:within-budget? at-depth)))
+    (is (true? (:compact? over-bytes)))
+    (is (false? (:within-budget? over-bytes)))
+    (is (thrown-with-msg?
+         #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+         #"byte budget exceeded"
+         (view/compact-packed-chain
+          {:view-id :feed :epoch 1
+           :generations [{:bundle (get-in built [:bundle :node])
+                          :pack-bytes (:pack-bytes built)}]
+           :max-input-bytes 0})))))

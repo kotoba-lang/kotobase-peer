@@ -539,23 +539,70 @@
               generations (:plans plan))]
     {:plan plan :values (finish-range-query-chain plan range-groups)}))
 
+(defn packed-chain-compaction-plan
+  "Decide whether a newest-first bundle chain must be folded before one more
+  delta is appended. Both metadata depth and total packed input bytes are
+  explicit algorithmic budgets. A chain at MAX-GENERATIONS is compacted now so
+  the subsequently appended delta keeps the published chain bounded."
+  [{:keys [bundles max-generations max-pack-bytes]}]
+  (when-not (and (integer? max-generations) (pos? max-generations)
+                 (integer? max-pack-bytes) (not (neg? max-pack-bytes)))
+    (throw (ex-info "Invalid packed-chain compaction budget"
+                    {:max-generations max-generations
+                     :max-pack-bytes max-pack-bytes})))
+  (let [generations (count bundles)
+        pack-bytes (reduce + 0 (map #(or (get % "pack-bytes") 0) bundles))
+        compact? (>= generations max-generations)]
+    {:compact? compact?
+     :within-budget? (and (<= generations max-generations)
+                          (<= pack-bytes max-pack-bytes))
+     :generations generations
+     :pack-bytes pack-bytes
+     :max-generations max-generations
+     :max-pack-bytes max-pack-bytes}))
+
 (defn compact-packed-chain
   "Compact complete newest-first packed generations into one deterministic
-  base view. Intended for host/background compaction; memory-bounded remote
-  streaming is a subsequent host executor concern."
-  [{:keys [view-id epoch generations block-rows source-manifest plan-cid]}]
-  (let [chain-plan (range-query-plan-chain (mapv :bundle generations) {})
-        range-groups
-        (mapv (fn [generation generation-plan]
-                (mapv #(slice-bytes (:pack-bytes generation)
-                                    (:offset %) (:length %))
-                      (:fetches generation-plan)))
-              generations (:plans chain-plan))
-        entries (->> (newest-chain-rows (:plans chain-plan) range-groups)
-                     (keep (fn [row]
-                             (when (= "assert" (get row "op"))
-                               {:key (get row "key") :value (get row "value")})))
-                     vec)]
-    (build-view {:view-id view-id :epoch epoch :entries entries
-                 :block-rows (or block-rows 512) :sorted? true
-                 :source-manifest source-manifest :plan-cid plan-cid})))
+  base view. MAX-INPUT-GENERATIONS and MAX-INPUT-BYTES, when supplied, are
+  checked before decoding so a host cannot accidentally turn this helper into
+  an unbounded Worker operation. Remote resumable/spill execution remains a
+  separate host concern."
+  [{:keys [view-id epoch generations block-rows source-manifest plan-cid
+           max-input-generations max-input-bytes]}]
+  (let [bundles (mapv :bundle generations)
+        input-generations (count generations)
+        input-bytes (reduce + 0 (map #(or (get % "pack-bytes") 0) bundles))]
+    (when-not (and (or (nil? max-input-generations)
+                       (and (integer? max-input-generations)
+                            (pos? max-input-generations)))
+                   (or (nil? max-input-bytes)
+                       (and (integer? max-input-bytes)
+                            (not (neg? max-input-bytes)))))
+      (throw (ex-info "Invalid packed-chain compaction input budget"
+                      {:max-input-generations max-input-generations
+                       :max-input-bytes max-input-bytes})))
+    (when (and max-input-generations
+               (> input-generations max-input-generations))
+      (throw (ex-info "Packed-chain generation budget exceeded"
+                      {:generations input-generations
+                       :max-generations max-input-generations})))
+    (when (and max-input-bytes (> input-bytes max-input-bytes))
+      (throw (ex-info "Packed-chain byte budget exceeded"
+                      {:pack-bytes input-bytes
+                       :max-pack-bytes max-input-bytes})))
+    (let [chain-plan (range-query-plan-chain bundles {})
+          range-groups
+          (mapv (fn [generation generation-plan]
+                  (mapv #(slice-bytes (:pack-bytes generation)
+                                      (:offset %) (:length %))
+                        (:fetches generation-plan)))
+                generations (:plans chain-plan))
+          entries (->> (newest-chain-rows (:plans chain-plan) range-groups)
+                       (keep (fn [row]
+                               (when (= "assert" (get row "op"))
+                                 {:key (get row "key")
+                                  :value (get row "value")})))
+                       vec)]
+      (build-view {:view-id view-id :epoch epoch :entries entries
+                   :block-rows (or block-rows 512) :sorted? true
+                   :source-manifest source-manifest :plan-cid plan-cid}))))
