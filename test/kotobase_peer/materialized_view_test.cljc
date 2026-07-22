@@ -318,3 +318,46 @@
     (is (= #{(str (:pack-cid left)) (str (:pack-cid right))}
            (set (map (comp str :pack-cid) (:fetches plan)))))
     (is (= [1 2 3 4] result))))
+
+(deftest segmented-view-allows-ordered-equal-key-subblocks
+  (let [left (view/build-view
+              {:view-id :hot :epoch 10 :block-rows 1
+               :entries [{:key "hot" :value {"part" 0}}]})
+        right (view/build-view
+               {:view-id :hot :epoch 10 :block-rows 1
+                :entries [{:key "hot" :value {"part" 1}}
+                          {:key "tail" :value {"part" 2}}]})
+        segments [(assoc left :ordinal 3) (assoc right :ordinal 4)]
+        composed (view/compose-view-segments
+                  {:view-id :hot :epoch 10 :segments segments})
+        bundle (get-in composed [:bundle :node])
+        plan (view/range-query-plan
+              {:bundle bundle :lower "hot" :upper "hot"})
+        packs {(str (:pack-cid left)) (:pack-bytes left)
+               (str (:pack-cid right)) (:pack-bytes right)}
+        ranges (mapv (fn [{:keys [pack-cid offset length]}]
+                       (slice-bytes (get packs (str pack-cid)) offset length))
+                     (:fetches plan))]
+    (is (= [3 4] (mapv #(get % "segment-ordinal") (:descriptors plan))))
+    (is (= 2 (:estimated-requests plan))
+        "equal-key subblocks in distinct packs remain independently fetched")
+    (is (= [{"part" 0} {"part" 1}]
+           (view/finish-range-query plan ranges)))
+    (is (= (get-in composed [:bundle :cid])
+           (get-in (view/compose-view-segments
+                    {:view-id :hot :epoch 10 :segments (reverse segments)})
+                   [:bundle :cid]))
+        "segment input order does not change the canonical composed CID")
+    (let [overlapping
+          (view/build-view
+           {:view-id :hot :epoch 10
+            :entries [{:key "between" :value 1}
+                      {:key "later" :value 2}]})]
+      (is (thrown-with-msg?
+           #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+           #"overlap or are unordered"
+           (view/compose-view-segments
+            {:view-id :hot :epoch 10
+             :segments [(assoc left :ordinal 3)
+                        (assoc overlapping :ordinal 4)
+                        (assoc right :ordinal 5)]}))))))

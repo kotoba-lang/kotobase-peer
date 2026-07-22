@@ -299,14 +299,29 @@
           (->> (map vector segments bundles)
                (mapcat
                 (fn [[segment bundle]]
-                  (let [pack-cid (:pack-cid segment)]
-                    (map #(assoc % "pack-cid" (ipld/link pack-cid))
+                  (let [pack-cid (:pack-cid segment)
+                        ordinal (or (:ordinal segment) 0)]
+                    (map #(assoc %
+                                 "pack-cid" (ipld/link pack-cid)
+                                 "segment-ordinal" ordinal)
                          (get bundle "blocks")))))
-               (sort-by #(get % "min-key")) vec)
+               (sort-by (juxt #(get % "min-key")
+                              #(get % "segment-ordinal")
+                              #(get % "offset")))
+               vec)
           ordered? (every?
                     (fn [[left right]]
-                      (neg? (compare (get left "max-key")
-                                     (get right "min-key"))))
+                      (let [boundary-order
+                            (compare (get left "max-key")
+                                     (get right "min-key"))]
+                        (or (neg? boundary-order)
+                            (and (zero? boundary-order)
+                                 (or (and (= (get left "pack-cid")
+                                             (get right "pack-cid"))
+                                          (< (get left "offset")
+                                             (get right "offset")))
+                                     (< (get left "segment-ordinal")
+                                        (get right "segment-ordinal")))))))
                     (partition 2 1 blocks))]
       (when-not ordered?
         (throw (ex-info "Materialized-view segments overlap or are unordered"
