@@ -8,6 +8,8 @@
             [ipld.core :as ipld]))
 
 (def format-version 1)
+(def range-directory-version 2)
+(def default-range-directory-page-refs 128)
 (def indexes #{:eavt :aevt :avet :vaet})
 (def default-run-block-rows 128)
 (def default-run-block-bytes 1048576)
@@ -80,7 +82,7 @@
         cid (ipld/cid bytes)]
     {:node node :bytes bytes :cid cid :effects [(block-put cid bytes)]}))
 
-(declare partition-logical-groups row-logical-key)
+(declare partition-logical-groups row-logical-key canonical-run-refs)
 
 (defn- byte-count [bytes]
   #?(:clj (alength ^bytes bytes)
@@ -368,10 +370,99 @@
                previous (assoc "previous" (ipld/link previous)))]
     (assoc (encoded node) :db-id (str db-id) :epoch epoch)))
 
+(defn- aggregate-bound [refs field choose]
+  (let [values (keep #(get % field) refs)]
+    (when (= (count values) (count refs))
+      (reduce choose values))))
+
+(defn build-range-directory-page
+  "Build one immutable v2 directory leaf. A page contains only run metadata;
+  run data remains linked by CID through each ref."
+  [{:keys [db-id epoch index refs]}]
+  (let [refs (canonical-run-refs refs)
+        node {"format" "kotobase/range-directory-page"
+              "version" range-directory-version
+              "db-id" (str db-id)
+              "epoch" epoch
+              "index" (name index)
+              "count" (count refs)
+              "refs" refs}
+        page (encoded node)]
+    (assoc page
+           :descriptor
+           (cond-> {"cid" (ipld/link (:cid page))
+                    "count" (count refs)}
+             (seq refs)
+             (assoc "logical-min"
+                    (aggregate-bound refs "logical-min"
+                                     #(if (neg? (compare %1 %2)) %1 %2))
+                    "logical-max"
+                    (aggregate-bound refs "logical-max"
+                                     #(if (pos? (compare %1 %2)) %1 %2))
+                    "first-component-min"
+                    (aggregate-bound refs "first-component-min"
+                                     #(if (neg? (compare %1 %2)) %1 %2))
+                    "first-component-max"
+                    (aggregate-bound refs "first-component-max"
+                                     #(if (pos? (compare %1 %2)) %1 %2)))))))
+
+(defn build-paged-range-directory
+  "Build a small v2 root plus immutable bounded ref pages. PAGE-REFS is an
+  exact upper bound on refs held by one leaf. The root links pages so the
+  generic IPLD reachability walker remains sufficient for GC."
+  [{:keys [db-id epoch indexes previous page-refs]
+    :or {page-refs default-range-directory-page-refs}}]
+  (when-not (pos-int? page-refs)
+    (throw (ex-info "Range directory page size must be positive"
+                    {:page-refs page-refs})))
+  (let [pages-by-index
+        (into
+         (sorted-map)
+         (map
+          (fn [[index refs]]
+            [(name index)
+             (mapv #(build-range-directory-page
+                     {:db-id db-id :epoch epoch :index index :refs %})
+                   (partition-all page-refs (canonical-run-refs refs)))]))
+         indexes)
+        node (cond->
+              {"format" "kotobase/range-directory"
+               "version" range-directory-version
+               "db-id" (str db-id)
+               "epoch" epoch
+               "page-refs" page-refs
+               "indexes"
+               (into (sorted-map)
+                     (map (fn [[index pages]]
+                            [index (mapv :descriptor pages)]))
+                     pages-by-index)}
+               previous (assoc "previous" (ipld/link previous)))
+        root (encoded node)]
+    (assoc root
+           :db-id (str db-id)
+           :epoch epoch
+           :pages pages-by-index
+           :effects (vec (concat (mapcat :effects (mapcat val pages-by-index))
+                                 (:effects root))))))
+
+(defn paged-range-directory? [directory]
+  (= range-directory-version (get directory "version")))
+
+(defn range-directory-page-descriptors [directory index]
+  (if (paged-range-directory? directory)
+    (get-in directory ["indexes" (name index)] [])
+    []))
+
 (defn range-directory-refs [directory index]
-  (get-in directory ["indexes" (name index)] []))
+  (if (paged-range-directory? directory)
+    (throw (ex-info "Paged range directory refs require page resolution"
+                    {:index index}))
+    (get-in directory ["indexes" (name index)] [])))
 
 (defn range-directory-indexes [directory]
+  (when (paged-range-directory? directory)
+    (throw (ex-info "Paged range directory indexes require page resolution"
+                    {})))
   (into {}
         (map (fn [[index refs]] [(keyword index) (vec refs)]))
         (get directory "indexes")))
@@ -381,25 +472,54 @@
   Legacy manifest chains contain no directory and need no migration; unknown
   future directory versions fail closed until an explicit migrator exists."
   [directory expected-db-id maximum-epoch]
-  (let [index-names (set (map name indexes))]
+  (let [index-names (set (map name indexes))
+        version (get directory "version")
+        paged? (= range-directory-version version)]
     (when-not (and (= "kotobase/range-directory" (get directory "format"))
-                   (= format-version (get directory "version"))
+                   (contains? #{format-version range-directory-version} version)
                    (= (str expected-db-id) (get directory "db-id"))
                    (integer? (get directory "epoch"))
                    (<= 0 (get directory "epoch") maximum-epoch)
                    (map? (get directory "indexes"))
                    (every? index-names (keys (get directory "indexes")))
                    (every? vector? (vals (get directory "indexes")))
-                   (every? (fn [refs]
-                             (every? #(and (map? %)
-                                           (ipld/link? (get % "cid")))
-                                     refs))
+                   (or (not paged?)
+                       (pos-int? (get directory "page-refs")))
+                   (every? (fn [entries]
+                             (every?
+                              #(and (map? %)
+                                    (ipld/link? (get % "cid"))
+                                    (or (not paged?)
+                                        (and (pos-int? (get % "count"))
+                                             (<= (get % "count")
+                                                 (get directory "page-refs")))))
+                              entries))
                            (vals (get directory "indexes"))))
       (throw (ex-info "Invalid or unsupported range directory"
                       {:expected-db-id (str expected-db-id)
                        :maximum-epoch maximum-epoch
                        :directory directory})))
     directory))
+
+(defn validate-range-directory-page
+  [page expected-db-id maximum-epoch expected-index maximum-refs]
+  (when-not
+   (and (= "kotobase/range-directory-page" (get page "format"))
+        (= range-directory-version (get page "version"))
+        (= (str expected-db-id) (get page "db-id"))
+        (integer? (get page "epoch"))
+        (<= 0 (get page "epoch") maximum-epoch)
+        (= (name expected-index) (get page "index"))
+        (vector? (get page "refs"))
+        (= (get page "count") (count (get page "refs")))
+        (<= 1 (get page "count") maximum-refs)
+        (every? #(and (map? %) (ipld/link? (get % "cid")))
+                (get page "refs")))
+    (throw (ex-info "Invalid range directory page"
+                    {:expected-db-id (str expected-db-id)
+                     :expected-index expected-index
+                     :maximum-epoch maximum-epoch})))
+  page)
 
 (defn- canonical-run-refs [refs]
   (->> refs

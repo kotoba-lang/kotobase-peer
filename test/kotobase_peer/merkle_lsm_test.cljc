@@ -131,6 +131,47 @@
       (is (thrown? #?(:clj Exception :cljs js/Error)
                    (lsm/validate-range-directory invalid "db" 4))))))
 
+(deftest paged-range-directory-bounds-inline-metadata-and-links-leaves
+  (let [ref (fn [n]
+              {"cid" (ipld/link
+                      (:cid (lsm/build-run
+                             :eavt "t"
+                             [{:components [(str "e" n) "name" n]
+                               :epoch 1 :op :assert :value n}])))
+               "count" 1
+               "min-key" (str n)
+               "max-key" (str n)
+               "logical-min" (str n)
+               "logical-max" (str n)
+               "first-component-min" (str "se" n)
+               "first-component-max" (str "se" n)})
+        refs (mapv ref (range 5))
+        directory
+        (lsm/build-paged-range-directory
+         {:db-id "db" :epoch 2 :indexes {:eavt refs} :page-refs 2})
+        root (:node directory)
+        pages (get (:pages directory) "eavt")]
+    (is (= 2 (get root "version")))
+    (is (= [2 2 1] (mapv #(get-in % [:node "count"]) pages)))
+    (is (= 3 (count (lsm/range-directory-page-descriptors root :eavt))))
+    (is (= 4 (count (:effects directory)))
+        "three leaves and one root are immutable block puts")
+    (is (= 1
+           (count
+            (lsm/select-run-refs-by-first-component
+             (lsm/range-directory-page-descriptors root :eavt) "e0")))
+        "an exact first component selects one bounded leaf")
+    (is (every? (lsm/linked-cids root)
+                (map :cid pages))
+        "the generic IPLD walker reaches every directory leaf")
+    (doseq [page pages]
+      (is (= (:node page)
+             (lsm/validate-range-directory-page
+              (:node page) "db" 2 :eavt 2))))
+    (is (= root (lsm/validate-range-directory root "db" 2)))
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (lsm/range-directory-refs root :eavt)))))
+
 (deftest first-component-range-prunes-run-refs
   (let [alice (lsm/build-run :eavt "t"
                              [{:components ["alice" "name" "Alice"]

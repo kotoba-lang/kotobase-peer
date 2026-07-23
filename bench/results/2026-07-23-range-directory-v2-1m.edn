@@ -1,0 +1,32 @@
+{:date "2026-07-23"
+ :feature :paged-range-directory-v2
+ :runtime {:kind :jvm :samples 20}
+ :fixture {:refs-per-index 977
+           :indexes 3
+           :page-refs 128
+           :source "the final real-R2 1M checkpoint ref cardinality"}
+ :inline-v1
+ {:root-bytes 606812
+  :build-p50-ms 3413.424375
+  :build-p95-ms 4686.511541}
+ :paged-v2
+ {:root-bytes 3845
+  :pages 24
+  :page-bytes-total 608949
+  :max-page-bytes 26589
+  :build-p50-ms 3527.637292
+  :build-p95-ms 3826.280167
+  :page-get-concurrency 4}
+ :ratios
+ {:root-byte-reduction 0.9936636042651259
+  :root-size-factor 157.8184655396619}
+ :correctness
+ {:legacy-v1-readable true
+  :v2-root-and-leaf-validation :fail-closed
+  :generic-ipld-gc-links-pages true
+  :prefix-selects-bounded-pages true}
+ :claim
+ "At the observed 1M cardinality, v2 removes 99.37% of inline root bytes and
+ caps each immutable leaf below 27 KiB. Total first-build metadata bytes remain
+ comparable because all refs still exist in leaves. Subsequent checkpoint page
+ reuse is a separate gate; this receipt does not claim it or the 10M result."}

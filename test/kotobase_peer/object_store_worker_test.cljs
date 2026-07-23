@@ -305,12 +305,27 @@
              (worker/get-node! env @second-checkpoint-head)))
           (.then
            (fn [manifest]
+             (is (= 2
+                    (get-in manifest
+                            ["statistics" "range-directory-version"])))
+             (is (pos? (get-in manifest
+                               ["statistics"
+                                "range-directory-page-count"])))
              (worker/get-node!
               env (ipld/link-cid
                    (get-in manifest ["statistics" "range-directory"])))))
           (.then
            (fn [directory]
-             (is (= 1 (count (lsm/range-directory-refs directory :eavt)))
+             (is (lsm/paged-range-directory? directory))
+             (worker/get-node!
+              env
+              (ipld/link-cid
+               (get (first
+                     (lsm/range-directory-page-descriptors directory :eavt))
+                    "cid")))))
+          (.then
+           (fn [directory-page]
+             (is (= 1 (count (get directory-page "refs")))
                  "the repeated checkpoint replaces overlapping inherited refs")
              (let [third-plan
                    (lsm/flush-plan

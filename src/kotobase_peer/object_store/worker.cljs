@@ -426,6 +426,43 @@
      (sort-by (juxt #(get-in % [:descriptor "logical-min"]) :cid)
               (vals loaded)))))
 
+(defn- load-directory-index-refs!
+  [e db-id directory index first-components]
+  (if-not (lsm/paged-range-directory? directory)
+    (js/Promise.resolve (lsm/range-directory-refs directory index))
+    (let [all (lsm/range-directory-page-descriptors directory index)
+          selected
+          (if (seq first-components)
+            (->> first-components
+                 (mapcat #(lsm/select-run-refs-by-first-component all %))
+                 (reduce (fn [by-cid descriptor]
+                           (assoc by-cid
+                                  (str (ipld/link-cid (get descriptor "cid")))
+                                  descriptor))
+                         {})
+                 vals vec)
+            (vec all))
+          load-page
+          (fn [descriptor]
+            (-> (get-node! e (ipld/link-cid (get descriptor "cid")))
+                (.then
+                 (fn [page]
+                   (get
+                    (lsm/validate-range-directory-page
+                     page db-id (get directory "epoch") index
+                     (get directory "page-refs"))
+                    "refs")))))]
+      ;; Keep provider concurrency bounded even when a 10M directory has
+      ;; hundreds of leaves.
+      (reduce
+       (fn [result wave]
+         (.then result
+                (fn [refs]
+                  (-> (js/Promise.all (clj->js (mapv load-page wave)))
+                      (.then #(into refs (mapcat identity (array-seq %))))))))
+       (js/Promise.resolve [])
+       (partition-all 4 selected)))))
+
 (defn- collect-index-run-refs!
   [e db-id base-cid index max-depth read-context]
   (letfn [(collect [cid remaining refs]
@@ -445,11 +482,20 @@
                        (-> (get-node! e (ipld/link-cid directory-link))
                            (.then
                             (fn [directory]
-                              (collect
-                               (some-> (get directory "previous") ipld/link-cid)
-                               (dec remaining)
-                               (into refs
-                                     (lsm/range-directory-refs directory index))))))
+                              (let [directory
+                                    (lsm/validate-range-directory
+                                     directory db-id (get manifest "epoch"))]
+                                (-> (load-directory-index-refs!
+                                     e db-id directory index
+                                     (or (:first-components read-context)
+                                         (:entities read-context)))
+                                    (.then
+                                     (fn [directory-refs]
+                                       (collect
+                                        (some-> (get directory "previous")
+                                                ipld/link-cid)
+                                        (dec remaining)
+                                        (into refs directory-refs)))))))))
                        (collect
                         (some-> (get manifest "previous") ipld/link-cid)
                         (dec remaining)
@@ -503,15 +549,23 @@
                                                           directory-link))
                                               (.then
                                                (fn [directory]
-                                                 (collect
-                                                  (some->
-                                                   (get directory "previous")
-                                                   ipld/link-cid)
-                                                  (dec remaining)
-                                                  (into
-                                                   refs
-                                                   (lsm/range-directory-refs
-                                                    directory :eavt))))))
+                                                 (let [directory
+                                                       (lsm/validate-range-directory
+                                                        directory db-id
+                                                        (get manifest "epoch"))]
+                                                   (->
+                                                    (load-directory-index-refs!
+                                                     e db-id directory :eavt
+                                                     (when (seq prefix) [prefix]))
+                                                    (.then
+                                                     (fn [directory-refs]
+                                                       (collect
+                                                        (some->
+                                                         (get directory "previous")
+                                                         ipld/link-cid)
+                                                        (dec remaining)
+                                                        (into refs
+                                                              directory-refs)))))))))
                                           (collect
                                            (some-> (get manifest "previous")
                                                    ipld/link-cid)
@@ -607,9 +661,10 @@
                   (.then
                    (fn [base-manifest]
                      (let [query-epoch (get base-manifest "epoch")]
-                       (-> (collect-index-run-refs!
+                           (-> (collect-index-run-refs!
                             e db-id base-cid index max-depth
-                            {:index index :prefix-count (count prefixes)})
+                            {:index index :prefix-count (count prefixes)
+                             :first-components (mapv first prefixes)})
                            (.then
                             (fn [refs]
                               (let [selected
@@ -1291,9 +1346,34 @@
              (-> (get-node! e (ipld/link-cid directory-link))
                  (.then
                   (fn [directory]
-                    {:directory
-                     (lsm/validate-range-directory
-                      directory db-id (get manifest "epoch"))})))))))))
+                    (let [source
+                          (lsm/validate-range-directory
+                           directory db-id (get manifest "epoch"))]
+                      (if-not (lsm/paged-range-directory? source)
+                        {:directory source :source-directory source}
+                        (->
+                         (js/Promise.all
+                          (clj->js
+                           (mapv
+                            (fn [index]
+                              (-> (load-directory-index-refs!
+                                   e db-id source index nil)
+                                  (.then #(vector index %))))
+                            lsm/indexes)))
+                         (.then
+                          (fn [pairs]
+                            {:source-directory source
+                             ;; Existing pure compaction selection consumes
+                             ;; resolved refs. Keep that contract while v2
+                             ;; storage remains paged.
+                             :directory
+                             (assoc source
+                                    "version" lsm/format-version
+                                    "indexes"
+                                    (into {}
+                                          (map (fn [[index refs]]
+                                                 [(name index) refs]))
+                                          (array-seq pairs)))}))))))))))))))
 
 (defn retention-safe-epoch-oracle!
   "Return the explicit clock-skew-conservative R2 retention decision consumed
@@ -1409,10 +1489,11 @@
                                            (some-> (get (:directory inherited) "previous")
                                                    ipld/link-cid)
                                            tail)
-                                         directory (lsm/build-range-directory
-                                                    {:db-id db-id :epoch epoch
-                                                     :indexes directory-indexes
-                                                     :previous directory-previous})
+                                         directory
+                                         (lsm/build-paged-range-directory
+                                          {:db-id db-id :epoch epoch
+                                           :indexes directory-indexes
+                                           :previous directory-previous})
                                          manifest (lsm/build-manifest
                                                    {:db-id db-id :epoch epoch
                                                     :safe-epoch safe-epoch
@@ -1428,6 +1509,27 @@
                                                      "manifest-count" (count manifests)
                                                      "target-run-rows" target-run-rows
                                                      "streaming-compaction" true
+                                                     "range-directory-version"
+                                                     lsm/range-directory-version
+                                                     "range-directory-page-refs"
+                                                     lsm/default-range-directory-page-refs
+                                                     "range-directory-page-count"
+                                                     (reduce +
+                                                             (map count
+                                                                  (vals
+                                                                   (:pages
+                                                                    directory))))
+                                                     "range-directory-root-bytes"
+                                                     (.-byteLength
+                                                      (:bytes directory))
+                                                     "range-directory-page-bytes"
+                                                     (reduce
+                                                      +
+                                                      (map
+                                                       #(.-byteLength (:bytes %))
+                                                       (mapcat
+                                                        val
+                                                        (:pages directory))))
                                                      "stream-metrics"
                                                      (into {}
                                                            (map (fn [[k v]]
