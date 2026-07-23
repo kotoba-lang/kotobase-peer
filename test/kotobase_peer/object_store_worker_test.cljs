@@ -1087,14 +1087,40 @@
                  (.then
                   (fn [terminal]
                     (is (= :completed (:phase terminal)))
+                    (swap! entries dissoc
+                           (str prefix "heads/restored"))
+                    (worker/claim-database-restore!
+                     env {:task (:task @restore-ready)
+                          :owner "head-loss-recovery-worker"
+                          :token "head-loss-recovery-token"
+                          :now-ms 13000
+                          :lease-ms 1000})))
+                 (.then
+                  (fn [head-loss-recovery]
+                    (is (:claimed? head-loss-recovery))
+                    (is (= "running"
+                           (get-in head-loss-recovery
+                                   [:checkpoint "status"])))
+                    (is (= 0
+                           (get-in head-loss-recovery
+                                   [:checkpoint "next-page"])))
+                    (is (= 3
+                           (get-in head-loss-recovery
+                                   [:checkpoint "attempt"])))
+                    (swap! entries dissoc
+                           (worker/database-restore-pointer-key
+                            env "restored"
+                            (str (get-in head-loss-recovery
+                                         [:task :cid]))))
                     (worker/restore-database!
                      env (:inventory backup) "restored")))
                  (.then
                   (fn [restored]
                     (is (= 0 (:restored restored)))
                     (is (= 1 (:already-present restored)))
-                    (is (false? (:head-created? restored)))
-                    (is (:idempotent? restored))
+                    (is (:head-created? restored)
+                        "head-loss recovery republishes the verified head")
+                    (is (false? (:idempotent? restored)))
                     (is (= 1 (:verified-reachable restored)))
                     (is (= source-head
                            (:value

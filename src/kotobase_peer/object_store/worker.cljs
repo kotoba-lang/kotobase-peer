@@ -3362,9 +3362,24 @@
                           :keys [etag]}]
                       (cond
                         (and current
-                             (= "completed" (get current "status")))
-                        {:claimed? false :reason :terminal
-                         :status :completed}
+                             (= "completed" (get current "status"))
+                             (= current-head expected-head))
+                        (let [terminal
+                              (database-restore/validate-checkpoint
+                               task current-checkpoint
+                               (get current "token")
+                               (get current "attempt"))]
+                          (when-not (= "completed"
+                                       (get terminal "status"))
+                            (throw
+                             (ex-info
+                              "Database restore terminal pointer/checkpoint mismatch"
+                              {:task-id task-id
+                               :pointer-status (get current "status")
+                               :checkpoint-status
+                               (get terminal "status")})))
+                          {:claimed? false :reason :terminal
+                           :status :completed})
 
                         (and current
                              (> (get current "expires-at" 0) now-ms))
@@ -3375,7 +3390,9 @@
                         :else
                         (let [attempt (inc (or (get current "attempt") 0))
                               checkpoint
-                              (if current
+                              (if (and current
+                                       (not= "completed"
+                                             (get current "status")))
                                 (database-restore/reclaim-checkpoint
                                  {:task task
                                   :checkpoint current-checkpoint

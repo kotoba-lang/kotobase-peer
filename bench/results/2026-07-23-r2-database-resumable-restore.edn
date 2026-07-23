@@ -40,7 +40,7 @@
                          :backup-before-delete true
                          :restore-cid-verification true
                          :local-cljs-tests {:tests 246
-                                            :assertions 957
+                                            :assertions 961
                                             :failures 0
                                             :errors 0}}}
  :verification {:jvm {:tests 241
