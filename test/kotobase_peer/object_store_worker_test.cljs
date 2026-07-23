@@ -115,6 +115,94 @@
              (is false (str "MVCC entity read rejected: " error))
              (done)))))))
 
+(deftest checkpoint-compaction-streams-physical-blocks-with-a-bounded-working-set
+  (async done
+    (let [entries (atom {})
+          version (atom 0)
+          block-gets (atom 0)
+          response
+          (fn [{:keys [value etag]}]
+            #js {:etag etag
+                 :text (fn [] (js/Promise.resolve value))
+                 :arrayBuffer
+                 (fn []
+                   (let [bytes (if (string? value)
+                                 (.encode (js/TextEncoder.) value)
+                                 value)]
+                     (js/Promise.resolve
+                      (.slice (.-buffer bytes) (.-byteOffset bytes)
+                              (+ (.-byteOffset bytes) (.-byteLength bytes))))))})
+          bucket
+          #js {:get
+               (fn [key]
+                 (let [stored (get @entries key)]
+                   (when (and stored
+                              (str/includes? key "/blocks/")
+                              (= "kotobase/merkle-run-block"
+                                 (get (ipld/decode (:value stored)) "format")))
+                     (swap! block-gets inc))
+                   (js/Promise.resolve (when stored (response stored)))))
+               :put
+               (fn [key value opts]
+                 (let [current (get @entries key)
+                       condition (when opts (.-onlyIf opts))
+                       matches (when condition (.-etagMatches condition))
+                       absent (when condition (.-etagDoesNotMatch condition))
+                       won? (cond
+                              matches (= matches (:etag current))
+                              (= "*" absent) (nil? current)
+                              :else true)]
+                   (if-not won?
+                     (js/Promise.resolve nil)
+                     (let [etag (str "v" (swap! version inc))]
+                       (swap! entries assoc key {:value value :etag etag})
+                       (js/Promise.resolve #js {:etag etag})))))}
+          env #js {"MERKLE_BUCKET" bucket "MERKLE_S3_PREFIX" "stream"}
+          datoms (mapv (fn [n]
+                         {:e (str "entity-" (.padStart (str n) 6 "0"))
+                          :a "value" :v n})
+                       (range 512))
+          first-plan (lsm/flush-plan
+                      {:db-id "db-stream" :epoch 1 :target-run-rows 512
+                       :block-rows 64 :datoms datoms})
+          first-head (get-in first-plan [:manifest :cid])
+          second-plan (lsm/flush-plan
+                       {:db-id "db-stream" :epoch 2 :previous first-head
+                        :expected first-head :target-run-rows 512
+                        :block-rows 64 :datoms datoms})]
+      (-> (worker/apply-atomic-publication! env first-plan)
+          (.then (fn [_] (worker/apply-atomic-publication! env second-plan)))
+          (.then (fn [_]
+                   (worker/compact-head! env "db-stream" 64 128 2)))
+          (.then
+           (fn [compacted?]
+             (is compacted?)
+             (is (pos? @block-gets)
+                 "compaction reads physical data blocks rather than whole runs")
+             (worker/get-head env "db-stream")))
+          (.then
+           (fn [{:keys [value]}]
+             (worker/get-node! env value)))
+          (.then
+           (fn [manifest]
+             (let [metrics (get-in manifest
+                                   ["statistics" "stream-metrics"])]
+               (is (true? (get-in manifest
+                                  ["statistics" "streaming-compaction"])))
+               (is (= @block-gets (get metrics "input-block-gets")))
+               (is (<= (get metrics "max-buffered-input-rows") 128)
+                   "one 64-row block per two overlapping runs is retained")
+               (is (<= (get metrics "max-buffered-input-bytes")
+                       (* 64 1024 1024)))
+               (is (= 1536 (get metrics "output-rows"))
+                   "three covering indexes each retain 512 logical rows")
+               (done))))
+          (.catch
+           (fn [error]
+             (is false (str "streaming compaction rejected: " error "\n"
+                            (.-stack error)))
+             (done)))))))
+
 (deftest repeated-checkpoint-compaction-inherits-replaces-and-fences
   (async done
     (let [entries (atom {})

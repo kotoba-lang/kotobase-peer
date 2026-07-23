@@ -135,7 +135,9 @@
     (is (= [["a" "h"] ["x" "z"]]
            (mapv (juxt :min-key :max-key) ranges)))
     (is (= [[a (dissoc b "min-key")]]
-           (lsm/overlapping-run-ranges [a (dissoc b "min-key")])))))
+           (mapv :refs
+                 (lsm/overlapping-run-ranges
+                  [a (dissoc b "min-key")]))))))
 
 (deftest publication-puts-before-cas
   (let [run (lsm/build-run :eavt "tenant-a" entries)

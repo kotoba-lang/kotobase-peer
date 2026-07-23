@@ -317,7 +317,7 @@
     (cond
       (empty? refs) []
       (some #(or (nil? (get % "min-key")) (nil? (get % "max-key"))) refs)
-      [refs]
+      [{:min-key nil :max-key nil :refs refs}]
       :else
       (reduce (fn [ranges ref]
                 (let [start (get ref "min-key")

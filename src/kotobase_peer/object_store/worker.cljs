@@ -971,23 +971,283 @@
       js/Promise.all
       (.then #(vec (array-seq %)))))
 
+(def ^:private default-stream-limits
+  {:max-open-runs 64
+   :max-input-block-bytes (* 2 1024 1024)
+   :max-working-input-bytes (* 64 1024 1024)
+   :max-inline-run-rows 4096
+   :max-logical-group-rows 65536})
+
+(defn- run-cursor!
+  [e index limits metrics ref]
+  (let [descriptors (vec (sort-by #(get % "ordinal") (get ref "blocks")))]
+    (if (seq descriptors)
+      (js/Promise.resolve
+       {:ref ref :descriptors descriptors :next-block 0 :rows [] :row-index 0
+        :loaded-bytes 0})
+      (let [encoded-bytes (get ref "encoded-bytes")]
+        (when (or (nil? encoded-bytes)
+                  (> encoded-bytes (:max-input-block-bytes limits))
+                  (> (+ (:current-buffered-input-bytes @metrics) encoded-bytes)
+                     (:max-working-input-bytes limits)))
+          (throw (ex-info "Inline Merkle run exceeds streaming byte bound"
+                          {:index index :encoded-bytes encoded-bytes
+                           :max-input-block-bytes
+                           (:max-input-block-bytes limits)
+                           :max-working-input-bytes
+                           (:max-working-input-bytes limits)})))
+        (-> (load-run! e ref)
+          (.then
+           (fn [{:keys [rows]}]
+             (when (> (count rows) (:max-inline-run-rows limits))
+               (throw (ex-info "Inline Merkle run exceeds streaming bound"
+                               {:index index :rows (count rows)
+                                :max-inline-run-rows
+                                (:max-inline-run-rows limits)})))
+             (swap! metrics
+                    (fn [m]
+                      (let [current-rows
+                            (+ (:current-buffered-input-rows m) (count rows))
+                            current-bytes
+                            (+ (:current-buffered-input-bytes m) encoded-bytes)]
+                        (-> m
+                            (assoc :current-buffered-input-rows current-rows
+                                   :current-buffered-input-bytes current-bytes)
+                            (update :max-buffered-input-rows max current-rows)
+                            (update :max-buffered-input-bytes max current-bytes)))))
+             {:ref ref :descriptors [] :next-block 0
+              :rows (vec rows) :row-index 0
+              :loaded-bytes encoded-bytes})))))))
+
+(defn- cursor-row [cursor]
+  (get (:rows cursor) (:row-index cursor)))
+
+(defn- ensure-cursor-row!
+  "Load at most one physical data block for a cursor. A consumed block is
+  replaced, never accumulated, so the live input is bounded by open runs."
+  [e index tenant limits metrics cursor]
+  (cond
+    (cursor-row cursor) (js/Promise.resolve cursor)
+    (>= (:next-block cursor) (count (:descriptors cursor)))
+    (js/Promise.resolve nil)
+    :else
+    (let [descriptor (get (:descriptors cursor) (:next-block cursor))
+          encoded-bytes (get descriptor "encoded-bytes")]
+      (when (or (nil? encoded-bytes)
+                (> encoded-bytes (:max-input-block-bytes limits)))
+        (throw (ex-info "Merkle input block lacks a valid streaming byte bound"
+                        {:index index :encoded-bytes encoded-bytes
+                         :max-input-block-bytes
+                         (:max-input-block-bytes limits)})))
+      (when (> (+ (:current-buffered-input-bytes @metrics) encoded-bytes)
+               (:max-working-input-bytes limits))
+        (throw
+         (ex-info "Compaction input working set exceeds streaming byte bound"
+                  {:index index
+                   :current-buffered-input-bytes
+                   (:current-buffered-input-bytes @metrics)
+                   :next-block-bytes encoded-bytes
+                   :max-working-input-bytes
+                   (:max-working-input-bytes limits)})))
+      (-> (get-node! e (ipld/link-cid (get descriptor "cid")))
+          (.then
+           (fn [block]
+             (let [rows (vec (validated-run-block-rows
+                              descriptor block index tenant))]
+               (swap! metrics
+                      (fn [m]
+                        (let [current-rows
+                              (+ (:current-buffered-input-rows m) (count rows))
+                              current-bytes
+                              (+ (:current-buffered-input-bytes m) encoded-bytes)]
+                          (-> m
+                              (update :input-block-gets inc)
+                              (update :input-block-bytes + encoded-bytes)
+                              (assoc :current-buffered-input-rows current-rows
+                                     :current-buffered-input-bytes current-bytes)
+                              (update :max-buffered-input-rows max current-rows)
+                              (update :max-buffered-input-bytes max current-bytes)))))
+               (assoc cursor
+                      :next-block (inc (:next-block cursor))
+                      :rows rows :row-index 0
+                      :loaded-bytes encoded-bytes))))))))
+
+(defn- advance-cursor!
+  [e index tenant limits metrics cursor]
+  (let [next-index (inc (:row-index cursor))
+        exhausted? (>= next-index (count (:rows cursor)))
+        cursor (assoc cursor :row-index next-index)]
+    (when exhausted?
+      (swap! metrics
+             (fn [m]
+               (-> m
+                   (update :current-buffered-input-rows - (count (:rows cursor)))
+                   (update :current-buffered-input-bytes -
+                           (:loaded-bytes cursor))))))
+    (ensure-cursor-row!
+     e index tenant limits metrics
+     (cond-> cursor exhausted?
+       (assoc :rows [] :row-index 0 :loaded-bytes 0)))))
+
+(defn- initialize-cursors!
+  [e index tenant limits metrics refs]
+  (when (> (count refs) (:max-open-runs limits))
+    (throw (ex-info "Compaction overlap exceeds streaming open-run bound"
+                    {:index index :runs (count refs)
+                     :max-open-runs (:max-open-runs limits)})))
+  ;; Initialize sequentially. Each cursor retains no more than one data block;
+  ;; avoiding Promise.all also prevents a burst of all input blocks at once.
+  (reduce
+   (fn [result ref]
+     (.then result
+            (fn [cursors]
+              (-> (run-cursor! e index limits metrics ref)
+                  (.then #(ensure-cursor-row!
+                           e index tenant limits metrics %))
+                  (.then #(cond-> cursors % (conj %)))))))
+   (js/Promise.resolve []) refs))
+
+(defn- next-cursor-index [cursors]
+  (first
+   (reduce-kv
+    (fn [[best-index best-key :as best] i cursor]
+      (if-let [row (cursor-row cursor)]
+        (let [key (get row "key")]
+          (if (or (nil? best-key)
+                  (neg? (compare key best-key))
+                  (and (= key best-key) (< i best-index)))
+            [i key]
+            best))
+        best))
+    [nil nil] cursors)))
+
+(defn- take-logical-group!
+  [e index tenant limits metrics cursors]
+  (when-let [first-index (next-cursor-index cursors)]
+    (let [logical-key (lsm/row-logical-key
+                       (cursor-row (get cursors first-index)))]
+      (letfn [(step [current rows]
+                (if-let [i (next-cursor-index current)]
+                  (let [cursor (get current i)
+                        row (cursor-row cursor)]
+                    (if (= logical-key (lsm/row-logical-key row))
+                      (do
+                        (when (>= (count rows)
+                                  (:max-logical-group-rows limits))
+                          (throw
+                           (ex-info "Logical key exceeds streaming compaction bound"
+                                    {:index index :logical-key logical-key
+                                     :max-logical-group-rows
+                                     (:max-logical-group-rows limits)})))
+                        (-> (advance-cursor!
+                             e index tenant limits metrics cursor)
+                            (.then
+                             (fn [next-cursor]
+                               (step (vec (remove nil?
+                                                  (assoc current i next-cursor)))
+                                     (conj rows row))))))
+                      (js/Promise.resolve
+                       {:cursors (vec (remove nil? current)) :rows rows})))
+                  (js/Promise.resolve {:cursors [] :rows rows})))]
+        (step cursors [])))))
+
+(defn- retained-group-entries [safe-epoch rows]
+  (let [{newer true older false}
+        (group-by #(> (get % "epoch") safe-epoch) (distinct rows))]
+    (mapv (fn [row]
+            {:components (get row "components")
+             :epoch (get row "epoch")
+             :op (keyword (get row "op"))
+             :value (get row "value")})
+          (concat newer (take 1 older)))))
+
+(defn- put-output-run!
+  [e index tenant entries metrics]
+  (let [run (lsm/build-run index tenant entries)
+        puts (filterv #(= :block/put (:effect/type %)) (:effects run))
+        put-bytes (reduce + (map #(.-byteLength (:bytes %)) puts))]
+    (-> (put-blocks! e (:effects run))
+        (.then
+         (fn [_]
+           (swap! metrics
+                  (fn [m]
+                    (-> m
+                        (update :output-runs inc)
+                        (update :output-rows + (:count run))
+                        (update :output-object-puts + (count puts))
+                        (update :output-object-bytes + put-bytes))))
+           (lsm/run-ref run))))))
+
+(defn- compact-run-component-streaming!
+  [e db-id index safe-epoch target-run-rows limits refs]
+  (let [metrics
+        (atom {:input-runs (count refs)
+               :input-block-gets 0 :input-block-bytes 0
+               :current-buffered-input-rows 0
+               :current-buffered-input-bytes 0
+               :max-buffered-input-rows 0 :max-buffered-input-bytes 0
+               :output-runs 0 :output-rows 0
+               :output-object-puts 0 :output-object-bytes 0})]
+    (letfn [(flush-pending [output-refs pending]
+              (if (seq pending)
+                (-> (put-output-run! e index db-id pending metrics)
+                    (.then (fn [ref] [(conj output-refs ref) []])))
+                (js/Promise.resolve [output-refs []])))
+            (step [cursors output-refs pending]
+              (if (empty? cursors)
+                (.then (flush-pending output-refs pending)
+                       (fn [[refs _]]
+                         {:refs refs
+                          :metrics
+                          (dissoc @metrics
+                                  :current-buffered-input-rows
+                                  :current-buffered-input-bytes)}))
+                (.then
+                 (take-logical-group!
+                  e index db-id limits metrics cursors)
+                 (fn [{next-cursors :cursors rows :rows}]
+                   (let [entries (retained-group-entries safe-epoch rows)]
+                     (if (and (seq pending)
+                              (> (+ (count pending) (count entries))
+                                 target-run-rows))
+                       (.then
+                        (flush-pending output-refs pending)
+                        (fn [[next-refs _]]
+                          (step next-cursors next-refs entries)))
+                       (step next-cursors output-refs
+                             (into pending entries))))))))]
+      (-> (initialize-cursors! e index db-id limits metrics refs)
+          (.then #(step % [] []))))))
+
+(defn- merge-stream-metrics [left right]
+  (reduce-kv
+   (fn [totals k value]
+     (assoc totals k
+            ((if (contains? #{:max-buffered-input-rows
+                              :max-buffered-input-bytes}
+                            k)
+               max +)
+             (get totals k 0) value)))
+   left right))
+
 (defn- compact-index-ranges!
-  "Process disjoint overlap components sequentially. Uploaded run bytes leave
-  the live working set before the next range starts; only manifest refs stay."
+  "Stream disjoint overlap components sequentially. The implementation holds
+  one bounded data block per open input run and one bounded output run; it
+  never materializes an overlap component's complete row set."
   [e db-id index safe-epoch target-run-rows refs]
   (reduce
    (fn [result {:keys [refs]}]
      (.then result
-            (fn [output-refs]
-              (-> (load-runs! e refs)
+            (fn [{output-refs :refs aggregate :metrics}]
+              (-> (compact-run-component-streaming!
+                   e db-id index safe-epoch target-run-rows
+                   default-stream-limits refs)
                   (.then
-                   (fn [runs]
-                     (let [outputs (lsm/compact-runs-partitioned
-                                    index db-id safe-epoch target-run-rows runs)]
-                       (-> (put-blocks! e (mapcat :effects outputs))
-                           (.then (fn [_]
-                                    (into output-refs (map lsm/run-ref) outputs)))))))))))
-   (js/Promise.resolve [])
+                   (fn [{component-refs :refs component :metrics}]
+                     {:refs (into output-refs component-refs)
+                      :metrics (merge-stream-metrics
+                                aggregate component)}))))))
+   (js/Promise.resolve {:refs [] :metrics {}})
    (lsm/overlapping-run-ranges refs)))
 
 (defn- load-tail-checkpoint! [e db-id tail]
@@ -1077,11 +1337,22 @@
                                                e db-id index safe-epoch
                                                target-run-rows inputs)
                                               (.then #(assoc compacted index %)))))))
-                                   (js/Promise.resolve {})
-                                   present)
+                                  (js/Promise.resolve {})
+                                  present)
                                   (.then
-                                   (fn [compacted]
-                                     (let [directory-indexes
+                                   (fn [compaction-results]
+                                     (let [compacted
+                                           (into {}
+                                                 (map (fn [[index result]]
+                                                        [index (:refs result)]))
+                                                 compaction-results)
+                                           stream-metrics
+                                           (reduce
+                                            (fn [totals result]
+                                              (merge-stream-metrics
+                                               totals (:metrics result)))
+                                            {} (vals compaction-results))
+                                           directory-indexes
                                            (if inherited
                                              (lsm/merge-range-directory-indexes
                                               compacted (:directory inherited))
@@ -1109,6 +1380,12 @@
                                                      "inherited-checkpoint" (boolean inherited)
                                                      "manifest-count" (count manifests)
                                                      "target-run-rows" target-run-rows
+                                                     "streaming-compaction" true
+                                                     "stream-metrics"
+                                                     (into {}
+                                                           (map (fn [[k v]]
+                                                                  [(name k) v]))
+                                                           stream-metrics)
                                                      "output-run-count"
                                                      (reduce + (map count (vals compacted)))}})
                                          base-effects (concat (:effects directory)

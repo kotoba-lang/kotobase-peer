@@ -226,6 +226,17 @@ and become v1 directories on compaction. A directory with a future version,
 wrong database, or epoch beyond its owning manifest fails closed until an
 explicit format migrator is provided.
 
+Window compaction streams every overlap component as a k-way merge over
+physical run blocks. Each open run retains at most one input block, completed
+blocks are released before the next GET, and each bounded output run is PUT
+before the following output is built. The default fail-closed limits are 64
+overlapping runs, 2 MiB per input block, 64 MiB aggregate input bytes, 4,096
+rows for a legacy inline run, and 65,536 versions for one indivisible logical
+key. The resulting manifest records input GETs/bytes, peak buffered rows/bytes,
+output PUTs/bytes, and output rows. These are algorithmic working-set metrics;
+they do not replace Worker CPU/memory or R2 request measurements in the
+1M/10M production gate.
+
 Production compaction is scheduled with one deterministic task CID per
 database head and compaction bounds. The R2 host claims a per-database lease
 with ETag CAS, fences active contenders, renews only running leases, reclaims
