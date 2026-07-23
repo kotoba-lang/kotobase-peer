@@ -1,6 +1,7 @@
 (ns kotobase-peer.object-store-worker-test
   (:require [cljs.test :refer [deftest is async]]
             [clojure.string :as str]
+            [goog.object :as gobj]
             [ipld.core :as ipld]
             [kotobase-peer.merkle-lsm :as lsm]
             [kotobase-peer.object-store.worker :as worker]
@@ -112,6 +113,147 @@
           (.catch
            (fn [error]
              (is false (str "MVCC entity read rejected: " error))
+             (done)))))))
+
+(deftest repeated-checkpoint-compaction-inherits-replaces-and-fences
+  (async done
+    (let [entries (atom {})
+          version (atom 0)
+          fail-next-head-cas? (atom false)
+          response
+          (fn [{:keys [value etag]}]
+            #js {:etag etag
+                 :text (fn []
+                         (js/Promise.resolve
+                          (if (string? value)
+                            value
+                            (.decode (js/TextDecoder.) value))))
+                 :arrayBuffer
+                 (fn []
+                   (let [bytes (if (string? value)
+                                 (.encode (js/TextEncoder.) value)
+                                 value)]
+                     (js/Promise.resolve
+                      (.slice (.-buffer bytes) (.-byteOffset bytes)
+                              (+ (.-byteOffset bytes) (.-byteLength bytes))))))})
+          bucket
+          #js {:get (fn [key]
+                      (js/Promise.resolve
+                       (some-> (get @entries key) response)))
+               :put
+               (fn [key value opts]
+                 (let [current (get @entries key)
+                       only-if (when opts (gobj/get opts "onlyIf"))
+                       matches (when only-if (gobj/get only-if "etagMatches"))
+                       absent (when only-if
+                                (gobj/get only-if "etagDoesNotMatch"))
+                       conditional? (some? only-if)
+                       won? (or (not conditional?)
+                                (and matches (= matches (:etag current)))
+                                (and (= "*" absent) (nil? current)))
+                       head? (str/includes? key "/heads/")]
+                   (if (and head? @fail-next-head-cas?)
+                     (do (reset! fail-next-head-cas? false)
+                         (js/Promise.resolve nil))
+                     (if-not won?
+                       (js/Promise.resolve nil)
+                       (let [etag (str "v" (swap! version inc))]
+                         (swap! entries assoc key {:value value :etag etag})
+                         (js/Promise.resolve #js {:etag etag}))))))}
+          env #js {"MERKLE_BUCKET" bucket "MERKLE_S3_PREFIX" "checkpoint"}
+          head-key "checkpoint/heads/db-checkpoint"
+          legacy-plan
+          (lsm/flush-plan
+           {:db-id "db-checkpoint" :epoch 0
+            :datoms [{:e "zara" :a "role" :v "admin"}]})
+          first-plan
+          (lsm/flush-plan
+           {:db-id "db-checkpoint" :epoch 1
+            :previous (get-in legacy-plan [:manifest :cid])
+            :expected (get-in legacy-plan [:manifest :cid])
+            :datoms [{:e "alice" :a "role" :v "admin"}
+                     {:e "bob" :a "role" :v "admin"}]})
+          first-checkpoint-head (atom nil)
+          second-checkpoint-head (atom nil)]
+      (-> (worker/apply-atomic-publication! env legacy-plan)
+          (.then (fn [published]
+                   (is (:published? published))
+                   (worker/apply-atomic-publication! env first-plan)))
+          (.then (fn [published]
+                   (is (:published? published))
+                   (worker/compact-head! env "db-checkpoint" 1 4096 1)))
+          (.then
+           (fn [compacted?]
+             (is compacted?)
+             (reset! first-checkpoint-head (:value (get @entries head-key)))
+             (let [second-plan
+                   (lsm/flush-plan
+                    {:db-id "db-checkpoint" :epoch 2
+                     :previous @first-checkpoint-head
+                     :expected @first-checkpoint-head
+                     :datoms [{:e "alice" :a "role" :v "admin" :op :retract}
+                              {:e "carol" :a "role" :v "admin"}]})]
+               (worker/apply-atomic-publication! env second-plan))))
+          (.then (fn [published]
+                   (is (:published? published))
+                   (worker/compact-head! env "db-checkpoint" 64 4096 1)))
+          (.then
+           (fn [compacted?]
+             (is compacted?)
+             (reset! second-checkpoint-head (:value (get @entries head-key)))
+             (worker/find-entities! env "db-checkpoint" "")))
+          (.then
+           (fn [entities]
+             (is (= #{"bob" "carol" "zara"} (set (keys entities)))
+                 "the second checkpoint keeps inherited refs, legacy tail, and tombstones")
+             (worker/find-index-prefix-page!
+              env "db-checkpoint" :eavt [["alice"] ["bob"] ["zara"]]
+              {:limit 10 :head-cid @first-checkpoint-head})))
+          (.then
+           (fn [page]
+             (is (= #{"alice" "bob" "zara"}
+                    (set (map #(first (get % "components")) (:rows page))))
+                 "an old pinned checkpoint and its partial legacy tail remain readable")
+             (worker/get-node! env @second-checkpoint-head)))
+          (.then
+           (fn [manifest]
+             (worker/get-node!
+              env (ipld/link-cid
+                   (get-in manifest ["statistics" "range-directory"])))))
+          (.then
+           (fn [directory]
+             (is (= 1 (count (lsm/range-directory-refs directory :eavt)))
+                 "the repeated checkpoint replaces overlapping inherited refs")
+             (let [third-plan
+                   (lsm/flush-plan
+                    {:db-id "db-checkpoint" :epoch 3
+                     :previous @second-checkpoint-head
+                     :expected @second-checkpoint-head
+                     :datoms [{:e "alice" :a "role" :v "admin"}]})]
+               (worker/apply-atomic-publication! env third-plan))))
+          (.then
+           (fn [published]
+             (is (:published? published))
+             (let [winner (:value (get @entries head-key))]
+               (reset! fail-next-head-cas? true)
+               (-> (worker/compact-head! env "db-checkpoint" 64 4096 1)
+                   (.then (fn [compacted?]
+                            (is (false? compacted?))
+                            (is (= winner (:value (get @entries head-key)))
+                                "a HeadCAS loser never publishes its directory")
+                            (worker/compact-head! env "db-checkpoint" 64 4096 1)))))))
+          (.then
+           (fn [compacted?]
+             (is compacted?)
+             (worker/find-entities! env "db-checkpoint" "")))
+          (.then
+           (fn [entities]
+             (is (= #{"alice" "bob" "carol" "zara"}
+                    (set (keys entities))))
+             (done)))
+          (.catch
+           (fn [error]
+             (is false (str "repeated checkpoint compaction rejected: " error))
              (done)))))))
 
 (deftest prefix-pages-skip-completed-physical-run-blocks

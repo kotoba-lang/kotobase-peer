@@ -730,9 +730,15 @@
                {:manifests acc :tail cid})
               (-> (get-node! e cid)
                   (.then (fn [node]
-                           (step (some-> (get node "previous") ipld/link-cid)
-                                 (dec remaining)
-                                 (conj acc {:cid cid :node node})))))))]
+                           ;; A range directory replaces the manifest indexes
+                           ;; for the checkpointed prefix. Keep that manifest as
+                           ;; an atomic boundary; reading only its own indexes
+                           ;; would silently omit refs inherited by directory.
+                           (if (get-in node ["statistics" "range-directory"])
+                             {:manifests acc :tail cid}
+                             (step (some-> (get node "previous") ipld/link-cid)
+                                   (dec remaining)
+                                   (conj acc {:cid cid :node node}))))))))]
     (step head-cid limit [])))
 
 (defn- index-run-refs [manifests index]
@@ -791,7 +797,7 @@
    (js/Promise.resolve [])
    (lsm/overlapping-run-ranges refs)))
 
-(defn- load-tail-checkpoint! [e tail]
+(defn- load-tail-checkpoint! [e db-id tail]
   (if-not tail
     (js/Promise.resolve nil)
     (-> (get-node! e tail)
@@ -800,7 +806,11 @@
            (when-let [directory-link
                       (get-in manifest ["statistics" "range-directory"])]
              (-> (get-node! e (ipld/link-cid directory-link))
-                 (.then (fn [directory] {:directory directory})))))))))
+                 (.then
+                  (fn [directory]
+                    {:directory
+                     (lsm/validate-range-directory
+                      directory db-id (get manifest "epoch"))})))))))))
 
 (defn retention-safe-epoch!
   "Return the minimum epoch imposed by active R2 retention roots, or nil when
@@ -835,31 +845,45 @@
             (-> (manifest-window! e base-cid window-size)
                 (.then
                  (fn [{:keys [manifests tail]}]
-                   (let [present (filter #(seq (index-run-refs manifests %)) lsm/indexes)
-                         epoch (apply max (map #(get-in % [:node "epoch"]) manifests))
-                         safe-epoch (if root-safe-epoch
-                                      (min epoch root-safe-epoch)
-                                      epoch)]
-                     (-> (reduce
-                          (fn [result index]
-                            (.then result
+                   (if (empty? manifests)
+                     false
+                     (let [present (filter #(seq (index-run-refs manifests %))
+                                           lsm/indexes)
+                           epoch (apply max
+                                        (map #(get-in % [:node "epoch"])
+                                             manifests))
+                           safe-epoch (if root-safe-epoch
+                                        (min epoch root-safe-epoch)
+                                        epoch)]
+                       (-> (load-tail-checkpoint! e db-id tail)
+                           (.then
+                            (fn [inherited]
+                              (-> (reduce
+                                   (fn [result index]
+                                     (.then
+                                      result
+                                      (fn [compacted]
+                                        (let [current
+                                              (index-run-refs manifests index)
+                                              inputs
+                                              (if inherited
+                                                (lsm/checkpoint-compaction-refs
+                                                 current (:directory inherited)
+                                                 index)
+                                                current)]
+                                          (-> (compact-index-ranges!
+                                               e db-id index safe-epoch
+                                               target-run-rows inputs)
+                                              (.then #(assoc compacted index %)))))))
+                                   (js/Promise.resolve {})
+                                   present)
+                                  (.then
                                    (fn [compacted]
-                                     (-> (compact-index-ranges!
-                                          e db-id index safe-epoch target-run-rows
-                                          (index-run-refs manifests index))
-                                         (.then #(assoc compacted index %))))))
-                          (js/Promise.resolve {})
-                         present)
-                         (.then
-                          (fn [compacted]
-                            (-> (load-tail-checkpoint! e tail)
-                                (.then
-                                 (fn [inherited]
-                                   (let [directory-indexes
-                                         (if inherited
-                                           (lsm/merge-range-directory-indexes
-                                            compacted (:directory inherited))
-                                           compacted)
+                                     (let [directory-indexes
+                                           (if inherited
+                                             (lsm/merge-range-directory-indexes
+                                              compacted (:directory inherited))
+                                             compacted)
                                          directory-previous
                                          (if inherited
                                            (some-> (get (:directory inherited) "previous")
@@ -916,7 +940,7 @@
                                                   (.then
                                                    (fn [_]
                                                      (cas-head! e db-id next-head
-                                                                etag)))))))))))))))))))))))))
+                                                                etag))))))))))))))))))))))))))
 
 (defn get-compaction-lease!
   "Read and validate the mutable per-database compaction lease."

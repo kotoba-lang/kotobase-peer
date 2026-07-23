@@ -27,6 +27,17 @@
     (is (= {:effect/type :block/put :cid (:cid a) :bytes (:bytes a)}
            (first (:effects a))))))
 
+(deftest same-epoch-retry-deduplicates-and-conflict-fails-closed
+  (let [entry {:components ["alice" "role" "admin"]
+               :epoch 7 :op :assert :value "admin"}
+        once (lsm/build-run :eavt "t" [entry])
+        retried (lsm/build-run :eavt "t" [entry entry])]
+    (is (= (:cid once) (:cid retried)))
+    (is (= 1 (:count retried)))
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (lsm/build-run :eavt "t"
+                                [entry (assoc entry :op :retract)])))))
+
 (deftest manifest-links-runs-and-is-deterministic
   (let [run (lsm/build-run :eavt "tenant-a" entries)
         opts {:db-id "tenant-a" :epoch 9 :safe-epoch 7
@@ -53,16 +64,46 @@
     (is (= (:cid a)
            (ipld/link-cid (get-in directory [:node "previous"]))))))
 
-(deftest range-directory-inherits-checkpoint-refs
+(deftest range-directory-replaces-compacted-index-and-converges
   (let [old-run (lsm/build-run :eavt "t" entries)
         new-run (lsm/build-run :eavt "t" (take 1 entries))
+        untouched (lsm/build-run :avet "t" entries)
         old-directory (:node (lsm/build-range-directory
                               {:db-id "db" :epoch 1
-                               :indexes {:eavt [old-run]}}))
-        merged (lsm/merge-range-directory-indexes
-                {:eavt [(lsm/run-ref new-run)]} old-directory)]
-    (is (= [(lsm/run-ref new-run) (lsm/run-ref old-run)]
-           (:eavt merged)))))
+                               :indexes {:eavt [old-run]
+                                         :avet [untouched]}}))
+        new-ref (lsm/run-ref new-run)
+        compact-inputs (lsm/checkpoint-compaction-refs
+                        [new-ref new-ref] old-directory :eavt)
+        a (lsm/merge-range-directory-indexes
+           {:eavt [new-ref new-ref]} old-directory)
+        b (lsm/merge-range-directory-indexes
+           {:eavt (reverse [new-ref new-ref])} old-directory)]
+    (is (= #{(lsm/run-ref old-run) new-ref} (set compact-inputs))
+        "inherited refs participate in the replacement compaction")
+    (is (= [new-ref] (:eavt a))
+        "the compacted index replaces, rather than appends to, stale refs")
+    (is (= [(lsm/run-ref untouched)] (:avet a))
+        "indexes absent from the new output remain inherited")
+    (is (= a b))
+    (is (= (:cid (lsm/build-range-directory
+                  {:db-id "db" :epoch 2 :indexes a}))
+           (:cid (lsm/build-range-directory
+                  {:db-id "db" :epoch 2 :indexes b})))
+        "equivalent retries converge on one directory CID")))
+
+(deftest range-directory-version-and-ownership-fail-closed
+  (let [directory (:node (lsm/build-range-directory
+                          {:db-id "db" :epoch 4 :indexes {}}))]
+    (is (= directory (lsm/validate-range-directory directory "db" 4)))
+    (doseq [invalid [(assoc directory "version" 2)
+                     (assoc directory "db-id" "other")
+                     (assoc directory "epoch" 5)
+                     (assoc-in directory ["indexes" "future"] [])
+                     (assoc-in directory ["indexes" "eavt"]
+                               [{"cid" "not-an-ipld-link"}])]]
+      (is (thrown? #?(:clj Exception :cljs js/Error)
+                   (lsm/validate-range-directory invalid "db" 4))))))
 
 (deftest first-component-range-prunes-run-refs
   (let [alice (lsm/build-run :eavt "t"
@@ -182,6 +223,42 @@
       (is (= (mapv :cid partitions)
              (mapv :cid (lsm/compact-runs-partitioned
                          :eavt "t" 3 2 [r2 r1])))))))
+
+(deftest checkpoint-compaction-preserves-portable-snapshot-corpus
+  (let [entries
+        (vec
+         (for [epoch (range 1 7)
+               entity (map #(str "entity-" %) (range 12))]
+           {:components [entity "flag" "on"]
+            :epoch epoch
+            :op (if (zero? (mod (+ epoch (count entity)) 3))
+                  :retract :assert)
+            :value "on"}))
+        by-epoch (group-by :epoch entries)
+        raw-runs (mapv #(lsm/build-run :eavt "t" (get by-epoch %))
+                       (range 1 7))
+        first-checkpoint
+        (lsm/compact-runs-partitioned :eavt "t" 2 7 (subvec raw-runs 0 3))
+        retry-run
+        (lsm/build-run :eavt "t"
+                       (concat (get by-epoch 4) (get by-epoch 4)))
+        second-inputs
+        (vec (concat first-checkpoint [retry-run]
+                     (subvec raw-runs 4 6)))
+        second-checkpoint
+        (lsm/compact-runs-partitioned :eavt "t" 2 7 second-inputs)
+        reversed-checkpoint
+        (lsm/compact-runs-partitioned :eavt "t" 2 7
+                                      (reverse second-inputs))]
+    (doseq [snapshot (range 2 7)]
+      (is (= (lsm/visible-rows raw-runs snapshot)
+             (lsm/visible-rows second-checkpoint snapshot))
+          (str "checkpoint replacement must preserve snapshot " snapshot)))
+    (is (= (mapv :cid second-checkpoint)
+           (mapv :cid reversed-checkpoint))
+        "enumeration order converges across CLJ and CLJS")
+    (is (= (count (get by-epoch 4)) (:count retry-run))
+        "an exact same-epoch retry does not survive as physical duplication")))
 
 (deftest visible-prefix-pages-are-bounded-and-tombstone-safe
   (let [r1 (lsm/build-run
