@@ -305,6 +305,9 @@
         "five data blocks and the small run root are independently addressed")
     (is (nil? (get-in run [:node "rows"])))
     (is (= descriptors (get ref "blocks")))
+    (is (= #?(:clj (alength ^bytes (:bytes run))
+              :cljs (.-byteLength (:bytes run)))
+           (get ref "encoded-bytes")))
     (is (= (range 5) (map #(get % "ordinal") descriptors)))
     (is (every? #(<= (get % "count") 64) descriptors))
     (is (every? (fn [[left right]]

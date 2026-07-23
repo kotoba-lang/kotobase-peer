@@ -846,19 +846,33 @@
                                             (-> (load-run! e ref)
                                                 (.then
                                                  (fn [run]
-                                                   (-> state
-                                                       (assoc :candidates
-                                                              (lsm/visible-page-add-run
-                                                               (:candidates state)
-                                                               (:rows run)
-                                                               query-epoch after limit
-                                                               matches-prefix?))
-                                                       (update :scanned-runs inc)
-                                                       (update :scanned-blocks inc)
-                                                       (update :fetched-blocks inc)
-                                                       (update
-                                                        :unknown-fetched-block-bytes
-                                                        inc))))))))]
+                                                   (cond->
+                                                    (-> state
+                                                        (assoc :candidates
+                                                               (lsm/visible-page-add-run
+                                                                (:candidates state)
+                                                                (:rows run)
+                                                                query-epoch after limit
+                                                                matches-prefix?))
+                                                        (update :scanned-runs inc)
+                                                        (update :scanned-blocks inc)
+                                                        (update :fetched-blocks inc))
+                                                     (pos-int?
+                                                      (get ref "encoded-bytes"))
+                                                     (update
+                                                      :fetched-block-bytes +
+                                                      (get ref "encoded-bytes"))
+                                                     (pos-int?
+                                                      (get ref "encoded-bytes"))
+                                                     (update
+                                                      :max-wave-block-bytes max
+                                                      (get ref "encoded-bytes"))
+                                                     (not
+                                                      (pos-int?
+                                                       (get ref "encoded-bytes")))
+                                                     (update
+                                                      :unknown-fetched-block-bytes
+                                                      inc))))))))]
                                  (let [block-refs (filterv #(seq (get % "blocks")) selected)
                                        legacy-refs (filterv #(not (seq (get % "blocks"))) selected)
                                        initial {:candidates {} :scanned-runs 0

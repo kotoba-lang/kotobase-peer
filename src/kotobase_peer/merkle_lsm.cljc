@@ -279,9 +279,10 @@
 
 (defn run-ref
   "Manifest-safe metadata for a run returned by build-run."
-  [{:keys [cid count min-key max-key first-component-min first-component-max
+  [{:keys [cid bytes count min-key max-key first-component-min first-component-max
            blocks]}]
   (cond-> {"cid" (ipld/link cid)
+           "encoded-bytes" (byte-count bytes)
            "count" count
            "min-key" min-key
            "max-key" max-key}
