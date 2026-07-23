@@ -3,6 +3,7 @@
             [clojure.string :as str]
             [goog.object :as gobj]
             [ipld.core :as ipld]
+            [kotobase-peer.database-restore :as database-restore]
             [kotobase-peer.merkle-lsm :as lsm]
             [kotobase-peer.object-store.worker :as worker]
             [kotobase-peer.resumable-execution :as resumable]
@@ -12,6 +13,40 @@
   (let [env #js {"MERKLE_S3_PREFIX" "test-prefix"}]
     (is (= "test-prefix/blocks/bafy-block" (worker/block-key env "bafy-block")))
     (is (= "test-prefix/objects/bafy-pack" (worker/object-key env "bafy-pack")))))
+
+(deftest reachability-treats-materialized-objects-as-opaque-cid-leaves
+  (async done
+    (let [object-bytes (ipld/encode {"opaque-pack" true})
+          object-cid (str (ipld/cid object-bytes))
+          root-bytes
+          (ipld/encode {"pack" (ipld/link object-cid)})
+          root-cid (str (ipld/cid root-bytes))
+          values {(str "opaque/blocks/" root-cid) root-bytes
+                  (str "opaque/objects/" object-cid) object-bytes}
+          bucket
+          #js {:get
+               (fn [key]
+                 (js/Promise.resolve
+                  (when-let [bytes (get values key)]
+                    #js {:arrayBuffer
+                         (fn []
+                           (js/Promise.resolve
+                            (.slice (.-buffer bytes)
+                                    (.-byteOffset bytes)
+                                    (+ (.-byteOffset bytes)
+                                       (.-byteLength bytes)))))})))}
+          env #js {"MERKLE_BUCKET" bucket
+                   "MERKLE_S3_PREFIX" "opaque"}]
+      (-> (worker/reachable-cids! env root-cid)
+          (.then
+           (fn [reachable]
+             (is (= #{root-cid object-cid} reachable))
+             (done)))
+          (.catch
+           (fn [error]
+             (is false
+                 (str "opaque reachability rejected: " error))
+             (done)))))))
 
 (deftest entity-readers-apply-mvcc-and-tombstones-across-manifests
   (async done
@@ -113,6 +148,122 @@
           (.catch
            (fn [error]
              (is false (str "MVCC entity read rejected: " error))
+             (done)))))))
+
+(deftest database-restore-pointer-reclaims-page-progress-with-etag-cas
+  (async done
+    (let [prefix "restore-state/"
+          entries (atom {})
+          version (atom 0)
+          bucket
+          #js {:get
+               (fn [key]
+                 (let [{:keys [value etag]} (get @entries key)]
+                   (js/Promise.resolve
+                    (when value
+                      #js {:etag etag
+                           :text (fn [] (js/Promise.resolve value))
+                           :arrayBuffer
+                           (fn []
+                             (let [bytes
+                                   (if (string? value)
+                                     (.encode (js/TextEncoder.) value)
+                                     value)]
+                               (js/Promise.resolve
+                                (.slice (.-buffer bytes)
+                                        (.-byteOffset bytes)
+                                        (+ (.-byteOffset bytes)
+                                           (.-byteLength bytes))))))}))))
+               :put
+               (fn [key value opts]
+                 (let [current (get @entries key)
+                       condition (when opts (.-onlyIf opts))
+                       matches (when condition (.-etagMatches condition))
+                       absent (when condition
+                                (.-etagDoesNotMatch condition))
+                       won? (cond
+                              matches (= matches (:etag current))
+                              (= "*" absent) (nil? current)
+                              :else true)]
+                   (if-not won?
+                     (js/Promise.resolve nil)
+                     (let [etag (str "v" (swap! version inc))]
+                       (swap! entries assoc key
+                              {:value value :etag etag})
+                       (js/Promise.resolve #js {:etag etag})))))}
+          env #js {"MERKLE_BUCKET" bucket
+                   "MERKLE_S3_PREFIX" "restore-state"}
+          head (ipld/cid (ipld/encode {"head" 1}))
+          task (database-restore/restore-task
+                {:inventory-cid
+                 (ipld/cid (ipld/encode {"inventory" 1}))
+                 :target-db-id "target"
+                 :head-cid head
+                 :entry-count 2
+                 :page-count 2})
+          claim-opts {:task task :owner "worker-a" :token "token-a"
+                      :now-ms 1000 :lease-ms 100}]
+      (-> (worker/claim-database-restore! env claim-opts)
+          (.then
+           (fn [claim]
+             (is (:claimed? claim))
+             (is (= 1 (get-in claim [:pointer "attempt"])))
+             (worker/advance-database-restore-checkpoint!
+              env (merge claim
+                         {:page-ordinal 0
+                          :page-cid
+                          (ipld/cid (ipld/encode {"page" 0}))
+                          :entry-count 1
+                          :restored 1
+                          :already-present 0
+                          :first-entry ["blocks" "cid-a"]
+                          :last-entry ["blocks" "cid-a"]
+                          :now-ms 1020
+                          :lease-ms 100}))))
+          (.then
+           (fn [advanced]
+             (is (:advanced? advanced))
+             (is (= 1
+                    (get-in advanced [:checkpoint "next-page"])))
+             (worker/claim-database-restore!
+              env (assoc claim-opts
+                         :owner "worker-b"
+                         :token "token-b"
+                         :now-ms 1201))))
+          (.then
+           (fn [reclaimed]
+             (is (:claimed? reclaimed))
+             (is (= 2 (get-in reclaimed [:pointer "attempt"])))
+             (is (= 1
+                    (get-in reclaimed [:checkpoint "next-page"])))
+             (is (= 1
+                    (get-in reclaimed
+                            [:checkpoint "processed-entries"])))
+             (swap! entries assoc
+                    (str prefix "heads/conflict")
+                    {:value "different" :etag "conflict"})
+             (worker/claim-database-restore!
+              env (assoc claim-opts
+                         :task
+                         (database-restore/restore-task
+                          {:inventory-cid
+                           (ipld/cid (ipld/encode {"inventory" 1}))
+                           :target-db-id "conflict"
+                           :head-cid head
+                           :entry-count 2
+                           :page-count 2})
+                         :owner "worker-c"
+                         :token "token-c"
+                         :now-ms 1300))))
+          (.then
+           (fn [conflict]
+             (is (= :target-head-conflict (:reason conflict)))
+             (done)))
+          (.catch
+           (fn [error]
+             (is false
+                 (str "database restore pointer rejected: " error
+                      "\n" (.-stack error)))
              (done)))))))
 
 (deftest checkpoint-compaction-streams-physical-blocks-with-a-bounded-working-set
@@ -766,6 +917,7 @@
           manifest (lsm/build-manifest {:db-id "source" :epoch 7})
           source-head (:cid manifest)
           backup-receipt (atom nil)
+          restore-ready (atom nil)
           entries
           (atom {(str prefix "heads/source")
                  {:value source-head :etag "etag-1"}
@@ -857,12 +1009,118 @@
              (swap! entries dissoc
                     (str prefix "heads/source")
                     (str prefix "blocks/" source-head))
-             (-> (worker/restore-database!
+             (-> (worker/prepare-database-restore-task!
                   env (:inventory backup) "restored")
                  (.then
+                  (fn [{:keys [task]}]
+                    (worker/claim-database-restore!
+                     env {:task task
+                          :owner "restore-worker"
+                          :token "restore-token"
+                          :now-ms 9000
+                          :lease-ms 1000})))
+                 (.then
+                  (fn [claim]
+                    (is (:claimed? claim))
+                    (worker/run-database-restore-page! env claim)))
+                 (.then
+                  (fn [advanced]
+                    (is (:advanced? advanced))
+                    (is (= 1
+                           (get-in advanced
+                                   [:checkpoint "next-page"])))
+                    (is (= 1
+                           (get-in advanced
+                                   [:checkpoint
+                                    "processed-entries"])))
+                    (is (contains?
+                         @entries
+                         (str prefix "blocks/" source-head)))
+                    (worker/verify-and-mark-database-restore-ready!
+                     env (assoc advanced
+                                :now-ms 9050
+                                :lease-ms 1000))))
+                 (.then
+                  (fn [ready]
+                    (is (:ready? ready))
+                    (is (= "ready-to-publish"
+                           (get-in ready
+                                   [:checkpoint "status"])))
+                    (reset! restore-ready ready)
+                    (worker/complete-database-restore!
+                     env (assoc ready :etag "forced-pointer-cas-loss"))))
+                 (.then
+                  (fn [interrupted]
+                    (is (false? (:completed? interrupted)))
+                    (is (:head-published? interrupted))
+                    (worker/claim-database-restore!
+                     env {:task (:task @restore-ready)
+                          :owner "recovery-worker"
+                          :token "recovery-token"
+                          :now-ms 11000
+                          :lease-ms 1000})))
+                 (.then
+                  (fn [recovered]
+                    (is (:claimed? recovered))
+                    (is (:head-published? recovered))
+                    (is (= "ready-to-publish"
+                           (get-in recovered
+                                   [:checkpoint "status"])))
+                    (worker/complete-database-restore!
+                     env recovered)))
+                 (.then
+                  (fn [completed]
+                    (is (:completed? completed))
+                    (is (= "completed"
+                           (get-in completed
+                                   [:checkpoint "status"])))
+                    (is (= source-head
+                           (:value
+                            (get @entries
+                                 (str prefix "heads/restored")))))
+                    (worker/step-database-restore!
+                     env (:inventory @backup-receipt) "restored"
+                     {:owner "replay-worker"
+                      :token "replay-token"
+                      :now-ms 12000
+                      :lease-ms 1000})))
+                 (.then
+                  (fn [terminal]
+                    (is (= :completed (:phase terminal)))
+                    (swap! entries dissoc
+                           (str prefix "heads/restored"))
+                    (worker/claim-database-restore!
+                     env {:task (:task @restore-ready)
+                          :owner "head-loss-recovery-worker"
+                          :token "head-loss-recovery-token"
+                          :now-ms 13000
+                          :lease-ms 1000})))
+                 (.then
+                  (fn [head-loss-recovery]
+                    (is (:claimed? head-loss-recovery))
+                    (is (= "running"
+                           (get-in head-loss-recovery
+                                   [:checkpoint "status"])))
+                    (is (= 0
+                           (get-in head-loss-recovery
+                                   [:checkpoint "next-page"])))
+                    (is (= 3
+                           (get-in head-loss-recovery
+                                   [:checkpoint "attempt"])))
+                    (swap! entries dissoc
+                           (worker/database-restore-pointer-key
+                            env "restored"
+                            (str (get-in head-loss-recovery
+                                         [:task :cid]))))
+                    (worker/restore-database!
+                     env (:inventory backup) "restored")))
+                 (.then
                   (fn [restored]
-                    (is (= 1 (:restored restored)))
-                    (is (:head-created? restored))
+                    (is (= 0 (:restored restored)))
+                    (is (= 1 (:already-present restored)))
+                    (is (:head-created? restored)
+                        "head-loss recovery republishes the verified head")
+                    (is (false? (:idempotent? restored)))
                     (is (= 1 (:verified-reachable restored)))
                     (is (= source-head
                            (:value
@@ -944,8 +1202,11 @@
           ingress-workload (ipld/cid ingress-workload-bytes)
           orphan-bytes (ipld/encode {"orphan" true})
           orphan (ipld/cid orphan-bytes)
+          orphan-object-bytes (ipld/encode {"opaque-orphan" true})
+          orphan-object (ipld/cid orphan-object-bytes)
           prefix "test/"
           block-key #(str prefix "blocks/" %)
+          object-key #(str prefix "objects/" %)
           objects (atom {(str prefix "heads/db-a") root-a
                          (str prefix "heads/db-b") root-b
                          (str prefix "scheduler/resumable/db-a/task/current")
@@ -968,7 +1229,8 @@
                          (block-key checkpoint) checkpoint-bytes
                          (block-key resumable-child) resumable-child-bytes
                          (block-key ingress-workload) ingress-workload-bytes
-                         (block-key orphan) orphan-bytes})
+                         (block-key orphan) orphan-bytes
+                         (object-key orphan-object) orphan-object-bytes})
           bytes-object (fn [value]
                          #js {:arrayBuffer
                               (fn []
@@ -1015,16 +1277,19 @@
                    (is (= 1 (:ingress-roots audit)))
                    (is (= 1 (:active-ingress-roots audit)))
                    (is (= 7 (:reachable audit)))
-                   (is (= 1 (:candidates audit)) "only the orphan is collectible")
+                   (is (= 2 (:candidates audit)))
+                   (is (= 1 (:block-candidates audit)))
+                   (is (= 1 (:object-candidates audit)))
                    (is (= 0 (:deleted audit)))
                    (is (= 1 (:inventory-passes audit)))
                    (worker/gc-unreachable! env "db-a" 0 true)))
           (.then (fn [sweep]
-                   (is (= 1 (:deleted sweep)))
+                   (is (= 2 (:deleted sweep)))
                    (is (= 2 (:inventory-passes sweep)))
-                   (is (= 1 (:backed-up sweep)))
+                   (is (= 2 (:backed-up sweep)))
                    (is (string? (:backup-inventory sweep)))
                    (is (nil? (get @objects (block-key orphan))))
+                   (is (nil? (get @objects (object-key orphan-object))))
                    (is (every? #(contains? @objects (block-key %))
                                [root-a child-a root-b child-b
                                 checkpoint resumable-child ingress-workload])
@@ -1032,14 +1297,18 @@
                    (-> (worker/restore-gc-inventory!
                         env (:backup-inventory sweep))
                        (.then (fn [restored]
-                                (is (= 1 (:restored restored)))
+                                (is (= 2 (:restored restored)))
                                 (is (= orphan
                                        (ipld/cid
                                         (get @objects (block-key orphan)))))
+                                (is (= orphan-object
+                                       (ipld/cid
+                                        (get @objects
+                                             (object-key orphan-object)))))
                                 (worker/restore-gc-inventory!
                                  env (:backup-inventory sweep))))
                        (.then (fn [replayed]
-                                (is (= 1 (:already-present replayed)))
+                                (is (= 2 (:already-present replayed)))
                                 (let [backup-key
                                       (worker/gc-backup-object-key env orphan)
                                       good-backup (get @objects backup-key)]
@@ -1061,6 +1330,7 @@
                                          (swap! objects assoc backup-key
                                                 good-backup))))))))))
           (.then (fn [_]
+                   (swap! objects dissoc (object-key orphan-object))
                    (let [second-orphan-bytes (ipld/encode {"orphan" 2})
                          second-orphan (ipld/cid second-orphan-bytes)
                          block-list-calls (atom 0)
