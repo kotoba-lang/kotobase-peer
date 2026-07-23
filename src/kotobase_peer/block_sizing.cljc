@@ -16,6 +16,13 @@
    :cpu-weight 0.0
    :cache-miss-ms-equivalent 0.0})
 
+(def default-qualification-policy
+  {:minimum-regions 2
+   :minimum-samples-per-class 3
+   :required-orders #{:ascending :descending}
+   :require-cpu-source? true
+   :require-cache-source? true})
+
 (defn- finite-non-negative? [value]
   (and (number? value)
        #?(:clj (Double/isFinite (double value))
@@ -44,6 +51,151 @@
                         :cpu-weight :cache-miss-ms-equivalent])))
       (throw (ex-info "Invalid block sizing policy" {:policy policy})))
     policy))
+
+(defn- valid-source? [source]
+  (and (keyword? source)
+       (not (contains? #{:unknown :synthetic} source))))
+
+(defn- valid-sample? [sample]
+  (and (map? sample)
+       (contains? (set size-classes) (:block-bytes sample))
+       (string? (:region sample))
+       (seq (:region sample))
+       (pos-int? (:round sample))
+       (contains? #{:ascending :descending} (:order sample))
+       (pos-int? (:sequence sample))
+       (string? (:head-key sample))
+       (seq (:head-key sample))
+       (string? (:prefix sample))
+       (seq (:prefix sample))
+       (every? finite-non-negative?
+               (map sample [:wall-ms :cpu-ms :fetched-blocks
+                            :fetched-bytes :cache-hit-ratio]))
+       (<= (:cache-hit-ratio sample) 1)))
+
+(defn- p95 [values]
+  (let [values (vec (sort values))
+        index (dec #?(:clj (long (Math/ceil (* 0.95 (count values))))
+                      :cljs (long (js/Math.ceil (* 0.95 (count values))))))]
+    (nth values index)))
+
+(defn- mean [values]
+  (/ (reduce + 0 values) (count values)))
+
+(defn- complete-round? [samples]
+  (let [ordered (sort-by :sequence samples)
+        order (:order (first ordered))
+        expected (if (= :ascending order)
+                   size-classes
+                   (vec (reverse size-classes)))]
+    (and (= (count size-classes) (count ordered))
+         (= expected (mapv :block-bytes ordered))
+         (= (range 1 (inc (count size-classes)))
+            (map :sequence ordered))
+         (every? #(= order (:order %)) ordered))))
+
+(defn qualify-samples
+  "Validate and aggregate raw block-size trials into controller observations.
+
+  Production eligibility requires complete ascending/descending rounds in each
+  required region, unique immutable heads and isolated class prefixes,
+  qualified metric sources,
+  and enough samples for every size class. Incomplete evidence is returned with
+  explicit reasons; malformed or duplicate samples fail closed."
+  ([samples] (qualify-samples samples nil))
+  ([samples policy]
+   (let [policy (merge default-qualification-policy policy)
+         samples (vec samples)
+         identities (mapv (juxt :region :round :block-bytes) samples)
+         class-prefixes
+         (group-by (juxt :region :block-bytes) samples)
+         prefix-owners
+         (mapv (fn [[owner cohort]]
+                 [owner (set (map :prefix cohort))])
+               class-prefixes)]
+     (when-not
+      (and (pos-int? (:minimum-regions policy))
+           (pos-int? (:minimum-samples-per-class policy))
+           (set? (:required-orders policy))
+           (seq (:required-orders policy))
+           (every? #{:ascending :descending} (:required-orders policy))
+           (every? boolean?
+                   [(:require-cpu-source? policy)
+                    (:require-cache-source? policy)]))
+       (throw (ex-info "Invalid block sizing qualification policy"
+                       {:policy policy})))
+     (when-not (and (every? valid-sample? samples)
+                    (= (count identities) (count (set identities)))
+                    (= (count samples) (count (set (map :head-key samples))))
+                    (every? #(= 1 (count (second %))) prefix-owners)
+                    (= (count prefix-owners)
+                       (count (set (map (comp first second) prefix-owners)))))
+       (throw (ex-info "Block sizing samples must be valid and unique"
+                       {:samples samples})))
+     (let [regions (set (map :region samples))
+           rounds (group-by (juxt :region :round) samples)
+           incomplete-rounds
+           (->> rounds
+                (keep (fn [[round trial]]
+                        (when-not (complete-round? trial) round)))
+                sort vec)
+           missing-orders
+           (->> regions
+                (keep (fn [region]
+                        (let [present (set (map :order
+                                               (filter #(= region (:region %))
+                                                       samples)))
+                              missing (set (remove present
+                                                   (:required-orders policy)))]
+                          (when (seq missing) [region missing]))))
+                (into (sorted-map)))
+           class-counts (frequencies (map :block-bytes samples))
+           undersampled
+           (->> size-classes
+                (filter #(< (get class-counts % 0)
+                            (:minimum-samples-per-class policy)))
+                vec)
+           missing-cpu
+           (when (:require-cpu-source? policy)
+             (count (remove #(valid-source? (:cpu-source %)) samples)))
+           missing-cache
+           (when (:require-cache-source? policy)
+             (count (remove #(valid-source? (:cache-source %)) samples)))
+           reasons
+           (cond-> []
+             (< (count regions) (:minimum-regions policy))
+             (conj :insufficient-regions)
+             (seq incomplete-rounds) (conj :incomplete-rounds)
+             (seq missing-orders) (conj :missing-order-coverage)
+             (seq undersampled) (conj :undersampled-classes)
+             (pos? (or missing-cpu 0)) (conj :missing-cpu-provenance)
+             (pos? (or missing-cache 0)) (conj :missing-cache-provenance))
+           observations
+           (mapv
+            (fn [block-bytes]
+              (let [cohort (filter #(= block-bytes (:block-bytes %)) samples)]
+                {:block-bytes block-bytes
+                 :samples (count cohort)
+                 :wall-p95-ms (if (seq cohort)
+                                (p95 (map :wall-ms cohort)) 0)
+                 :cpu-ms (if (seq cohort) (mean (map :cpu-ms cohort)) 0)
+                 :fetched-blocks
+                 (if (seq cohort) (mean (map :fetched-blocks cohort)) 0)
+                 :fetched-bytes
+                 (if (seq cohort) (mean (map :fetched-bytes cohort)) 0)
+                 :cache-hit-ratio
+                 (if (seq cohort) (mean (map :cache-hit-ratio cohort)) 0)}))
+            size-classes)]
+       {:eligible? (empty? reasons)
+        :reasons reasons
+        :regions (vec (sort regions))
+        :class-counts (into (sorted-map) class-counts)
+        :incomplete-rounds incomplete-rounds
+        :missing-orders missing-orders
+        :missing-cpu-samples (or missing-cpu 0)
+        :missing-cache-samples (or missing-cache 0)
+        :observations observations
+        :policy policy}))))
 
 (defn cohort-score
   "Return the explicit wall/resource score for one validated observation."
