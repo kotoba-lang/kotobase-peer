@@ -426,6 +426,29 @@
      (sort-by (juxt #(get-in % [:descriptor "logical-min"]) :cid)
               (vals loaded)))))
 
+(defn- load-directory-pages!
+  [e db-id directory index descriptors]
+  (let [load-page
+          (fn [descriptor]
+            (-> (get-node! e (ipld/link-cid (get descriptor "cid")))
+                (.then
+                 (fn [page]
+                   (get
+                    (lsm/validate-range-directory-page
+                     page db-id (get directory "epoch") index
+                     (get directory "page-refs"))
+                    "refs")))))]
+    ;; Keep provider concurrency bounded even when a 10M directory has
+    ;; hundreds of leaves.
+    (reduce
+     (fn [result wave]
+       (.then result
+              (fn [refs]
+                (-> (js/Promise.all (clj->js (mapv load-page wave)))
+                    (.then #(into refs (mapcat identity (array-seq %))))))))
+     (js/Promise.resolve [])
+     (partition-all 4 descriptors))))
+
 (defn- load-directory-index-refs!
   [e db-id directory index first-components]
   (if-not (lsm/paged-range-directory? directory)
@@ -441,27 +464,8 @@
                                   descriptor))
                          {})
                  vals vec)
-            (vec all))
-          load-page
-          (fn [descriptor]
-            (-> (get-node! e (ipld/link-cid (get descriptor "cid")))
-                (.then
-                 (fn [page]
-                   (get
-                    (lsm/validate-range-directory-page
-                     page db-id (get directory "epoch") index
-                     (get directory "page-refs"))
-                    "refs")))))]
-      ;; Keep provider concurrency bounded even when a 10M directory has
-      ;; hundreds of leaves.
-      (reduce
-       (fn [result wave]
-         (.then result
-                (fn [refs]
-                  (-> (js/Promise.all (clj->js (mapv load-page wave)))
-                      (.then #(into refs (mapcat identity (array-seq %))))))))
-       (js/Promise.resolve [])
-       (partition-all 4 selected)))))
+            (vec all))]
+      (load-directory-pages! e db-id directory index selected))))
 
 (defn- collect-index-run-refs!
   [e db-id base-cid index max-depth read-context]
@@ -1349,38 +1353,8 @@
                     (let [source
                           (lsm/validate-range-directory
                            directory db-id (get manifest "epoch"))]
-                      (if-not (lsm/paged-range-directory? source)
-                        {:directory source :source-directory source}
-                        (->
-                         ;; Indexes are deliberately sequential: each leaf
-                         ;; loader already permits four concurrent GETs, so
-                         ;; Promise.all over indexes would silently raise the
-                         ;; aggregate provider concurrency to twelve.
-                         (reduce
-                          (fn [result index]
-                            (.then
-                             result
-                             (fn [pairs]
-                               (->
-                                (load-directory-index-refs!
-                                 e db-id source index nil)
-                                (.then #(conj pairs [index %]))))))
-                          (js/Promise.resolve [])
-                          (sort lsm/indexes))
-                         (.then
-                          (fn [pairs]
-                            {:source-directory source
-                             ;; Existing pure compaction selection consumes
-                             ;; resolved refs. Keep that contract while v2
-                             ;; storage remains paged.
-                             :directory
-                             (assoc source
-                                    "version" lsm/format-version
-                                    "indexes"
-                                    (into {}
-                                          (map (fn [[index refs]]
-                                                 [(name index) refs]))
-                                          pairs))}))))))))))))))
+                      {:directory source
+                       :source-directory source}))))))))))
 
 (defn retention-safe-epoch-oracle!
   "Return the explicit clock-skew-conservative R2 retention decision consumed
@@ -1444,23 +1418,75 @@
                                       (fn [compacted]
                                         (let [current
                                               (index-run-refs manifests index)
-                                              selection
-                                              (if inherited
-                                                (lsm/checkpoint-compaction-selection
-                                                 current (:directory inherited)
-                                                 index)
-                                                {:inputs current
-                                                 :untouched []})]
-                                          (-> (compact-index-ranges!
-                                               e db-id index safe-epoch
-                                               target-run-rows
-                                               (:inputs selection))
-                                              (.then
-                                               #(assoc compacted index
-                                                       (assoc %
-                                                              :untouched
-                                                              (:untouched
-                                                               selection)))))))))
+                                              source
+                                              (:source-directory inherited)
+                                              selection-promise
+                                              (cond
+                                                (nil? inherited)
+                                                (js/Promise.resolve
+                                                 {:selection
+                                                  {:inputs current
+                                                   :untouched []}
+                                                  :untouched-pages []
+                                                  :selected-page-count 0})
+
+                                                (lsm/paged-range-directory?
+                                                 source)
+                                                (let [page-selection
+                                                      (lsm/checkpoint-directory-page-selection
+                                                       current source index)]
+                                                  (->
+                                                   (load-directory-pages!
+                                                    e db-id source index
+                                                    (:selected-pages
+                                                     page-selection))
+                                                   (.then
+                                                    (fn [selected-refs]
+                                                      {:selection
+                                                       (lsm/checkpoint-compaction-selection
+                                                        current
+                                                        {"indexes"
+                                                         {(name index)
+                                                          selected-refs}}
+                                                        index)
+                                                       :untouched-pages
+                                                       (:untouched-pages
+                                                        page-selection)
+                                                       :selected-page-count
+                                                       (count
+                                                        (:selected-pages
+                                                         page-selection))}))))
+
+                                                :else
+                                                (js/Promise.resolve
+                                                 {:selection
+                                                  (lsm/checkpoint-compaction-selection
+                                                   current (:directory inherited)
+                                                   index)
+                                                  :untouched-pages []
+                                                  :selected-page-count 0}))]
+                                          (->
+                                           selection-promise
+                                           (.then
+                                            (fn [{:keys [selection
+                                                        untouched-pages
+                                                        selected-page-count]}]
+                                              (->
+                                               (compact-index-ranges!
+                                                e db-id index safe-epoch
+                                                target-run-rows
+                                                (:inputs selection))
+                                               (.then
+                                                #(assoc
+                                                  compacted index
+                                                  (assoc
+                                                   %
+                                                   :untouched
+                                                   (:untouched selection)
+                                                   :untouched-pages
+                                                   untouched-pages
+                                                   :selected-page-count
+                                                   selected-page-count)))))))))))
                                   (js/Promise.resolve {})
                                   present)
                                   (.then
@@ -1486,21 +1512,88 @@
                                               (merge-stream-metrics
                                                totals (:metrics result)))
                                             {} (vals compaction-results))
+                                           paged-inherited?
+                                           (and inherited
+                                                (lsm/paged-range-directory?
+                                                 (:source-directory inherited)))
                                            directory-indexes
-                                           (if inherited
+                                           (if (and inherited
+                                                    (not paged-inherited?))
                                              (lsm/merge-range-directory-indexes
                                               compacted (:directory inherited))
                                              compacted)
                                          directory-previous
                                          (if inherited
-                                           (some-> (get (:directory inherited) "previous")
+                                           (some-> (get (:source-directory
+                                                        inherited)
+                                                       "previous")
                                                    ipld/link-cid)
                                            tail)
-                                         directory
-                                         (lsm/build-paged-range-directory
+                                         new-pages
+                                         (lsm/build-range-directory-pages
                                           {:db-id db-id :epoch epoch
-                                           :indexes directory-indexes
+                                           :indexes directory-indexes})
+                                         new-page-descriptors
+                                         (into {}
+                                               (map (fn [[index pages]]
+                                                      [(keyword index)
+                                                       (mapv :descriptor
+                                                             pages)]))
+                                               new-pages)
+                                         inherited-page-indexes
+                                         (when paged-inherited?
+                                           (into {}
+                                                 (map
+                                                  (fn [[index descriptors]]
+                                                    [(keyword index)
+                                                     descriptors]))
+                                                 (get (:source-directory
+                                                       inherited)
+                                                      "indexes")))
+                                         directory-page-indexes
+                                         (if paged-inherited?
+                                           (reduce
+                                            (fn [all [index result]]
+                                              (assoc
+                                               all index
+                                               (vec
+                                                (concat
+                                                 (:untouched-pages result)
+                                                 (get
+                                                  new-page-descriptors
+                                                  index [])))))
+                                            inherited-page-indexes
+                                            compaction-results)
+                                           new-page-descriptors)
+                                         directory
+                                         (lsm/build-paged-range-directory-root
+                                          {:db-id db-id :epoch epoch
+                                           :indexes directory-page-indexes
                                            :previous directory-previous})
+                                         new-page-list (mapcat val new-pages)
+                                         directory-effects
+                                         (concat
+                                          (mapcat :effects new-page-list)
+                                          (:effects directory))
+                                         new-page-bytes
+                                         (reduce +
+                                                 (map #(.-byteLength (:bytes %))
+                                                      new-page-list))
+                                         directory-page-count
+                                         (reduce +
+                                                 (map count
+                                                      (vals
+                                                       directory-page-indexes)))
+                                         reused-page-count
+                                         (if paged-inherited?
+                                           (- directory-page-count
+                                              (count new-page-list))
+                                           0)
+                                         selected-page-count
+                                         (reduce +
+                                                 (map :selected-page-count
+                                                      (vals
+                                                       compaction-results)))
                                          manifest (lsm/build-manifest
                                                    {:db-id db-id :epoch epoch
                                                     :safe-epoch safe-epoch
@@ -1521,22 +1614,20 @@
                                                      "range-directory-page-refs"
                                                      lsm/default-range-directory-page-refs
                                                      "range-directory-page-count"
-                                                     (reduce +
-                                                             (map count
-                                                                  (vals
-                                                                   (:pages
-                                                                    directory))))
+                                                     directory-page-count
+                                                     "range-directory-page-put-count"
+                                                     (count new-page-list)
+                                                     "range-directory-reused-page-count"
+                                                     reused-page-count
+                                                     "range-directory-page-get-count"
+                                                     selected-page-count
                                                      "range-directory-root-bytes"
                                                      (.-byteLength
                                                       (:bytes directory))
                                                      "range-directory-page-bytes"
-                                                     (reduce
-                                                      +
-                                                      (map
-                                                       #(.-byteLength (:bytes %))
-                                                       (mapcat
-                                                        val
-                                                        (:pages directory))))
+                                                     new-page-bytes
+                                                     "range-directory-page-put-bytes"
+                                                     new-page-bytes
                                                      "stream-metrics"
                                                      (into {}
                                                            (map (fn [[k v]]
@@ -1547,7 +1638,7 @@
                                                              (map count
                                                                   (vals
                                                                    output-indexes)))}})
-                                         base-effects (concat (:effects directory)
+                                         base-effects (concat directory-effects
                                                               (:effects manifest))]
                                      (-> (if publication
                                            (load-publication-view-bundles!
