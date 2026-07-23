@@ -23,9 +23,10 @@
   :run-ref-encoded-bytes 7204
   :refs 123
   :pages 4
-  :page-ref-counts [36 36 36 15]
-  :maximum-page-bytes 259437
-  :total-page-bytes 886462}
+  :page-ref-counts [39 39 39 6]
+  :maximum-page-bytes 258117
+  :page-build-ms 3245.066958
+  :partition-complexity :linear-normal-path-exact-final-encode}
  :claim
  "Every newly published directory leaf is bounded by both ref count and exact
  encoded bytes. The earlier 27 KiB maximum from the minimal fake-ref fixture

@@ -411,35 +411,42 @@
 
 (defn- build-bounded-directory-pages
   [db-id epoch index refs page-refs page-bytes]
-  (loop [remaining (seq (canonical-run-refs refs))
-         current []
-         pages []]
-    (if-let [ref (first remaining)]
-      (let [candidate (build-range-directory-page
-                       {:db-id db-id :epoch epoch :index index
-                        :refs (conj current ref)})
-            fits? (and (<= (count (get-in candidate [:node "refs"]))
-                           page-refs)
-                       (<= (byte-count (:bytes candidate)) page-bytes))]
-        (cond
-          fits?
-          (recur (next remaining) (conj current ref) pages)
-
-          (empty? current)
-          (throw (ex-info "Range directory ref exceeds page byte limit"
+  (letfn [(exact-pages [refs]
+            (let [page (build-range-directory-page
+                        {:db-id db-id :epoch epoch :index index :refs refs})]
+              (cond
+                (<= (byte-count (:bytes page)) page-bytes) [page]
+                (= 1 (count refs))
+                (throw
+                 (ex-info "Range directory ref exceeds page byte limit"
                           {:index index :page-bytes page-bytes
-                           :encoded-bytes (byte-count (:bytes candidate))}))
-
-          :else
-          (recur remaining []
-                 (conj pages
-                       (build-range-directory-page
-                        {:db-id db-id :epoch epoch :index index
-                         :refs current})))))
-      (cond-> pages
-        (seq current)
-        (conj (build-range-directory-page
-               {:db-id db-id :epoch epoch :index index :refs current}))))))
+                           :encoded-bytes (byte-count (:bytes page))}))
+                :else
+                (let [middle (quot (count refs) 2)]
+                  (into (exact-pages (subvec refs 0 middle))
+                        (exact-pages (subvec refs middle)))))))]
+    ;; Encode each ref once for the normal partition path, reserving one KiB
+    ;; for the leaf envelope/array framing. Exact final encoding remains the
+    ;; authority; the recursive split above handles any underestimated
+    ;; envelope without weakening the byte ceiling.
+    (let [target-bytes (max 1 (- page-bytes 1024))
+          chunks
+          (reduce
+           (fn [chunks ref]
+             (let [ref-bytes (byte-count (ipld/encode ref))
+                   {:keys [refs bytes]} (peek chunks)]
+               (if (and (seq refs)
+                        (or (>= (count refs) page-refs)
+                            (> (+ bytes ref-bytes) target-bytes)))
+                 (conj chunks {:refs [ref] :bytes ref-bytes})
+                 (conj (pop chunks)
+                       {:refs (conj (or refs []) ref)
+                        :bytes (+ (or bytes 0) ref-bytes)}))))
+           [{:refs [] :bytes 0}]
+           (canonical-run-refs refs))]
+      (mapv identity
+            (mapcat #(exact-pages (vec (:refs %)))
+                    (remove #(empty? (:refs %)) chunks))))))
 
 (defn build-range-directory-pages
   "Build immutable leaves bounded by both ref count and exact encoded bytes."
