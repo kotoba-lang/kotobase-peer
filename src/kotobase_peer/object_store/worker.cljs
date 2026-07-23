@@ -974,9 +974,12 @@
 (def ^:private default-stream-limits
   {:max-open-runs 64
    :max-input-block-bytes (* 2 1024 1024)
-   :max-working-input-bytes (* 64 1024 1024)
+   ;; Four disjoint components may run concurrently. Each component is capped
+   ;; at 16 MiB so the aggregate physical input budget remains 64 MiB.
+   :max-working-input-bytes (* 16 1024 1024)
    :max-inline-run-rows 4096
    :max-logical-group-rows 65536})
+(def ^:private compact-range-concurrency 4)
 
 (defn- run-cursor!
   [e index limits metrics ref]
@@ -1231,24 +1234,39 @@
    left right))
 
 (defn- compact-index-ranges!
-  "Stream disjoint overlap components sequentially. The implementation holds
-  one bounded data block per open input run and one bounded output run; it
-  never materializes an overlap component's complete row set."
+  "Stream disjoint overlap components in bounded parallel waves. Each
+  component holds one bounded data block per open input run and one bounded
+  output run; no component materializes its complete row set."
   [e db-id index safe-epoch target-run-rows refs]
   (reduce
-   (fn [result {:keys [refs]}]
-     (.then result
-            (fn [{output-refs :refs aggregate :metrics}]
-              (-> (compact-run-component-streaming!
-                   e db-id index safe-epoch target-run-rows
-                   default-stream-limits refs)
-                  (.then
-                   (fn [{component-refs :refs component :metrics}]
-                     {:refs (into output-refs component-refs)
-                      :metrics (merge-stream-metrics
-                                aggregate component)}))))))
+   (fn [result wave]
+     (.then
+      result
+      (fn [{output-refs :refs aggregate :metrics}]
+        (.then
+         (js/Promise.all
+          (clj->js
+           (mapv
+            (fn [{:keys [refs]}]
+              (compact-run-component-streaming!
+               e db-id index safe-epoch target-run-rows
+               default-stream-limits refs))
+            wave)))
+         (fn [results]
+           (let [results (vec (array-seq results))
+                 wave-refs (mapcat :refs results)
+                 ;; Concurrent component peaks may coincide, so sum their
+                 ;; individual peaks within a wave. Across sequential waves
+                 ;; only the maximum is retained.
+                 wave-metrics (reduce
+                               #(merge-with + %1 (:metrics %2))
+                               {} results)]
+             {:refs (into output-refs wave-refs)
+              :metrics (merge-stream-metrics
+                        aggregate wave-metrics)}))))))
    (js/Promise.resolve {:refs [] :metrics {}})
-   (lsm/overlapping-run-ranges refs)))
+   (partition-all compact-range-concurrency
+                  (lsm/overlapping-run-ranges refs))))
 
 (defn- load-tail-checkpoint! [e db-id tail]
   (if-not tail
