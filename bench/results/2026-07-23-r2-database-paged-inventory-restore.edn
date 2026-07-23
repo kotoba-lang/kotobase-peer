@@ -1,0 +1,36 @@
+{:date "2026-07-23"
+ :backend :cloudflare-r2
+ :bucket "kotobase-merkle-lsm"
+ :scope "isolated bench/database-paged-restore/20260723 prefix"
+ :worker {:name "kotobase-database-paged-restore-drill-20260723"
+          :version "7af0d90e-8e15-4e16-b728-849e180b70b3"}
+ :inventory {:format "kotobase/database-backup-inventory"
+             :version 2
+             :cid "bafyreihnsfnlhh72ofhanxomrosa2irsmhf7tgt52eylbblbvb4sonnyby"
+             :head-cid "bafyreiagf67txroag34ww4syabob76nbeq6ihozgdr3wlszainah6cahge"
+             :base-cid "bafyreiduz7qnwjfbef2lcy4wjymeskgmuo3zcduwwdqybra4pgyc44yhnm"
+             :entries 12
+             :blocks 11
+             :objects 1
+             :content-bytes 10134
+             :pages 1
+             :page-cid "bafyreieofsbephodr4syzeddnp6kareeijfggkno5frcvg53v4k2rpc5iy"
+             :root-bytes 653
+             :maximum-page-bytes 1073
+             :page-entry-limit 256
+             :page-byte-limit 65536}
+ :drill {:deleted-head true
+         :deleted-primary-entries 12
+         :restored 12
+         :already-present 0
+         :head-created true
+         :verified-reachable 12
+         :replay {:restored 0
+                  :already-present 12
+                  :idempotent true
+                  :verified-reachable 12}}
+ :cleanup {:primary-entries :explicitly-deleted
+           :immutable-backup-objects :explicitly-deleted
+           :inventory-root-and-pages :explicitly-deleted
+           :temporary-worker :deleted}
+ :claim "A real isolated R2 database backup used the v2 CID-addressed page format. After the mutable head and every primary inventory entry were explicitly deleted, restore recreated all 12 entries, published the head with CAS, verified exact reachability, and replayed idempotently. The 10,000-entry/40-page deterministic fixture remains the multi-page scale evidence; this live drill is correctness evidence, not a latency percentile or bounded-total-memory claim."}
