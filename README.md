@@ -169,13 +169,19 @@ blocks, found/deleted exactly 1 orphan, retained all 4 live blocks, and took
 
 `kotobase-peer.retention` defines the pure retention-root contract. Active
 reader and replication roots are leases with an explicit millisecond expiry;
-legal-hold and release roots are durable. The Worker persists mutable registry
+legal-hold, release, and backup roots are durable. The Worker persists mutable registry
 records under `roots/<db-id>/<kind>/<encoded-id>` using R2 ETag CAS. Renewal and release
 therefore cannot overwrite a concurrent owner; release writes an inactive CAS
 tombstone instead of performing an unsafe delete. GC marks every active root,
 reports the effective minimum safe epoch, and fences sweep when either a head
 or registry ETag changes. `compact-head!` uses the same minimum epoch, so a
 pinned snapshot is protected from both version pruning and physical block GC.
+One explicit safe-epoch oracle filters all root kinds for both consumers and
+keeps just-expired leases active for `MERKLE_RETENTION_CLOCK_SKEW_MS` (30
+seconds by default), preventing a modest host-clock lead from pruning a live
+reader. The oracle's safe epoch, active kind counts, and skew allowance are
+reported by GC; compaction consumes the same decision rather than recomputing
+an implicit latest-epoch boundary.
 
 RangeDirectory v1 is a compaction boundary, not another manifest level. A
 later window stops before that boundary, compacts every inherited ref for each

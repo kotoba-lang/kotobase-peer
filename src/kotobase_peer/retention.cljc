@@ -4,7 +4,7 @@
   database model.")
 
 (def leased-kinds #{:reader :replication})
-(def durable-kinds #{:legal-hold :release})
+(def durable-kinds #{:legal-hold :release :backup})
 (def kinds (into leased-kinds durable-kinds))
 
 (defn root-node
@@ -72,6 +72,28 @@
   [nodes now-ms]
   (when-let [epochs (seq (map #(get % "epoch") (active-roots nodes now-ms)))]
     (reduce min epochs)))
+
+(defn safe-epoch-oracle
+  "Return one explicit conservative retention decision for compaction and GC.
+  CLOCK-SKEW-MS keeps a just-expired leased root active for that additional
+  interval; durable legal-hold/release/backup roots are unaffected."
+  [nodes now-ms clock-skew-ms]
+  (when-not (and (integer? now-ms) (not (neg? now-ms))
+                 (integer? clock-skew-ms) (not (neg? clock-skew-ms)))
+    (throw (ex-info "Safe-epoch oracle requires non-negative integer clocks"
+                    {:now-ms now-ms :clock-skew-ms clock-skew-ms})))
+  (let [effective-now (max 0 (- now-ms clock-skew-ms))
+        active (active-roots nodes effective-now)
+        epochs (mapv #(get % "epoch") active)]
+    {:safe-epoch (when (seq epochs) (reduce min epochs))
+     :active-roots active
+     :active-by-kind
+     (into (sorted-map)
+           (map (fn [[kind roots]] [kind (count roots)]))
+           (group-by #(get % "kind") active))
+     :evaluated-at now-ms
+     :effective-now effective-now
+     :clock-skew-ms clock-skew-ms}))
 
 (defn release-node
   "Create the CAS replacement used instead of an unsafe unconditional delete."
