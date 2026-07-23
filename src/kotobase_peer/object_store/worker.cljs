@@ -436,7 +436,8 @@
                    (get
                     (lsm/validate-range-directory-page
                      page db-id (get directory "epoch") index
-                     (get directory "page-refs"))
+                     (get directory "page-refs")
+                     (get directory "page-bytes"))
                     "refs")))))]
     ;; Keep provider concurrency bounded even when a 10M directory has
     ;; hundreds of leaves.
@@ -1613,6 +1614,8 @@
                                                      lsm/range-directory-version
                                                      "range-directory-page-refs"
                                                      lsm/default-range-directory-page-refs
+                                                     "range-directory-page-byte-limit"
+                                                     lsm/default-range-directory-page-bytes
                                                      "range-directory-page-count"
                                                      directory-page-count
                                                      "range-directory-page-put-count"

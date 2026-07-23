@@ -1,0 +1,33 @@
+{:date "2026-07-23"
+ :feature :range-directory-exact-page-byte-bound
+ :trigger
+ {:provider :cloudflare-r2
+  :durable-datoms 251904
+  :refs-per-index 123
+  :observed-page-count 3
+  :observed-total-page-bytes 3799893
+  :finding
+  "The prior 977-ref synthetic fixture omitted real block descriptors. A
+   128-ref ceiling alone therefore permitted multi-MiB metadata leaves."}
+ :decision
+ {:maximum-page-refs 128
+  :maximum-encoded-page-bytes 262144
+  :enforcement :exact-dag-cbor-bytes-before-publication
+  :oversize-single-ref :fail-closed
+  :legacy-v2-migration
+  "A page descriptor without encoded-bytes is selected and rewritten once,
+   even when its logical range does not overlap the new run."}
+ :representative-fixture
+ {:run-rows 2048
+  :run-block-rows 128
+  :run-ref-encoded-bytes 7204
+  :refs 123
+  :pages 4
+  :page-ref-counts [36 36 36 15]
+  :maximum-page-bytes 259437
+  :total-page-bytes 886462}
+ :claim
+ "Every newly published directory leaf is bounded by both ref count and exact
+ encoded bytes. The earlier 27 KiB maximum from the minimal fake-ref fixture
+ was not representative and is superseded by this fail-closed byte gate. A
+ clean live R2 migration and resumed 10M run remain required."}

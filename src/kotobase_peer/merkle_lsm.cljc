@@ -10,6 +10,7 @@
 (def format-version 1)
 (def range-directory-version 2)
 (def default-range-directory-page-refs 128)
+(def default-range-directory-page-bytes 262144)
 (def indexes #{:eavt :aevt :avet :vaet})
 (def default-run-block-rows 128)
 (def default-run-block-bytes 1048576)
@@ -392,7 +393,8 @@
     (assoc page
            :descriptor
            (cond-> {"cid" (ipld/link (:cid page))
-                    "count" (count refs)}
+                    "count" (count refs)
+                    "encoded-bytes" (byte-count (:bytes page))}
              (seq refs)
              (assoc "logical-min"
                     (aggregate-bound refs "logical-min"
@@ -407,35 +409,73 @@
                     (aggregate-bound refs "first-component-max"
                                      #(if (pos? (compare %1 %2)) %1 %2)))))))
 
+(defn- build-bounded-directory-pages
+  [db-id epoch index refs page-refs page-bytes]
+  (loop [remaining (seq (canonical-run-refs refs))
+         current []
+         pages []]
+    (if-let [ref (first remaining)]
+      (let [candidate (build-range-directory-page
+                       {:db-id db-id :epoch epoch :index index
+                        :refs (conj current ref)})
+            fits? (and (<= (count (get-in candidate [:node "refs"]))
+                           page-refs)
+                       (<= (byte-count (:bytes candidate)) page-bytes))]
+        (cond
+          fits?
+          (recur (next remaining) (conj current ref) pages)
+
+          (empty? current)
+          (throw (ex-info "Range directory ref exceeds page byte limit"
+                          {:index index :page-bytes page-bytes
+                           :encoded-bytes (byte-count (:bytes candidate))}))
+
+          :else
+          (recur remaining []
+                 (conj pages
+                       (build-range-directory-page
+                        {:db-id db-id :epoch epoch :index index
+                         :refs current})))))
+      (cond-> pages
+        (seq current)
+        (conj (build-range-directory-page
+               {:db-id db-id :epoch epoch :index index :refs current}))))))
+
 (defn build-range-directory-pages
-  "Build bounded immutable leaves for INDEXES without a root."
-  [{:keys [db-id epoch indexes page-refs]
-    :or {page-refs default-range-directory-page-refs}}]
+  "Build immutable leaves bounded by both ref count and exact encoded bytes."
+  [{:keys [db-id epoch indexes page-refs page-bytes]
+    :or {page-refs default-range-directory-page-refs
+         page-bytes default-range-directory-page-bytes}}]
   (when-not (pos-int? page-refs)
     (throw (ex-info "Range directory page size must be positive"
                     {:page-refs page-refs})))
+  (when-not (pos-int? page-bytes)
+    (throw (ex-info "Range directory page byte size must be positive"
+                    {:page-bytes page-bytes})))
   (into
    (sorted-map)
    (map
     (fn [[index refs]]
       [(name index)
-       (mapv #(build-range-directory-page
-               {:db-id db-id :epoch epoch :index index :refs %})
-             (partition-all page-refs (canonical-run-refs refs)))]))
+       (build-bounded-directory-pages
+        db-id epoch index refs page-refs page-bytes)]))
    indexes))
 
 (defn build-paged-range-directory
   "Build a small v2 root plus immutable bounded ref pages. PAGE-REFS is an
   exact upper bound on refs held by one leaf. The root links pages so the
   generic IPLD reachability walker remains sufficient for GC."
-  [{:keys [db-id epoch indexes previous page-refs]
-    :or {page-refs default-range-directory-page-refs}}]
+  [{:keys [db-id epoch indexes previous page-refs page-bytes]
+    :or {page-refs default-range-directory-page-refs
+         page-bytes default-range-directory-page-bytes}}]
   (let [pages-by-index
         (build-range-directory-pages
-         {:db-id db-id :epoch epoch :indexes indexes :page-refs page-refs})
+         {:db-id db-id :epoch epoch :indexes indexes :page-refs page-refs
+          :page-bytes page-bytes})
         root
         (build-paged-range-directory-root
          {:db-id db-id :epoch epoch :page-refs page-refs
+          :page-bytes page-bytes
           :indexes
           (into (sorted-map)
                 (map (fn [[index pages]]
@@ -466,11 +506,15 @@
   "Build only the v2 root over already-persisted or newly-built page
   descriptors. This is the copy-on-write publication primitive: callers can
   retain untouched leaf CIDs without decoding or rewriting their refs."
-  [{:keys [db-id epoch indexes previous page-refs]
-    :or {page-refs default-range-directory-page-refs}}]
+  [{:keys [db-id epoch indexes previous page-refs page-bytes]
+    :or {page-refs default-range-directory-page-refs
+         page-bytes default-range-directory-page-bytes}}]
   (when-not (pos-int? page-refs)
     (throw (ex-info "Range directory page size must be positive"
                     {:page-refs page-refs})))
+  (when-not (pos-int? page-bytes)
+    (throw (ex-info "Range directory page byte size must be positive"
+                    {:page-bytes page-bytes})))
   (let [node
         (cond->
          {"format" "kotobase/range-directory"
@@ -478,6 +522,7 @@
           "db-id" (str db-id)
           "epoch" epoch
           "page-refs" page-refs
+          "page-bytes" page-bytes
           "indexes"
           (into (sorted-map)
                 (map (fn [[index descriptors]]
@@ -516,7 +561,8 @@
   [directory expected-db-id maximum-epoch]
   (let [index-names (set (map name indexes))
         version (get directory "version")
-        paged? (= range-directory-version version)]
+        paged? (= range-directory-version version)
+        page-bytes (get directory "page-bytes")]
     (when-not (and (= "kotobase/range-directory" (get directory "format"))
                    (contains? #{format-version range-directory-version} version)
                    (= (str expected-db-id) (get directory "db-id"))
@@ -527,6 +573,9 @@
                    (every? vector? (vals (get directory "indexes")))
                    (or (not paged?)
                        (pos-int? (get directory "page-refs")))
+                   (or (not paged?)
+                       (nil? page-bytes)
+                       (pos-int? page-bytes))
                    (every? (fn [entries]
                              (every?
                               #(and (map? %)
@@ -534,7 +583,14 @@
                                     (or (not paged?)
                                         (and (pos-int? (get % "count"))
                                              (<= (get % "count")
-                                                 (get directory "page-refs")))))
+                                                 (get directory "page-refs"))
+                                             (or (nil? page-bytes)
+                                                 (and
+                                                  (pos-int?
+                                                   (get % "encoded-bytes"))
+                                                  (<=
+                                                   (get % "encoded-bytes")
+                                                   page-bytes))))))
                               entries))
                            (vals (get directory "indexes"))))
       (throw (ex-info "Invalid or unsupported range directory"
@@ -544,24 +600,30 @@
     directory))
 
 (defn validate-range-directory-page
-  [page expected-db-id maximum-epoch expected-index maximum-refs]
-  (when-not
-   (and (= "kotobase/range-directory-page" (get page "format"))
-        (= range-directory-version (get page "version"))
-        (= (str expected-db-id) (get page "db-id"))
-        (integer? (get page "epoch"))
-        (<= 0 (get page "epoch") maximum-epoch)
-        (= (name expected-index) (get page "index"))
-        (vector? (get page "refs"))
-        (= (get page "count") (count (get page "refs")))
-        (<= 1 (get page "count") maximum-refs)
-        (every? #(and (map? %) (ipld/link? (get % "cid")))
-                (get page "refs")))
-    (throw (ex-info "Invalid range directory page"
-                    {:expected-db-id (str expected-db-id)
-                     :expected-index expected-index
-                     :maximum-epoch maximum-epoch})))
-  page)
+  ([page expected-db-id maximum-epoch expected-index maximum-refs]
+   (validate-range-directory-page
+    page expected-db-id maximum-epoch expected-index maximum-refs nil))
+  ([page expected-db-id maximum-epoch expected-index maximum-refs maximum-bytes]
+   (when-not
+    (and (= "kotobase/range-directory-page" (get page "format"))
+         (= range-directory-version (get page "version"))
+         (= (str expected-db-id) (get page "db-id"))
+         (integer? (get page "epoch"))
+         (<= 0 (get page "epoch") maximum-epoch)
+         (= (name expected-index) (get page "index"))
+         (vector? (get page "refs"))
+         (= (get page "count") (count (get page "refs")))
+         (<= 1 (get page "count") maximum-refs)
+         (or (nil? maximum-bytes)
+             (<= (byte-count (ipld/encode page)) maximum-bytes))
+         (every? #(and (map? %) (ipld/link? (get % "cid")))
+                 (get page "refs")))
+     (throw (ex-info "Invalid range directory page"
+                     {:expected-db-id (str expected-db-id)
+                      :expected-index expected-index
+                      :maximum-epoch maximum-epoch
+                      :maximum-bytes maximum-bytes})))
+   page))
 
 (defn- canonical-run-refs [refs]
   (->> refs
@@ -596,7 +658,12 @@
         {selected true untouched false}
         (group-by
          (fn [descriptor]
-           (boolean (some #(refs-overlap? % descriptor) new-refs)))
+           (boolean
+            (or (nil? (get descriptor "encoded-bytes"))
+                (and (get directory "page-bytes")
+                     (> (get descriptor "encoded-bytes")
+                        (get directory "page-bytes")))
+                (some #(refs-overlap? % descriptor) new-refs))))
          descriptors)]
     {:selected-pages (canonical-page-descriptors selected)
      :untouched-pages (canonical-page-descriptors untouched)}))

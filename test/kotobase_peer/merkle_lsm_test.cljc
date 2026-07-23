@@ -192,6 +192,19 @@
         (is (every? (lsm/linked-cids (:node successor))
                     (map #(ipld/link-cid (get % "cid"))
                          (:untouched-pages selection))))))
+    (let [legacy-v2
+          (-> root
+              (dissoc "page-bytes")
+              (update-in ["indexes" "eavt"]
+                         #(mapv (fn [descriptor]
+                                  (dissoc descriptor "encoded-bytes"))
+                                %)))
+          migration
+          (lsm/checkpoint-directory-page-selection
+           [(first refs)] legacy-v2 :eavt)]
+      (is (= 3 (count (:selected-pages migration))))
+      (is (empty? (:untouched-pages migration))
+          "pre-byte-limit v2 leaves are rewritten once, never retained"))
     (is (every? (lsm/linked-cids root)
                 (map :cid pages))
         "the generic IPLD walker reaches every directory leaf")
@@ -202,6 +215,40 @@
     (is (= root (lsm/validate-range-directory root "db" 2)))
     (is (thrown? #?(:clj Exception :cljs js/Error)
                  (lsm/range-directory-refs root :eavt)))))
+
+(deftest range-directory-pages-have-an-exact-byte-ceiling
+  (let [run (lsm/build-run :eavt "t" (take 1 entries))
+        refs (mapv
+              (fn [n]
+                (assoc (lsm/run-ref run)
+                       "cid" (ipld/link
+                              (:cid (lsm/build-run
+                                     :eavt "t"
+                                     [{:components [(str "entity-" n)
+                                                    "payload"
+                                                    (apply str
+                                                           (repeat 400 "x"))]
+                                       :epoch 1 :op :assert :value n}])))
+                       "logical-min" (str n)
+                       "logical-max" (str n)
+                       "padding" (apply str (repeat 400 "x"))))
+              (range 5))
+        pages
+        (get
+         (lsm/build-range-directory-pages
+          {:db-id "db" :epoch 1 :indexes {:eavt refs}
+           :page-refs 128 :page-bytes 1400})
+         "eavt")]
+    (is (< 1 (count pages))
+        "the encoded byte limit splits before the ref-count limit")
+    (is (every? #(<= #?(:clj (alength ^bytes (:bytes %))
+                        :cljs (.-byteLength (:bytes %)))
+                     1400)
+                pages))
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (lsm/build-range-directory-pages
+                  {:db-id "db" :epoch 1 :indexes {:eavt [(first refs)]}
+                   :page-refs 128 :page-bytes 64})))))
 
 (deftest first-component-range-prunes-run-refs
   (let [alice (lsm/build-run :eavt "t"
