@@ -2630,21 +2630,84 @@
                 (ensure-backup-retention-root!
                  e db-id backup-id head-cid epoch)))))))))
 
-(defn- backup-reachable-blocks!
-  [e primary backup-bucket cids]
-  (reduce
-   (fn [pending wave]
-     (.then
-      pending
-      (fn [entries]
-        (-> (js/Promise.all
-             (clj->js
-              (mapv #(backup-one-candidate!
-                      e primary backup-bucket (block-key e %))
-                    wave)))
-            (.then #(into entries (array-seq %)))))))
-   (js/Promise.resolve [])
-   (partition-all 4 cids)))
+(defn- database-storage-key [e namespace cid]
+  (case namespace
+    "blocks" (block-key e cid)
+    "objects" (object-key e cid)
+    (throw (ex-info "Unknown database backup namespace"
+                    {:namespace namespace :cid cid}))))
+
+(defn- read-database-storage-entry!
+  [e primary cid]
+  (let [read-object
+        (fn []
+          (-> (.get primary (object-key e cid))
+              (.then
+               (fn [stored]
+                 (if-not stored
+                   (js/Promise.reject
+                    (ex-info "Database backup link not found" {:cid cid}))
+                   (-> (stored-bytes! stored)
+                       (.then
+                        (fn [bytes]
+                          (verify-gc-entry-bytes!
+                           e (object-key e cid) cid bytes)
+                          {:namespace "objects" :cid cid :bytes bytes
+                           :links []}))))))))]
+    (-> (.get primary (block-key e cid))
+        (.then
+         (fn [stored]
+           (if-not stored
+             (read-object)
+             (-> (stored-bytes! stored)
+                 (.then
+                  (fn [bytes]
+                    (verify-gc-entry-bytes!
+                     e (block-key e cid) cid bytes)
+                    {:namespace "blocks" :cid cid :bytes bytes
+                     :links (lsm/linked-cids (ipld/decode bytes))})))))))))
+
+(defn- backup-database-storage-graph!
+  [e primary backup-bucket root-cid]
+  (let [seen (atom {})]
+    (letfn
+        [(walk [frontier]
+           (let [fresh (->> frontier
+                            (remove #(contains? @seen %))
+                            distinct sort vec)]
+             (if (empty? fresh)
+               (js/Promise.resolve
+                (->> (vals @seen)
+                     (sort-by (juxt :namespace :cid))
+                     vec))
+               (-> (reduce
+                    (fn [pending wave]
+                      (.then
+                       pending
+                       (fn [loaded]
+                         (-> (js/Promise.all
+                              (clj->js
+                               (mapv
+                                (fn [cid]
+                                  (-> (read-database-storage-entry!
+                                       e primary cid)
+                                      (.then
+                                       (fn [entry]
+                                         (-> (put-immutable-gc-backup!
+                                              backup-bucket
+                                              (gc-backup-object-key e cid)
+                                              cid (:bytes entry))
+                                             (.then (fn [_] entry)))))))
+                                wave)))
+                             (.then #(into loaded (array-seq %)))))))
+                    (js/Promise.resolve [])
+                    (partition-all 4 fresh))
+                   (.then
+                    (fn [loaded]
+                      (swap! seen into
+                             (map (fn [entry] [(:cid entry) entry]) loaded))
+                      (walk (mapcat :links loaded))))))))]
+      (walk [root-cid]))))
 
 (defn backup-database!
   "Pin one immutable database snapshot, copy every reachable IPLD block into
@@ -2682,15 +2745,16 @@
                               e db-id backup-id head-cid epoch)
                              (.then
                               (fn [root]
-                                (-> (reachable-cids! e head-cid)
+                                (-> (backup-database-storage-graph!
+                                     e primary backup-bucket head-cid)
                                     (.then
-                                     (fn [reachable]
-                                       (let [cids (vec (sort reachable))]
-                                         (-> (backup-reachable-blocks!
-                                              e primary backup-bucket cids)
-                                             (.then
-                                              (fn [entries]
-                                                (let [node
+                                     (fn [entries]
+                                       (let [inventory-entries
+                                             (mapv
+                                              #(select-keys
+                                                % [:namespace :cid])
+                                              entries)
+                                             node
                                                       {"format"
                                                        "kotobase/database-backup-inventory"
                                                        "version" 1
@@ -2700,10 +2764,16 @@
                                                        "head-cid" head-cid
                                                        "base-cid" base-cid
                                                        "epoch" epoch
-                                                       "blocks" cids}
-                                                      bytes (ipld/encode node)
-                                                      cid (str (ipld/cid bytes))]
-                                                  (-> (put-immutable-gc-backup!
+                                                       "entries"
+                                                       (mapv
+                                                        (fn [{:keys
+                                                              [namespace cid]}]
+                                                          {"namespace" namespace
+                                                           "cid" cid})
+                                                        inventory-entries)}
+                                             bytes (ipld/encode node)
+                                             cid (str (ipld/cid bytes))]
+                                         (-> (put-immutable-gc-backup!
                                                        backup-bucket
                                                        (database-backup-inventory-key
                                                         e cid)
@@ -2715,20 +2785,39 @@
                                                           :base-cid base-cid
                                                           :epoch epoch
                                                           :observed-at now-ms
-                                                          :blocks (count entries)
+                                                          :entries
+                                                          (count entries)
+                                                          :blocks
+                                                          (count
+                                                           (filter
+                                                            #(= "blocks"
+                                                                (:namespace %))
+                                                            entries))
+                                                          :objects
+                                                          (count
+                                                           (filter
+                                                            #(= "objects"
+                                                                (:namespace %))
+                                                            entries))
                                                           :bytes
                                                           (reduce
                                                            + 0
-                                                           (map #(get % "bytes")
+                                                           (map #(.-byteLength
+                                                                  (:bytes %))
                                                                 entries))
                                                           :retention-root
                                                           (:root root)
                                                           :idempotent?
                                                           (:idempotent?
-                                                           root)}))))))))))))))))))))))))))
+                                                           root)}))))))))))))))))))))))
 
 (defn- validate-database-backup-inventory [e cid node]
-  (let [blocks (get node "blocks")]
+  (let [entries (get node "entries")
+        normalized
+        (when (vector? entries)
+          (mapv (fn [entry]
+                  [(get entry "namespace") (get entry "cid")])
+                entries))]
     (when-not
      (and (= "kotobase/database-backup-inventory" (get node "format"))
           (= 1 (get node "version"))
@@ -2738,11 +2827,15 @@
           (string? (get node "head-cid"))
           (string? (get node "base-cid"))
           (integer? (get node "epoch"))
-          (vector? blocks)
-          (= blocks (vec (sort (distinct blocks))))
-          (every? #(and (string? %) (re-matches #"b[a-z2-7]+" %)) blocks)
-          (some #{(get node "head-cid")} blocks)
-          (some #{(get node "base-cid")} blocks))
+          (vector? entries)
+          (= normalized (vec (sort (distinct normalized))))
+          (every? (fn [[namespace entry-cid]]
+                    (and (contains? #{"blocks" "objects"} namespace)
+                         (string? entry-cid)
+                         (re-matches #"b[a-z2-7]+" entry-cid)))
+                  normalized)
+          (some #{["blocks" (get node "head-cid")]} normalized)
+          (some #{["blocks" (get node "base-cid")]} normalized))
       (throw (ex-info "Invalid database backup inventory"
                       {:cid cid :node node})))
     node))
@@ -2767,8 +2860,8 @@
          (validate-database-backup-inventory
           e inventory-cid (ipld/decode bytes))))))
 
-(defn- restore-database-blocks!
-  [e primary backup-bucket inventory-cid cids]
+(defn- restore-database-entries!
+  [e primary backup-bucket inventory-cid entries]
   (reduce
    (fn [pending wave]
      (.then
@@ -2777,11 +2870,14 @@
         (-> (js/Promise.all
              (clj->js
               (mapv
-               (fn [cid]
+               (fn [entry]
+                 (let [namespace (get entry "namespace")
+                       cid (get entry "cid")]
                  (restore-one-gc-entry!
                   e primary backup-bucket
                   {:restored 0 :already-present 0}
-                  {"key" (block-key e cid) "content-cid" cid}))
+                  {"key" (database-storage-key e namespace cid)
+                   "content-cid" cid})))
                wave)))
             (.then
              (fn [wave-counts]
@@ -2794,7 +2890,7 @@
                 (array-seq wave-counts))))))))
    (js/Promise.resolve
     {:inventory inventory-cid :restored 0 :already-present 0})
-   (partition-all 4 cids)))
+   (partition-all 4 entries)))
 
 (defn- publish-restored-head!
   [e target-db-id head-cid counts]
@@ -2832,20 +2928,27 @@
                                         :expected head-cid})))))))))))))))
 
 (defn- verify-restored-database!
-  [e inventory-cid inventory target-db-id cids result]
-  (-> (reachable-cids! e (get inventory "head-cid"))
+  [e primary backup-bucket inventory-cid inventory target-db-id entries result]
+  (-> (backup-database-storage-graph!
+       e primary backup-bucket (get inventory "head-cid"))
       (.then
        (fn [reachable]
-         (when-not (= (set cids) reachable)
+         (let [actual (mapv (fn [{:keys [namespace cid]}]
+                              [namespace cid])
+                            reachable)
+               expected (mapv (fn [entry]
+                                [(get entry "namespace") (get entry "cid")])
+                              entries)]
+         (when-not (= expected actual)
            (throw
             (ex-info "Restored database reachability mismatch"
                      {:inventory inventory-cid
-                      :expected (count cids)
-                      :actual (count reachable)})))
+                      :expected (count expected)
+                      :actual (count actual)})))
          (assoc result
-                :verified-reachable (count reachable)
+                :verified-reachable (count actual)
                 :source-db-id (get inventory "db-id")
-                :target-db-id target-db-id)))))
+                :target-db-id target-db-id))))))
 
 (defn restore-database!
   "Restore every immutable block from INVENTORY-CID and create TARGET-DB-ID's
@@ -2868,15 +2971,16 @@
           (.then
            (fn [inventory]
              (let [head-cid (get inventory "head-cid")
-                   cids (get inventory "blocks")]
-               (-> (restore-database-blocks!
-                    e primary backup-bucket inventory-cid cids)
+                   entries (get inventory "entries")]
+               (-> (restore-database-entries!
+                    e primary backup-bucket inventory-cid entries)
                    (.then
                     #(publish-restored-head!
                       e target-db-id head-cid %))
                    (.then
                     #(verify-restored-database!
-                      e inventory-cid inventory target-db-id cids %))))))))))
+                      e primary backup-bucket inventory-cid inventory
+                      target-db-id entries %))))))))))
 
 (defn- delete-confirmed-inventory!
   [e bucket snapshot-before result first-candidates grace-ms now-ms]
