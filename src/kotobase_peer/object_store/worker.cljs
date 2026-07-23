@@ -3534,7 +3534,7 @@
                                 [(get (peek entries) "namespace")
                                  (get (peek entries) "cid")]})))))))))))))))
 
-(defn mark-database-restore-ready!
+(defn- mark-database-restore-ready!
   "Persist the verified all-pages barrier before exposing the target head."
   [e {:keys [task pointer checkpoint etag verified-reachable
              now-ms lease-ms]
@@ -3591,6 +3591,37 @@
                                   :pointer-fenced}))))))))))))
       (js/Promise.reject
        (js/Error. "Resumable database restore requires an R2 binding")))))
+
+(defn verify-and-mark-database-restore-ready!
+  "Verify the exact namespace-aware reachable set against the immutable
+  inventory before publishing the ready barrier. This preserves correctness
+  while the follow-up external visited-set traversal removes the remaining
+  O(total entries) verification working set."
+  [e {:keys [task pointer] :as claim}]
+  (let [primary (env e "MERKLE_BUCKET")
+        backup-bucket (gc-backup-bucket e)
+        inventory-cid
+        (str (ipld/link-cid (get-in task [:node "inventory"])))
+        target-db-id (get pointer "target-db-id")]
+    (if-not (and primary backup-bucket)
+      (js/Promise.reject
+       (js/Error.
+        "Resumable database restore requires primary and backup buckets"))
+      (-> (load-database-backup-inventory!
+           e backup-bucket inventory-cid)
+          (.then
+           (fn [inventory]
+             (let [entries (get inventory "entries")]
+               (-> (verify-restored-database!
+                    e primary backup-bucket inventory-cid inventory
+                    target-db-id entries {})
+                   (.then
+                    (fn [verified]
+                      (mark-database-restore-ready!
+                       e
+                       (assoc claim
+                              :verified-reachable
+                              (:verified-reachable verified)))))))))))))
 
 (defn complete-database-restore!
   "Publish the target head by CAS, then terminally CAS the restore pointer.

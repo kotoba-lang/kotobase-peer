@@ -1002,9 +1002,8 @@
                     (is (contains?
                          @entries
                          (str prefix "blocks/" source-head)))
-                    (worker/mark-database-restore-ready!
+                    (worker/verify-and-mark-database-restore-ready!
                      env (assoc advanced
-                                :verified-reachable 1
                                 :now-ms 9050
                                 :lease-ms 1000))))
                  (.then
