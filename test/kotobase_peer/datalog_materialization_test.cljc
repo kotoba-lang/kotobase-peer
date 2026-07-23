@@ -224,6 +224,7 @@
          {:db-before before
           :tx-data [["bob" "role" "admin"]]
           :db-id "tenant-a" :new-epoch 1
+          :block-rows 32 :max-block-bytes 65536
           :expected-head "old-publication"
           :previous-base-manifest (:cid old-manifest)
           :base-statistics {"catalog-directory" (ipld/link (:cid old-manifest))}
@@ -248,6 +249,9 @@
     (is (= (:cid old-manifest)
            (ipld/link-cid
             (get-in base-node ["statistics" "catalog-directory"]))))
+    (is (= 32 (get-in base-node ["statistics" "run-block-rows"])))
+    (is (= 65536
+           (get-in base-node ["statistics" "run-max-block-bytes"])))
     (is (= :differential (get-in refresh [:views 0 :maintenance :mode])))
     (is (= base-cid (ipld/link-cid (get bundle "source-manifest"))))
     (is (= (get-in old-view [:bundle :cid])

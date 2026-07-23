@@ -365,8 +365,10 @@
   registry at the expected head; all registered views are refreshed together."
   [{:keys [db-before tx-data db-id tenant new-epoch safe-epoch expected-head
            previous-base-manifest base-statistics query-statistics view-specs
-           registered-view-ids target-run-rows]
-    :or {safe-epoch 0 target-run-rows 4096}}]
+           registered-view-ids target-run-rows block-rows max-block-bytes]
+    :or {safe-epoch 0 target-run-rows 4096
+         block-rows lsm/default-run-block-rows
+         max-block-bytes lsm/default-run-block-bytes}}]
   (let [view-ids (mapv (comp str :view-id) view-specs)]
     (when-not (and (integer? new-epoch) (not (neg? new-epoch))
                    (seq registered-view-ids)
@@ -385,7 +387,9 @@
                       :safe-epoch safe-epoch :previous previous-base-manifest
                       :expected expected-head :datoms effective-deltas
                       :statistics (or base-statistics {})
-                      :target-run-rows target-run-rows})
+                      :target-run-rows target-run-rows
+                      :block-rows block-rows
+                      :max-block-bytes max-block-bytes})
           base-cid (get-in base-plan [:manifest :cid])
           refreshed-statistics
           (statistics/refresh-query-statistics query-statistics
