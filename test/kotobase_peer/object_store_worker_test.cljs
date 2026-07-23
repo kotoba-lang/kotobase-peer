@@ -899,6 +899,33 @@
                             "\n" (.-stack error)))
              (done)))))))
 
+(deftest database-backup-inventory-pages-bound-ten-thousand-entries
+  (let [entries
+        (mapv
+         (fn [index]
+           {:namespace (if (zero? (mod index 5)) "objects" "blocks")
+            :cid (str (ipld/cid (ipld/encode {"inventory-index" index})))})
+         (range 10000))
+        entries (vec (sort-by (juxt :namespace :cid) entries))
+        pages (worker/database-backup-inventory-pages entries)
+        decoded
+        (mapcat #(get-in % [:node "entries"]) pages)]
+    (is (= 40 (count pages)))
+    (is (= 10000 (reduce + (map #(get-in % [:descriptor "count"])
+                                pages))))
+    (is (every? #(<= (get-in % [:descriptor "count"]) 256) pages))
+    (is (every? #(<= (get-in % [:descriptor "encoded-bytes"])
+                     worker/database-backup-page-bytes)
+                pages))
+    (is (= (mapv (fn [{:keys [namespace cid]}]
+                   {"namespace" namespace "cid" cid})
+                 entries)
+           (vec decoded)))
+    (is (= (mapv :cid pages)
+           (mapv :cid
+                 (worker/database-backup-inventory-pages entries)))
+        "the same inventory produces the same immutable page CIDs")))
+
 (deftest gc-marks-every-head-before-sweeping-shared-block-prefix
   (async done
     (let [child-a-bytes (ipld/encode {"value" "a"})

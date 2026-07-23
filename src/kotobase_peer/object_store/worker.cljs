@@ -47,6 +47,11 @@
   (str (prefix e) "gc-backups/inventories/" cid))
 (defn database-backup-inventory-key [e cid]
   (str (prefix e) "database-backups/inventories/" cid))
+(defn database-backup-page-key [e cid]
+  (str (prefix e) "database-backups/pages/" cid))
+
+(def database-backup-page-entries 256)
+(def database-backup-page-bytes (* 64 1024))
 
 (defn- b2-config [e]
   (when (every? #(seq (env e %))
@@ -2709,6 +2714,60 @@
                       (walk (mapcat :links loaded))))))))]
       (walk [root-cid]))))
 
+(defn- backup-inventory-entry
+  [{:keys [namespace cid]}]
+  {"namespace" namespace "cid" cid})
+
+(defn database-backup-inventory-pages
+  "Build deterministic, byte-bounded immutable inventory pages. ENTRIES must
+  already be ordered by [namespace CID]."
+  [entries]
+  (->> entries
+       (partition-all database-backup-page-entries)
+       (map-indexed
+        (fn [ordinal page-entries]
+          (let [node {"format" "kotobase/database-backup-inventory-page"
+                      "version" 1
+                      "ordinal" ordinal
+                      "entries" (mapv backup-inventory-entry page-entries)}
+                bytes (ipld/encode node)
+                encoded-bytes (.-byteLength bytes)]
+            (when (> encoded-bytes database-backup-page-bytes)
+              (throw
+               (ex-info "Database backup inventory page exceeds byte limit"
+                        {:ordinal ordinal
+                         :entries (count page-entries)
+                         :encoded-bytes encoded-bytes
+                         :maximum database-backup-page-bytes})))
+            {:cid (str (ipld/cid bytes))
+             :bytes bytes
+             :node node
+             :descriptor
+             {"cid" (str (ipld/cid bytes))
+              "ordinal" ordinal
+              "count" (count page-entries)
+              "encoded-bytes" encoded-bytes
+              "first" (backup-inventory-entry (first page-entries))
+              "last" (backup-inventory-entry (peek (vec page-entries)))}})))
+       vec))
+
+(defn- publish-database-backup-pages!
+  [e backup-bucket pages]
+  (reduce
+   (fn [pending wave]
+     (.then
+      pending
+      (fn [_]
+        (js/Promise.all
+         (clj->js
+          (mapv
+           (fn [{:keys [cid bytes]}]
+             (put-immutable-gc-backup!
+              backup-bucket (database-backup-page-key e cid) cid bytes))
+           wave))))))
+   (js/Promise.resolve nil)
+   (partition-all 4 pages)))
+
 (defn backup-database!
   "Pin one immutable database snapshot, copy every reachable IPLD block into
   the immutable backup namespace, and publish a content-addressed inventory.
@@ -2754,37 +2813,55 @@
                                               #(select-keys
                                                 % [:namespace :cid])
                                               entries)
+                                             pages
+                                             (database-backup-inventory-pages
+                                              inventory-entries)
                                              node
-                                                      {"format"
-                                                       "kotobase/database-backup-inventory"
-                                                       "version" 1
-                                                       "source-prefix" (prefix e)
-                                                       "db-id" db-id
-                                                       "backup-id" backup-id
-                                                       "head-cid" head-cid
-                                                       "base-cid" base-cid
-                                                       "epoch" epoch
-                                                       "entries"
-                                                       (mapv
-                                                        (fn [{:keys
-                                                              [namespace cid]}]
-                                                          {"namespace" namespace
-                                                           "cid" cid})
-                                                        inventory-entries)}
+                                             {"format"
+                                              "kotobase/database-backup-inventory"
+                                              "version" 2
+                                              "source-prefix" (prefix e)
+                                              "db-id" db-id
+                                              "backup-id" backup-id
+                                              "head-cid" head-cid
+                                              "base-cid" base-cid
+                                              "epoch" epoch
+                                              "entry-count" (count entries)
+                                              "page-entry-limit"
+                                              database-backup-page-entries
+                                              "page-byte-limit"
+                                              database-backup-page-bytes
+                                              "pages"
+                                              (mapv :descriptor pages)}
                                              bytes (ipld/encode node)
                                              cid (str (ipld/cid bytes))]
-                                         (-> (put-immutable-gc-backup!
-                                                       backup-bucket
-                                                       (database-backup-inventory-key
-                                                        e cid)
-                                                       cid bytes)
-                                                      (.then
-                                                       (fn [_]
+                                         (-> (publish-database-backup-pages!
+                                              e backup-bucket pages)
+                                             (.then
+                                              (fn [_]
+                                                (put-immutable-gc-backup!
+                                                 backup-bucket
+                                                 (database-backup-inventory-key
+                                                  e cid)
+                                                 cid bytes)))
+                                             (.then
+                                              (fn [_]
                                                          {:inventory cid
                                                           :head-cid head-cid
                                                           :base-cid base-cid
                                                           :epoch epoch
                                                           :observed-at now-ms
+                                                          :inventory-pages
+                                                          (count pages)
+                                                          :inventory-root-bytes
+                                                          (.-byteLength bytes)
+                                                          :maximum-page-bytes
+                                                          (reduce
+                                                           max 0
+                                                           (map #(get-in
+                                                                  % [:descriptor
+                                                                     "encoded-bytes"])
+                                                                pages))
                                                           :entries
                                                           (count entries)
                                                           :blocks
@@ -2811,34 +2888,131 @@
                                                           (:idempotent?
                                                            root)}))))))))))))))))))))))
 
-(defn- validate-database-backup-inventory [e cid node]
-  (let [entries (get node "entries")
-        normalized
-        (when (vector? entries)
-          (mapv (fn [entry]
-                  [(get entry "namespace") (get entry "cid")])
-                entries))]
+(defn- valid-database-backup-entry? [entry]
+  (and (map? entry)
+       (contains? #{"blocks" "objects"} (get entry "namespace"))
+       (string? (get entry "cid"))
+       (re-matches #"b[a-z2-7]+" (get entry "cid"))))
+
+(defn- normalized-database-backup-entries [entries]
+  (mapv (fn [entry]
+          [(get entry "namespace") (get entry "cid")])
+        entries))
+
+(defn- validate-materialized-database-backup-entries
+  [cid node entries]
+  (let [normalized (normalized-database-backup-entries entries)]
     (when-not
-     (and (= "kotobase/database-backup-inventory" (get node "format"))
-          (= 1 (get node "version"))
-          (= (prefix e) (get node "source-prefix"))
-          (string? (get node "db-id"))
-          (string? (get node "backup-id"))
-          (string? (get node "head-cid"))
-          (string? (get node "base-cid"))
-          (integer? (get node "epoch"))
-          (vector? entries)
+     (and (vector? entries)
           (= normalized (vec (sort (distinct normalized))))
-          (every? (fn [[namespace entry-cid]]
-                    (and (contains? #{"blocks" "objects"} namespace)
-                         (string? entry-cid)
-                         (re-matches #"b[a-z2-7]+" entry-cid)))
-                  normalized)
+          (every? valid-database-backup-entry? entries)
           (some #{["blocks" (get node "head-cid")]} normalized)
           (some #{["blocks" (get node "base-cid")]} normalized))
+      (throw (ex-info "Invalid database backup inventory entries"
+                      {:cid cid :node node})))
+    entries))
+
+(defn- valid-database-backup-page-descriptor? [index descriptor]
+  (and (map? descriptor)
+       (= index (get descriptor "ordinal"))
+       (string? (get descriptor "cid"))
+       (re-matches #"b[a-z2-7]+" (get descriptor "cid"))
+       (pos-int? (get descriptor "count"))
+       (<= (get descriptor "count") database-backup-page-entries)
+       (pos-int? (get descriptor "encoded-bytes"))
+       (<= (get descriptor "encoded-bytes") database-backup-page-bytes)
+       (valid-database-backup-entry? (get descriptor "first"))
+       (valid-database-backup-entry? (get descriptor "last"))))
+
+(defn- validate-database-backup-inventory [e cid node]
+  (let [version (get node "version")
+        common?
+        (and (= "kotobase/database-backup-inventory" (get node "format"))
+             (contains? #{1 2} version)
+             (= (prefix e) (get node "source-prefix"))
+             (string? (get node "db-id"))
+             (string? (get node "backup-id"))
+             (string? (get node "head-cid"))
+             (string? (get node "base-cid"))
+             (integer? (get node "epoch")))]
+    (when-not common?
       (throw (ex-info "Invalid database backup inventory"
                       {:cid cid :node node})))
-    node))
+    (case version
+      1
+      (do
+        (validate-materialized-database-backup-entries
+         cid node (get node "entries"))
+        node)
+
+      2
+      (let [pages (get node "pages")]
+        (when-not
+         (and (vector? pages)
+              (seq pages)
+              (every? identity
+                      (map-indexed
+                       valid-database-backup-page-descriptor? pages))
+              (= (get node "entry-count")
+                 (reduce + 0 (map #(get % "count") pages)))
+              (= database-backup-page-entries
+                 (get node "page-entry-limit"))
+              (= database-backup-page-bytes
+                 (get node "page-byte-limit")))
+          (throw (ex-info "Invalid paged database backup inventory"
+                          {:cid cid :node node})))
+        node))))
+
+(defn- load-database-backup-page!
+  [e backup-bucket descriptor]
+  (let [cid (get descriptor "cid")]
+    (-> (.get backup-bucket (database-backup-page-key e cid))
+        (.then
+         (fn [stored]
+           (if-not stored
+             (js/Promise.reject
+              (ex-info "Database backup inventory page not found"
+                       {:cid cid}))
+             (stored-bytes! stored))))
+        (.then
+         (fn [bytes]
+           (when-not (= cid (str (ipld/cid bytes)))
+             (throw
+              (ex-info "Database backup inventory page CID mismatch"
+                       {:cid cid})))
+           (let [page (ipld/decode bytes)
+                 entries (get page "entries")]
+             (when-not
+              (and (= "kotobase/database-backup-inventory-page"
+                      (get page "format"))
+                   (= 1 (get page "version"))
+                   (= (get descriptor "ordinal") (get page "ordinal"))
+                   (= (get descriptor "count") (count entries))
+                   (= (get descriptor "encoded-bytes")
+                      (.-byteLength bytes))
+                   (= (get descriptor "first") (first entries))
+                   (= (get descriptor "last") (peek entries))
+                   (every? valid-database-backup-entry? entries))
+               (throw
+                (ex-info "Invalid database backup inventory page"
+                         {:cid cid :descriptor descriptor})))
+             entries))))))
+
+(defn- materialize-database-backup-pages!
+  [e backup-bucket inventory]
+  (reduce
+   (fn [pending wave]
+     (.then
+      pending
+      (fn [entries]
+        (-> (js/Promise.all
+             (clj->js
+              (mapv #(load-database-backup-page!
+                      e backup-bucket %)
+                    wave)))
+            (.then #(into entries (mapcat identity (array-seq %))))))))
+   (js/Promise.resolve [])
+   (partition-all 4 (get inventory "pages"))))
 
 (defn- load-database-backup-inventory!
   [e backup-bucket inventory-cid]
@@ -2857,8 +3031,18 @@
            (throw
             (ex-info "Database backup inventory CID mismatch"
                      {:cid inventory-cid})))
-         (validate-database-backup-inventory
-          e inventory-cid (ipld/decode bytes))))))
+         (let [inventory
+               (validate-database-backup-inventory
+                e inventory-cid (ipld/decode bytes))]
+           (if (= 1 (get inventory "version"))
+             inventory
+             (-> (materialize-database-backup-pages!
+                  e backup-bucket inventory)
+                 (.then
+                  (fn [entries]
+                    (validate-materialized-database-backup-entries
+                     inventory-cid inventory entries)
+                    (assoc inventory "entries" entries))))))))))
 
 (defn- restore-database-entries!
   [e primary backup-bucket inventory-cid entries]
