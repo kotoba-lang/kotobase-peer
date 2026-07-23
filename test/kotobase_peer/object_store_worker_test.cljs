@@ -324,8 +324,29 @@
                                  "manifest block descriptors bypass the run root")
                              (is (= 7 (count (filter data-cids @gets)))
                                  "continuations skip data blocks entirely before the cursor")
+                             (reset! gets [])
+                             (cached-step nil [] [] 0))
+                           (step (:cursor page) next-rows next-scanned)))))))
+              (cached-step [after remainder rows fetched]
+                (-> (worker/find-index-prefix-page!
+                     env "db-blocks" :aevt [["member"]]
+                     (cond-> {:limit 64 :remainder-max-bytes 1048576
+                              :block-remainder remainder}
+                       after (assoc :after after)))
+                    (.then
+                     (fn [page]
+                       (let [next-rows (into rows (:rows page))
+                             next-fetched (+ fetched (:fetched-blocks page))]
+                         (if (:done? page)
+                           (do
+                             (is (= 300 (count next-rows)))
+                             (is (= 3 next-fetched)
+                                 "each physical block is fetched once across pages")
+                             (is (= 3 (count (filter data-cids @gets)))
+                                 "inline CID-verified remainder removes repeated R2 GETs")
                              (done))
-                           (step (:cursor page) next-rows next-scanned)))))))]
+                           (cached-step (:cursor page) (:block-remainder page)
+                                        next-rows next-fetched)))))))]
         (-> (worker/find-index-prefixes!
              env "db-blocks" :aevt [["member"]])
             (.then

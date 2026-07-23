@@ -119,6 +119,23 @@
   [wire]
   (into {} (map (fn [[variable value]] [(symbol variable) value])) wire))
 
+(defn- valid-block-remainder? [remainder]
+  (and (vector? remainder)
+       (every? (fn [entry]
+                 (and (map? entry)
+                      (string? (:cid entry))
+                      (seq (:cid entry))
+                      (map? (:block entry))))
+               remainder)))
+
+(defn- valid-wire-block-remainder? [remainder]
+  (and (vector? remainder)
+       (every? (fn [entry]
+                 (and (map? entry)
+                      (ipld/link? (get entry "cid"))
+                      (map? (get entry "block"))))
+               remainder)))
+
 (defn decode-frontier-work
   "Validate and decode a join-frontier work node. The returned `:next-work` is
   a CID or nil; bindings are ordinary symbol-keyed maps again."
@@ -137,6 +154,9 @@
                                        (get scan "index"))
                             (string? (get scan "after"))
                             (seq (get scan "after"))
+                            (or (nil? (get scan "block-remainder"))
+                                (valid-wire-block-remainder?
+                                 (get scan "block-remainder")))
                             (some #{(get scan "clause-index")}
                                   (get node "remaining"))))))
     (throw (ex-info "Malformed join frontier work node" {:node node})))
@@ -146,7 +166,12 @@
    :scan (when-let [scan (get node "scan")]
            {:clause-index (get scan "clause-index")
             :index (keyword (get scan "index"))
-            :after (get scan "after")})
+            :after (get scan "after")
+            :block-remainder
+            (mapv (fn [entry]
+                    {:cid (str (ipld/link-cid (get entry "cid")))
+                     :block (get entry "block")})
+                  (or (get scan "block-remainder") []))})
    :next-work (some-> (get node "next-work") ipld/link-cid)})
 
 (defn build-frontier-work-chain
@@ -164,7 +189,9 @@
                           (some #{(:clause-index scan)} remaining)
                           (contains? lsm/indexes (:index scan))
                           (string? (:after scan))
-                          (seq (:after scan)))))
+                          (seq (:after scan))
+                          (valid-block-remainder?
+                           (or (:block-remainder scan) [])))))
     (throw (ex-info "Invalid join frontier work chain input"
                     {:snapshot snapshot :remaining remaining
                      :bindings-type (type bindings) :max-bytes max-bytes})))
@@ -175,9 +202,18 @@
                                  "snapshot" (name snapshot)
                                  "remaining" remaining
                                  "bindings" (mapv binding->wire bindings)}
-                          scan (assoc "scan" {"clause-index" (:clause-index scan)
-                                              "index" (name (:index scan))
-                                              "after" (:after scan)})
+                          scan (assoc "scan"
+                                      (cond->
+                                       {"clause-index" (:clause-index scan)
+                                        "index" (name (:index scan))
+                                        "after" (:after scan)}
+                                        (seq (:block-remainder scan))
+                                        (assoc
+                                         "block-remainder"
+                                         (mapv (fn [{:keys [cid block]}]
+                                                 {"cid" (ipld/link cid)
+                                                  "block" block})
+                                               (:block-remainder scan)))))
                           next-work (assoc "next-work" (ipld/link next-work))))]
               (cond
                 (<= #?(:clj (alength ^bytes (:bytes node))

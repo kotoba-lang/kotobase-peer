@@ -96,10 +96,13 @@
 
 (deftest join-frontier-work-preserves-a-bounded-prefix-cursor
   (let [bindings (mapv (fn [n] {'?person (str "person-" n)}) (range 12))
-        scan {:clause-index 0 :index :avet :after "member|person-4"}
+        block {"format" "test/remainder" "rows" [["person-5"]]}
+        scan {:clause-index 0 :index :avet :after "member|person-4"
+              :block-remainder [{:cid (str (ipld/cid (ipld/encode block)))
+                                 :block block}]}
         chain (materialization/build-frontier-work-chain
                {:snapshot :after :remaining [0 1]
-                :bindings bindings :scan scan :max-bytes 220})
+                :bindings bindings :scan scan :max-bytes 400})
         by-cid (into {} (map (juxt :cid :node) (:nodes chain)))]
     (is (< 1 (count (:nodes chain))))
     (loop [cid (:head chain) decoded []]

@@ -145,6 +145,13 @@ its continuation without fetching the run root or replaying earlier data.
 Continuation reads are demand-only: a block is fetched after its descriptor is
 known to overlap the cursor and current page cutoff. This avoids speculative
 successor GETs and keeps physical reads attributable to returned page work.
+With an explicit `:remainder-max-bytes` budget, a page may return the decoded
+current block as `:block-remainder`. A resumable host can persist that bounded
+value beside the logical cursor and supply it to the next page, avoiding a
+second R2 GET when the cursor remains inside the same physical block. The next
+page verifies its CID and validates it against the current manifest descriptor
+before use. A block that does not fit the budget is omitted and transparently
+falls back to the ordinary immutable GET path.
 Callers may pass an immutable `:head-cid`; every page then resolves that legacy
 manifest or EpochPublication directly and never re-reads the mutable head. This
 is the snapshot-pinned path used by resumable remote queries.

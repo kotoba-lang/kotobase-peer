@@ -399,6 +399,30 @@
                        :index expected-index :tenant expected-tenant})))
     rows))
 
+(defn- valid-block-remainder? [remainder]
+  (and (vector? remainder)
+       (every? (fn [entry]
+                 (and (map? entry)
+                      (string? (:cid entry))
+                      (seq (:cid entry))
+                      (map? (:block entry))))
+               remainder)))
+
+(defn- bounded-block-remainder [loaded cursor max-bytes]
+  (if (or (nil? cursor) (not (pos-int? max-bytes)))
+    []
+    (reduce
+     (fn [entries {:keys [descriptor] :as entry}]
+       (if (pos? (compare (get descriptor "logical-max") cursor))
+         (let [candidate (conj entries (select-keys entry [:cid :block]))]
+           (if (<= (.-byteLength (ipld/encode candidate)) max-bytes)
+             candidate
+             entries))
+         entries))
+     []
+     (sort-by (juxt #(get-in % [:descriptor "logical-min"]) :cid)
+              (vals loaded)))))
+
 (defn- collect-index-run-refs!
   [e db-id base-cid index max-depth read-context]
   (letfn [(collect [cid remaining refs]
@@ -615,11 +639,17 @@
   on demand. A continuation never speculatively fetches its successor block;
   only LIMIT+1 logical-key candidates survive between reads.
   AFTER is the opaque logical-key cursor returned by the previous page."
-  [e db-id index prefixes {:keys [after limit max-depth head-cid]
-                           :or {limit 256 max-depth 256}}]
+  [e db-id index prefixes
+   {:keys [after limit max-depth head-cid block-remainder remainder-max-bytes]
+    :or {limit 256 max-depth 256 block-remainder [] remainder-max-bytes 0}}]
   (let [prefixes (vec (distinct (map vec prefixes)))]
     (when-not (and (lsm/indexes index) (seq prefixes) (pos-int? limit)
                    (pos-int? max-depth)
+                   (nat-int? remainder-max-bytes)
+                   (valid-block-remainder? block-remainder)
+                   (or (zero? remainder-max-bytes)
+                       (<= (.-byteLength (ipld/encode block-remainder))
+                           remainder-max-bytes))
                    (or (nil? after) (string? after))
                    (or (nil? head-cid)
                        (and (string? head-cid) (seq head-cid)))
@@ -627,7 +657,8 @@
       (throw (ex-info "Invalid bounded Merkle index prefix page"
                       {:index index :prefixes prefixes :after after
                        :limit limit :max-depth max-depth
-                       :head-cid head-cid})))
+                       :head-cid head-cid
+                       :remainder-max-bytes remainder-max-bytes})))
     (-> (if head-cid
           (resolve-database-snapshot! e head-cid)
           (resolve-database-head! e db-id))
@@ -644,7 +675,10 @@
                            {:index index :prefix-count (count prefixes)})
                           (.then
                            (fn [refs]
-                             (let [selected
+                             (let [remainder-by-cid
+                                   (into {} (map (juxt :cid :block))
+                                         block-remainder)
+                                   selected
                                    (->> prefixes
                                         (mapcat
                                          #(lsm/select-run-refs-by-first-component
@@ -676,15 +710,31 @@
                                                (and page-cutoff lo
                                                     (pos? (compare lo page-cutoff))))))
                                        (load-block! [descriptor]
-                                         (-> (get-node!
-                                              e (ipld/link-cid
-                                                 (get descriptor "cid")))
-                                             (.then #(vector descriptor %))))
-                                       (fold-loaded-block [state [descriptor block]]
+                                         (let [cid (str (ipld/link-cid
+                                                         (get descriptor "cid")))]
+                                           (if-let [block (get remainder-by-cid cid)]
+                                             (do
+                                               (when-not (= cid (str (ipld/cid
+                                                                     (ipld/encode block))))
+                                                 (throw
+                                                  (ex-info
+                                                   "Merkle block remainder CID mismatch"
+                                                   {:cid cid})))
+                                               (js/Promise.resolve
+                                                [descriptor block false cid]))
+                                             (-> (get-node! e cid)
+                                                 (.then #(vector descriptor % true cid))))))
+                                       (fold-loaded-block
+                                         [state [descriptor block fetched? cid]]
                                          (let [rows (validated-run-block-rows
                                                      descriptor block index db-id)
                                                candidates (:candidates state)]
-                                           (cond-> (update state :scanned-blocks inc)
+                                           (cond-> (-> state
+                                                       (update :scanned-blocks inc)
+                                                       (assoc-in [:loaded-blocks cid]
+                                                                 {:cid cid :block block
+                                                                  :descriptor descriptor}))
+                                             fetched? (update :fetched-blocks inc)
                                              (not (skip-block? candidates descriptor))
                                              (assoc :candidates
                                                     (lsm/visible-page-add-run
@@ -723,19 +773,27 @@
                                                                  query-epoch after limit
                                                                  matches-prefix?))
                                                          (update :scanned-runs inc)
-                                                         (update :scanned-blocks inc)))))))))]
+                                                         (update :scanned-blocks inc)
+                                                         (update :fetched-blocks inc)))))))))]
                                  (-> (reduce fold-ref
                                              (js/Promise.resolve
                                               {:candidates {} :scanned-runs 0
-                                               :scanned-blocks 0})
+                                               :scanned-blocks 0 :fetched-blocks 0
+                                               :loaded-blocks {}})
                                              selected)
                                      (.then
                                       (fn [state]
-                                        (assoc (lsm/visible-page-result
-                                                (:candidates state) limit)
-                                               :scanned-runs (:scanned-runs state)
-                                               :scanned-blocks
-                                               (:scanned-blocks state))))))))))))))))))))
+                                        (let [result (lsm/visible-page-result
+                                                      (:candidates state) limit)]
+                                          (assoc result
+                                                 :scanned-runs (:scanned-runs state)
+                                                 :scanned-blocks (:scanned-blocks state)
+                                                 :fetched-blocks (:fetched-blocks state)
+                                                 :block-remainder
+                                                 (bounded-block-remainder
+                                                  (:loaded-blocks state)
+                                                  (:cursor result)
+                                                  remainder-max-bytes)))))))))))))))))))))
 
 (defn- manifest-window!
   [e head-cid limit]
