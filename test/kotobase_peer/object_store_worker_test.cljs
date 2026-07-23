@@ -467,6 +467,66 @@
                     (is false (str "retention registry promise rejected: " error))
                     (done)))))))
 
+(deftest host-safe-epoch-oracle-unifies-root-kinds-and-clock-skew
+  (async done
+    (let [roots
+          [(retention/root-node
+            {:db-id "db-a" :kind :reader :id "reader"
+             :manifest-cid "m7" :epoch 7 :expires-at 950})
+           (retention/root-node
+            {:db-id "db-a" :kind :replication :id "replica"
+             :manifest-cid "m5" :epoch 5 :expires-at 1200})
+           (retention/root-node
+            {:db-id "db-a" :kind :backup :id "backup"
+             :manifest-cid "m3" :epoch 3})
+           (retention/root-node
+            {:db-id "db-b" :kind :legal-hold :id "other"
+             :manifest-cid "m1" :epoch 1})]
+          entries
+          (into {}
+                (map-indexed
+                 (fn [index root]
+                   [(str "oracle/roots/" (get root "db-id") "/"
+                         (get root "kind") "/" index)
+                    (js/JSON.stringify (clj->js root))]))
+                roots)
+          bucket
+          #js {:list
+               (fn [opts]
+                 (let [wanted (.-prefix opts)]
+                   (js/Promise.resolve
+                    #js {:objects
+                         (clj->js
+                          (mapv (fn [key] #js {:key key})
+                                (filter #(str/starts-with? % wanted)
+                                        (keys entries))))
+                         :truncated false})))
+               :get
+               (fn [key]
+                 (js/Promise.resolve
+                  (when-let [value (get entries key)]
+                    #js {:etag (str "etag/" key)
+                         :text (fn [] (js/Promise.resolve value))})))}
+          env #js {"MERKLE_BUCKET" bucket "MERKLE_S3_PREFIX" "oracle"
+                   "MERKLE_RETENTION_CLOCK_SKEW_MS" "100"}]
+      (-> (worker/retention-safe-epoch-oracle! env "db-a" 1000)
+          (.then
+           (fn [oracle]
+             (is (= 3 (:safe-epoch oracle)))
+             (is (= 900 (:effective-now oracle)))
+             (is (= {"backup" 1 "reader" 1 "replication" 1}
+                    (:active-by-kind oracle)))
+             (worker/retention-safe-epoch! env "db-a" 1000)))
+          (.then
+           (fn [safe-epoch]
+             (is (= 3 safe-epoch)
+                 "compaction consumes the same explicit oracle decision")
+             (done)))
+          (.catch
+           (fn [error]
+             (is false (str "safe-epoch oracle rejected: " error))
+             (done)))))))
+
 (deftest gc-marks-every-head-before-sweeping-shared-block-prefix
   (async done
     (let [child-a-bytes (ipld/encode {"value" "a"})
@@ -606,6 +666,33 @@
                    (is (= 0 (:deleted fenced)))
                    (is (contains? @objects (block-key orphan))
                        "head mutation fences deletion of a previously marked candidate")
+                   (let [root-list-calls (atom 0)
+                         concurrent-key (str prefix "roots/db-a/backup/concurrent")
+                         concurrent-root
+                         (retention/root-node
+                          {:db-id "db-a" :kind :backup :id "concurrent"
+                           :manifest-cid orphan :epoch 2})
+                         fenced-bucket
+                         #js {:get (fn [key] (.get bucket key))
+                              :list
+                              (fn [opts]
+                                (when (= (.-prefix opts) (str prefix "roots/"))
+                                  (when (= 2 (swap! root-list-calls inc))
+                                    (swap! objects assoc concurrent-key
+                                           (js/JSON.stringify
+                                            (clj->js concurrent-root)))))
+                                (.list bucket opts))
+                              :delete (fn [keys] (.delete bucket keys))}
+                         fenced-env #js {"MERKLE_BUCKET" fenced-bucket
+                                         "MERKLE_S3_PREFIX" "test"}]
+                     (worker/gc-unreachable! fenced-env "db-a" 0 true))))
+          (.then (fn [fenced]
+                   (is (= :roots-changed (:aborted fenced)))
+                   (is (= 0 (:deleted fenced)))
+                   (is (contains? @objects (block-key orphan))
+                       "a concurrently registered backup root fences deletion")
+                   (swap! objects dissoc
+                          (str prefix "roots/db-a/backup/concurrent"))
                    (let [root (retention/root-node
                                {:db-id "db-a" :kind :legal-hold :id "case-1"
                                 :manifest-cid orphan :epoch 2})

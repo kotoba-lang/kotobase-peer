@@ -14,6 +14,17 @@
             [kotobase-peer.object-store.s3-sigv4 :as sigv4]))
 
 (defn- env [e k] (gobj/get e k))
+(defn retention-clock-skew-ms [e]
+  (let [raw (env e "MERKLE_RETENTION_CLOCK_SKEW_MS")]
+    (if (nil? raw)
+      30000
+      (let [text (str raw)
+            parsed (js/Number text)]
+        (when-not (and (re-matches #"[0-9]+" text)
+                       (js/Number.isSafeInteger parsed))
+          (throw (ex-info "MERKLE_RETENTION_CLOCK_SKEW_MS must be a non-negative safe integer"
+                          {:value raw})))
+        parsed))))
 (defn- prefix [e]
   (str (str/replace (or (env e "MERKLE_S3_PREFIX") "kotobase/merkle-lsm") #"^/+|/+$" "") "/"))
 (defn block-key [e cid] (str (prefix e) "blocks/" cid))
@@ -812,20 +823,28 @@
                      (lsm/validate-range-directory
                       directory db-id (get manifest "epoch"))})))))))))
 
-(defn retention-safe-epoch!
-  "Return the minimum epoch imposed by active R2 retention roots, or nil when
-  no root constrains compaction. NOW-MS is injectable for deterministic hosts."
-  ([e db-id] (retention-safe-epoch! e db-id (js/Date.now)))
+(defn retention-safe-epoch-oracle!
+  "Return the explicit clock-skew-conservative R2 retention decision consumed
+  by compaction and GC. NOW-MS is injectable for deterministic hosts."
+  ([e db-id] (retention-safe-epoch-oracle! e db-id (js/Date.now)))
   ([e db-id now-ms]
    (if-let [bucket (env e "MERKLE_BUCKET")]
      (-> (all-r2-retention-roots! e bucket)
          (.then (fn [roots]
-                  (retention/minimum-safe-epoch
+                  (retention/safe-epoch-oracle
                    (->> roots
                         (mapv :root)
                         (filterv #(= db-id (get % "db-id"))))
-                   now-ms))))
-     (js/Promise.resolve nil))))
+                   now-ms (retention-clock-skew-ms e)))))
+     (js/Promise.resolve
+      (retention/safe-epoch-oracle [] now-ms (retention-clock-skew-ms e))))))
+
+(defn retention-safe-epoch!
+  "Return the safe epoch from the same explicit oracle used by GC."
+  ([e db-id] (retention-safe-epoch! e db-id (js/Date.now)))
+  ([e db-id now-ms]
+   (-> (retention-safe-epoch-oracle! e db-id now-ms)
+       (.then (fn [oracle] (:safe-epoch oracle))))))
 
 (defn compact-head!
   "Compact the newest manifest window into range-partitioned L1 runs and
@@ -834,8 +853,9 @@
   ([e db-id] (compact-head! e db-id 64 4096))
   ([e db-id window-size] (compact-head! e db-id window-size 4096))
   ([e db-id window-size target-run-rows]
-   (-> (retention-safe-epoch! e db-id)
-       (.then #(compact-head! e db-id window-size target-run-rows %))))
+   (-> (retention-safe-epoch-oracle! e db-id)
+       (.then #(compact-head! e db-id window-size target-run-rows
+                              (:safe-epoch %)))))
   ([e db-id window-size target-run-rows root-safe-epoch]
    (-> (resolve-database-head! e db-id)
        (.then
@@ -1515,13 +1535,16 @@
 (defn- gc-audit! [e bucket {:keys [heads roots resumable-roots ingress-roots]}
                   grace-ms now-ms]
   (let [head-by-key (into {} (map (juxt :key :value)) heads)
+        oracle (retention/safe-epoch-oracle
+                (mapv :root roots) now-ms (retention-clock-skew-ms e))
+        active-root-nodes (set (:active-roots oracle))
         active-resumable-roots
         (filterv (fn [{:keys [db-id expected-head status]}]
                    (and (contains? #{"running" "completed"} status)
                         (= expected-head
                            (get head-by-key (head-key e db-id)))))
                  resumable-roots)
-        active-roots (filterv #(retention/active? (:root %) now-ms) roots)
+        active-roots (filterv #(contains? active-root-nodes (:root %)) roots)
         active-ingress-roots
         (filterv (fn [{:keys [status deadline-at]}]
                    (and (contains? #{"queued" "running"} status)
@@ -1573,7 +1596,9 @@
               :stale-ingress-pointers (count stale-ingress-pointer-keys)
               :retention-roots (count roots)
               :active-retention-roots (count active-roots)
-              :safe-epoch (retention/minimum-safe-epoch (mapv :root roots) now-ms)
+              :safe-epoch (:safe-epoch oracle)
+              :retention-active-by-kind (:active-by-kind oracle)
+              :retention-clock-skew-ms (:clock-skew-ms oracle)
               :candidate-keys (into candidates
                                     (concat stale-resumable-pointer-keys
                                             stale-ingress-pointer-keys))
