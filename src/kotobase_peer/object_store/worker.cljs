@@ -1233,6 +1233,16 @@
              (get totals k 0) value)))
    left right))
 
+(defn- promoted-component-result [refs]
+  {:refs (vec refs)
+   :metrics
+   {:input-runs 0
+    :input-block-gets 0 :input-block-bytes 0
+    :max-buffered-input-rows 0 :max-buffered-input-bytes 0
+    :output-runs 0 :output-rows 0
+    :output-object-puts 0 :output-object-bytes 0
+    :promoted-runs (count refs)}})
+
 (defn- compact-index-ranges!
   "Stream disjoint overlap components in bounded parallel waves. Each
   component holds one bounded data block per open input run and one bounded
@@ -1248,9 +1258,11 @@
           (clj->js
            (mapv
             (fn [{:keys [refs]}]
-              (compact-run-component-streaming!
-               e db-id index safe-epoch target-run-rows
-               default-stream-limits refs))
+              (if (= 1 (count refs))
+                (js/Promise.resolve (promoted-component-result refs))
+                (compact-run-component-streaming!
+                 e db-id index safe-epoch target-run-rows
+                 default-stream-limits refs)))
             wave)))
          (fn [results]
            (let [results (vec (array-seq results))
