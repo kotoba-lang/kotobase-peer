@@ -181,6 +181,7 @@
                             {:key conflicting-key :index index})))
         rows (->> candidate-rows distinct (sort-by #(get % "key")) vec)
         keys' (mapv #(get % "key") rows)
+        logical-keys (mapv row-logical-key rows)
         first-components (->> rows
                               (map #(component-text (first (get % "components"))))
                               sort vec)
@@ -213,6 +214,8 @@
                                          (:effects root)))
                    :index index :tenant (str tenant) :count (count rows)
                    :min-key (first keys') :max-key (peek keys')
+                   :logical-min (first logical-keys)
+                   :logical-max (peek logical-keys)
                    :rows rows :blocks blocks)
       component-min (assoc :first-component-min component-min
                            :first-component-max component-max)))))
@@ -279,13 +282,16 @@
 
 (defn run-ref
   "Manifest-safe metadata for a run returned by build-run."
-  [{:keys [cid bytes count min-key max-key first-component-min first-component-max
-           blocks]}]
+  [{:keys [cid bytes count min-key max-key logical-min logical-max
+           first-component-min first-component-max blocks]}]
   (cond-> {"cid" (ipld/link cid)
            "encoded-bytes" (byte-count bytes)
            "count" count
            "min-key" min-key
            "max-key" max-key}
+    logical-min
+    (assoc "logical-min" logical-min
+           "logical-max" logical-max)
     first-component-min
     (assoc "first-component-min" first-component-min
            "first-component-max" first-component-max)
@@ -406,13 +412,35 @@
                       #(str (ipld/link-cid (get % "cid")))))
        vec))
 
-(defn checkpoint-compaction-refs
-  "Return the canonical input refs for replacing INDEX in an inherited
-  checkpoint. Existing directory refs participate in the compaction, rather
-  than remaining as an ever-growing overlapping suffix."
+(defn- refs-overlap? [left right]
+  (let [left-min (get left "logical-min")
+        left-max (get left "logical-max")
+        right-min (get right "logical-min")
+        right-max (get right "logical-max")]
+    (or (some nil? [left-min left-max right-min right-max])
+        (and (not (pos? (compare left-min right-max)))
+             (not (pos? (compare right-min left-max)))))))
+
+(defn checkpoint-compaction-selection
+  "Select only inherited refs overlapping the new L0 ranges. Non-overlapping
+  refs remain immutable directory entries and must not be read or rewritten.
+  Missing legacy bounds conservatively select the ref for compaction."
   [new-refs inherited-directory index]
-  (canonical-run-refs
-   (concat new-refs (range-directory-refs inherited-directory index))))
+  (let [new-refs (canonical-run-refs new-refs)
+        inherited (range-directory-refs inherited-directory index)
+        {overlap true untouched false}
+        (group-by
+         (fn [old-ref]
+           (boolean (some #(refs-overlap? % old-ref) new-refs)))
+         inherited)]
+    {:inputs (canonical-run-refs (concat new-refs overlap))
+     :untouched (canonical-run-refs untouched)}))
+
+(defn checkpoint-compaction-refs
+  "Compatibility projection of checkpoint-compaction-selection."
+  [new-refs inherited-directory index]
+  (:inputs
+   (checkpoint-compaction-selection new-refs inherited-directory index)))
 
 (defn merge-range-directory-indexes
   "Replace every index present in NEW-INDEXES and preserve untouched inherited

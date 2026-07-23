@@ -1345,24 +1345,41 @@
                                       (fn [compacted]
                                         (let [current
                                               (index-run-refs manifests index)
-                                              inputs
+                                              selection
                                               (if inherited
-                                                (lsm/checkpoint-compaction-refs
+                                                (lsm/checkpoint-compaction-selection
                                                  current (:directory inherited)
                                                  index)
-                                                current)]
+                                                {:inputs current
+                                                 :untouched []})]
                                           (-> (compact-index-ranges!
                                                e db-id index safe-epoch
-                                               target-run-rows inputs)
-                                              (.then #(assoc compacted index %)))))))
+                                               target-run-rows
+                                               (:inputs selection))
+                                              (.then
+                                               #(assoc compacted index
+                                                       (assoc %
+                                                              :untouched
+                                                              (:untouched
+                                                               selection)))))))))
                                   (js/Promise.resolve {})
                                   present)
                                   (.then
                                    (fn [compaction-results]
-                                     (let [compacted
+                                     (let [output-indexes
                                            (into {}
                                                  (map (fn [[index result]]
                                                         [index (:refs result)]))
+                                                 compaction-results)
+                                           compacted
+                                           (into {}
+                                                 (map
+                                                  (fn [[index result]]
+                                                    [index
+                                                     (vec
+                                                      (concat
+                                                       (:refs result)
+                                                       (:untouched result)))]))
                                                  compaction-results)
                                            stream-metrics
                                            (reduce
@@ -1391,7 +1408,7 @@
                                                     :indexes (into {}
                                                                    (map (fn [[index runs]]
                                                                           [index {:l1 runs}]))
-                                                                   compacted)
+                                                                   output-indexes)
                                                     :statistics
                                                     {"operation" "window-compaction"
                                                      "range-directory" (ipld/link (:cid directory))
@@ -1405,7 +1422,10 @@
                                                                   [(name k) v]))
                                                            stream-metrics)
                                                      "output-run-count"
-                                                     (reduce + (map count (vals compacted)))}})
+                                                     (reduce +
+                                                             (map count
+                                                                  (vals
+                                                                   output-indexes)))}})
                                          base-effects (concat (:effects directory)
                                                               (:effects manifest))]
                                      (-> (if publication

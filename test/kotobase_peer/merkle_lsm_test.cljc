@@ -92,6 +92,32 @@
                   {:db-id "db" :epoch 2 :indexes b})))
         "equivalent retries converge on one directory CID")))
 
+(deftest checkpoint-selection-reuses-non-overlapping-directory-ranges
+  (let [entry (fn [entity]
+                {:components [entity "name" entity]
+                 :epoch 1 :op :assert :value entity})
+        alice (lsm/build-run :eavt "t" [(entry "alice")])
+        zara (lsm/build-run :eavt "t" [(entry "zara")])
+        bob (lsm/build-run :eavt "t" [(entry "bob")])
+        alice-v2 (lsm/build-run
+                  :eavt "t" [(assoc (entry "alice") :epoch 2)])
+        directory
+        (:node (lsm/build-range-directory
+                {:db-id "db" :epoch 1 :indexes {:eavt [alice zara]}}))
+        append-selection
+        (lsm/checkpoint-compaction-selection
+         [(lsm/run-ref bob)] directory :eavt)
+        overlap-selection
+        (lsm/checkpoint-compaction-selection
+         [(lsm/run-ref alice-v2)] directory :eavt)]
+    (is (= [(lsm/run-ref bob)] (:inputs append-selection)))
+    (is (= #{(lsm/run-ref alice) (lsm/run-ref zara)}
+           (set (:untouched append-selection)))
+        "append-only ranges do not reread existing checkpoint blocks")
+    (is (= #{(lsm/run-ref alice) (lsm/run-ref alice-v2)}
+           (set (:inputs overlap-selection))))
+    (is (= [(lsm/run-ref zara)] (:untouched overlap-selection)))))
+
 (deftest range-directory-version-and-ownership-fail-closed
   (let [directory (:node (lsm/build-range-directory
                           {:db-id "db" :epoch 4 :indexes {}}))]
