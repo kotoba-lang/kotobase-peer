@@ -1599,9 +1599,10 @@
               :safe-epoch (:safe-epoch oracle)
               :retention-active-by-kind (:active-by-kind oracle)
               :retention-clock-skew-ms (:clock-skew-ms oracle)
-              :candidate-keys (into candidates
-                                    (concat stale-resumable-pointer-keys
-                                            stale-ingress-pointer-keys))
+              :candidate-keys (->> (concat candidates
+                                           stale-resumable-pointer-keys
+                                           stale-ingress-pointer-keys)
+                                   distinct sort vec)
               :block-candidates (count candidates)
               :pointer-candidates (+ (count stale-resumable-pointer-keys)
                                      (count stale-ingress-pointer-keys))
@@ -1611,6 +1612,36 @@
         (.catch (fn [error]
                   (js/Promise.reject
                    (js/Error. (str "GC mark audit failed: " error))))))))
+
+(defn- delete-confirmed-inventory!
+  [e bucket snapshot-before result first-candidates grace-ms now-ms]
+  (-> (gc-root-snapshot! e bucket)
+      (.then
+       (fn [snapshot-after]
+         (if (not= snapshot-before snapshot-after)
+           (assoc result :deleted 0 :inventory-passes 1
+                  :aborted :roots-changed)
+           (-> (gc-audit! e bucket snapshot-after grace-ms now-ms)
+               (.then
+                (fn [{second-candidates :candidate-keys}]
+                  (-> (gc-root-snapshot! e bucket)
+                      (.then
+                       (fn [snapshot-final]
+                         (cond
+                           (not= snapshot-after snapshot-final)
+                           (assoc result :deleted 0 :inventory-passes 2
+                                  :aborted :roots-changed)
+
+                           (not= first-candidates second-candidates)
+                           (assoc result :deleted 0 :inventory-passes 2
+                                  :aborted :inventory-changed)
+
+                           :else
+                           (-> (.delete bucket (clj->js first-candidates))
+                               (.then
+                                #(assoc result
+                                        :deleted (count first-candidates)
+                                        :inventory-passes 2)))))))))))))))
 
 (defn gc-unreachable!
   "Globally mark from every mutable R2 head, resumable execution checkpoint,
@@ -1634,18 +1665,13 @@
             (try
               (-> (gc-audit! e bucket snapshot-before grace-ms now-ms)
                   (.then
-                   (fn [{:keys [candidate-keys] :as audit}]
+                   (fn [{first-candidates :candidate-keys :as audit}]
                      (let [result (dissoc audit :candidate-keys)]
-                       (if (and delete? (seq candidate-keys))
-                         (-> (gc-root-snapshot! e bucket)
-                             (.then
-                              (fn [snapshot-after]
-                                (if (= snapshot-before snapshot-after)
-                                  (-> (.delete bucket (clj->js candidate-keys))
-                                      (.then #(assoc result :deleted
-                                                     (count candidate-keys))))
-                                  (assoc result :deleted 0 :aborted :roots-changed)))))
-                         (assoc result :deleted 0))))))
+                       (if (and delete? (seq first-candidates))
+                         (delete-confirmed-inventory!
+                          e bucket snapshot-before result first-candidates
+                          grace-ms now-ms)
+                         (assoc result :deleted 0 :inventory-passes 1))))))
               (catch :default error
                 (js/Promise.reject
                  (js/Error. (str "GC audit setup failed: " error))))))))

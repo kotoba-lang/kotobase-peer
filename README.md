@@ -158,10 +158,13 @@ conditional `PutObject`; enable that path explicitly with
 `MERKLE_S3_CONDITIONAL_HEAD=true`. R2 remains the default CAS implementation.
 Reachability GC walks IPLD links from every R2 head because immutable blocks are
 deduplicated in one shared prefix. It only considers objects older than a
-caller-supplied grace period, supports a dry audit, and re-reads the complete
-sorted head/ETag snapshot immediately before deletion. Any head change fences
-the sweep; the grace period protects blocks written before a concurrent head
-publication. Publishers must upload their immutable blocks before HeadCAS.
+caller-supplied grace period and supports a dry audit. Delete mode requires the
+complete sorted head/root/ETag snapshot to remain unchanged and independently
+recomputes reachability plus the sorted candidate inventory a second time.
+Only byte-for-byte equal candidate key vectors are deleted; a head/root change
+or candidate appearing/disappearing aborts the sweep. The grace period protects
+fresh blocks written before a concurrent head publication. Publishers must
+upload their immutable blocks before HeadCAS.
 The authenticated `/bench/orphan-gc` drill uses an isolated prefix and
 cleans it in `finally`; the 2026-07-22 real-R2 run marked 2 heads and 4 live
 blocks, found/deleted exactly 1 orphan, retained all 4 live blocks, and took
