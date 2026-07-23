@@ -1,0 +1,56 @@
+{:date "2026-07-23"
+ :backend :cloudflare-r2
+ :bucket "kotobase-merkle-lsm"
+ :scope "isolated bench/database-resumable-restore/20260723 prefix"
+ :worker {:name "kotobase-database-resumable-restore-drill-20260723"
+          :version "99f448b8-a463-4d1e-9885-e8af1de4eada"}
+ :inventory {:format "kotobase/database-backup-inventory"
+             :version 2
+             :cid "bafyreiaguwzuoa5bkrqoqlxxooumhkrp5ci5c3dop2rcdkbkqophcsdq6m"
+             :page-cid "bafyreie54rfqevbj4ae5orsdmfj756s3ggjuriiaagqmzjtzdssbcay6p4"
+             :head-cid "bafyreidwbug74x3ofzl3b3p73okrbgrej7rodiucsbaltqwcvkp6o2vnju"
+             :base-cid "bafyreibzbrqizqp6do4fcd36i576hj54xsxwckftcx6rvqyximjp6bl72a"
+             :entries 12
+             :blocks 11
+             :objects 1
+             :content-bytes 10628}
+ :drill {:deleted-head true
+         :deleted-retention-root true
+         :deleted-primary-entries 12
+         :page-step {:status 202
+                     :elapsed-ms 1978.449}
+         :verification-step {:status 202
+                             :elapsed-ms 1523.291}
+         :publication-step {:status 200
+                            :elapsed-ms 1432.436
+                            :restored 12
+                            :head-created true}
+         :terminal-replay {:status 200
+                           :elapsed-ms 416.634
+                           :idempotent true}
+         :transaction-replay {:verified true
+                              :elapsed-ms 294.574}}
+ :gc-drill {:opaque-object-reachability :verified
+            :first-sweep {:reachable 12
+                          :deleted 8}
+            :after-retention-release {:reachable 0
+                                      :deleted-blocks 11}
+            :finding "The live sweep exposed that objects/ was marked as an opaque CID namespace but was not listed as a sweep namespace."
+            :correction {:namespaces ["blocks" "objects"]
+                         :backup-before-delete true
+                         :restore-cid-verification true
+                         :local-cljs-tests {:tests 246
+                                            :assertions 957
+                                            :failures 0
+                                            :errors 0}}}
+ :verification {:jvm {:tests 241
+                      :assertions 761
+                      :failures 0
+                      :errors 0}
+                :lint {:errors 0}
+                :claim-limit "The live restore proves phased R2 correctness and replay behavior for this 12-entry fixture. The objects/ sweep correction is covered by the worker integration test and still requires a post-correction live R2 sweep before production qualification."}
+ :cleanup {:primary-entries :explicitly-deleted
+           :immutable-backup-objects :explicitly-deleted
+           :inventory-root-and-pages :explicitly-deleted
+           :gc-artifacts :explicitly-deleted
+           :temporary-worker :deleted}}

@@ -14,6 +14,40 @@
     (is (= "test-prefix/blocks/bafy-block" (worker/block-key env "bafy-block")))
     (is (= "test-prefix/objects/bafy-pack" (worker/object-key env "bafy-pack")))))
 
+(deftest reachability-treats-materialized-objects-as-opaque-cid-leaves
+  (async done
+    (let [object-bytes (ipld/encode {"opaque-pack" true})
+          object-cid (str (ipld/cid object-bytes))
+          root-bytes
+          (ipld/encode {"pack" (ipld/link object-cid)})
+          root-cid (str (ipld/cid root-bytes))
+          values {(str "opaque/blocks/" root-cid) root-bytes
+                  (str "opaque/objects/" object-cid) object-bytes}
+          bucket
+          #js {:get
+               (fn [key]
+                 (js/Promise.resolve
+                  (when-let [bytes (get values key)]
+                    #js {:arrayBuffer
+                         (fn []
+                           (js/Promise.resolve
+                            (.slice (.-buffer bytes)
+                                    (.-byteOffset bytes)
+                                    (+ (.-byteOffset bytes)
+                                       (.-byteLength bytes)))))})))}
+          env #js {"MERKLE_BUCKET" bucket
+                   "MERKLE_S3_PREFIX" "opaque"}]
+      (-> (worker/reachable-cids! env root-cid)
+          (.then
+           (fn [reachable]
+             (is (= #{root-cid object-cid} reachable))
+             (done)))
+          (.catch
+           (fn [error]
+             (is false
+                 (str "opaque reachability rejected: " error))
+             (done)))))))
+
 (deftest entity-readers-apply-mvcc-and-tombstones-across-manifests
   (async done
     (let [first-plan (lsm/flush-plan
@@ -1142,8 +1176,11 @@
           ingress-workload (ipld/cid ingress-workload-bytes)
           orphan-bytes (ipld/encode {"orphan" true})
           orphan (ipld/cid orphan-bytes)
+          orphan-object-bytes (ipld/encode {"opaque-orphan" true})
+          orphan-object (ipld/cid orphan-object-bytes)
           prefix "test/"
           block-key #(str prefix "blocks/" %)
+          object-key #(str prefix "objects/" %)
           objects (atom {(str prefix "heads/db-a") root-a
                          (str prefix "heads/db-b") root-b
                          (str prefix "scheduler/resumable/db-a/task/current")
@@ -1166,7 +1203,8 @@
                          (block-key checkpoint) checkpoint-bytes
                          (block-key resumable-child) resumable-child-bytes
                          (block-key ingress-workload) ingress-workload-bytes
-                         (block-key orphan) orphan-bytes})
+                         (block-key orphan) orphan-bytes
+                         (object-key orphan-object) orphan-object-bytes})
           bytes-object (fn [value]
                          #js {:arrayBuffer
                               (fn []
@@ -1213,16 +1251,19 @@
                    (is (= 1 (:ingress-roots audit)))
                    (is (= 1 (:active-ingress-roots audit)))
                    (is (= 7 (:reachable audit)))
-                   (is (= 1 (:candidates audit)) "only the orphan is collectible")
+                   (is (= 2 (:candidates audit)))
+                   (is (= 1 (:block-candidates audit)))
+                   (is (= 1 (:object-candidates audit)))
                    (is (= 0 (:deleted audit)))
                    (is (= 1 (:inventory-passes audit)))
                    (worker/gc-unreachable! env "db-a" 0 true)))
           (.then (fn [sweep]
-                   (is (= 1 (:deleted sweep)))
+                   (is (= 2 (:deleted sweep)))
                    (is (= 2 (:inventory-passes sweep)))
-                   (is (= 1 (:backed-up sweep)))
+                   (is (= 2 (:backed-up sweep)))
                    (is (string? (:backup-inventory sweep)))
                    (is (nil? (get @objects (block-key orphan))))
+                   (is (nil? (get @objects (object-key orphan-object))))
                    (is (every? #(contains? @objects (block-key %))
                                [root-a child-a root-b child-b
                                 checkpoint resumable-child ingress-workload])
@@ -1230,14 +1271,18 @@
                    (-> (worker/restore-gc-inventory!
                         env (:backup-inventory sweep))
                        (.then (fn [restored]
-                                (is (= 1 (:restored restored)))
+                                (is (= 2 (:restored restored)))
                                 (is (= orphan
                                        (ipld/cid
                                         (get @objects (block-key orphan)))))
+                                (is (= orphan-object
+                                       (ipld/cid
+                                        (get @objects
+                                             (object-key orphan-object)))))
                                 (worker/restore-gc-inventory!
                                  env (:backup-inventory sweep))))
                        (.then (fn [replayed]
-                                (is (= 1 (:already-present replayed)))
+                                (is (= 2 (:already-present replayed)))
                                 (let [backup-key
                                       (worker/gc-backup-object-key env orphan)
                                       good-backup (get @objects backup-key)]
@@ -1259,6 +1304,7 @@
                                          (swap! objects assoc backup-key
                                                 good-backup))))))))))
           (.then (fn [_]
+                   (swap! objects dissoc (object-key orphan-object))
                    (let [second-orphan-bytes (ipld/encode {"orphan" 2})
                          second-orphan (ipld/cid second-orphan-bytes)
                          block-list-calls (atom 0)

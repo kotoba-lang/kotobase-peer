@@ -2159,10 +2159,42 @@
      (js/Error. "Resumable execution currently requires an R2 binding"))))
 
 (defn reachable-cids!
-  "Walk decoded IPLD links from ROOT-CID and return a Promise<set<CID>>."
+  "Walk decoded block links from ROOT-CID and return a Promise<set<CID>>.
+  Materialized packs live under objects/, are CID-verified opaque leaves, and
+  must not be decoded as DAG-CBOR blocks."
   [e root-cid]
-  (let [seen (atom #{})]
-    (letfn [(walk [frontier]
+  (let [seen (atom #{})
+        bucket (env e "MERKLE_BUCKET")]
+    (letfn [(object-bytes [stored]
+              (-> (.arrayBuffer stored)
+                  (.then #(js/Uint8Array. %))))
+            (verified-links [cid bytes decode?]
+              (when-not (= cid (str (ipld/cid bytes)))
+                (throw
+                 (ex-info "Reachability object CID mismatch"
+                          {:cid cid})))
+              (if decode?
+                (lsm/linked-cids (ipld/decode bytes))
+                []))
+            (read-links [cid]
+              (-> (.get bucket (block-key e cid))
+                  (.then
+                   (fn [block]
+                     (if block
+                       (-> (object-bytes block)
+                           (.then #(verified-links cid % true)))
+                       (-> (.get bucket (object-key e cid))
+                           (.then
+                            (fn [object]
+                              (if object
+                                (-> (object-bytes object)
+                                    (.then
+                                     #(verified-links cid % false)))
+                                (js/Promise.reject
+                                 (ex-info
+                                  "Reachability object not found"
+                                  {:cid cid})))))))))))
+            (walk [frontier]
               (let [fresh (vec (remove @seen frontier))]
                 (if (empty? fresh)
                   (js/Promise.resolve @seen)
@@ -2170,12 +2202,15 @@
                     (swap! seen into fresh)
                     (-> (js/Promise.all
                          (clj->js
-                          (map #(-> (get-node! e %)
-                                    (.then lsm/linked-cids))
-                               fresh)))
+                          (map read-links fresh)))
                         (.then (fn [links]
                                  (walk (into #{} cat (js->clj links))))))))))]
-      (if root-cid (walk [root-cid]) (js/Promise.resolve #{})))))
+      (cond
+        (nil? root-cid) (js/Promise.resolve #{})
+        (nil? bucket)
+        (js/Promise.reject
+         (js/Error. "Reachability GC requires an R2 binding"))
+        :else (walk [root-cid])))))
 
 (defn- list-r2-blocks! [bucket prefix]
   (letfn [(page [cursor acc]
@@ -2430,21 +2465,26 @@
          #js [(-> (js/Promise.all
                     (clj->js (map #(reachable-cids! e %) root-cids)))
                    (.then (fn [sets] (into #{} cat (array-seq sets)))))
-              (list-r2-blocks! bucket (str (prefix e) "blocks/"))])
+              (list-r2-blocks! bucket (str (prefix e) "blocks/"))
+              (list-r2-blocks! bucket (str (prefix e) "objects/"))])
         (.then
          (fn [result]
            (let [reachable (aget result 0)
-                 candidates
-                 (->> (aget result 1)
-                      (filter
-                       (fn [object]
-                         (let [key (gobj/get object "key")
-                               cid (last (str/split key #"/"))
-                               uploaded (gobj/get object "uploaded")]
-                           (and (not (contains? reachable cid))
-                                uploaded
-                                (< (.getTime uploaded) cutoff)))))
-                      (mapv #(gobj/get % "key")))]
+                 candidates-for
+                 (fn [objects]
+                   (->> objects
+                        (filter
+                         (fn [object]
+                           (let [key (gobj/get object "key")
+                                 cid (last (str/split key #"/"))
+                                 uploaded (gobj/get object "uploaded")]
+                             (and (not (contains? reachable cid))
+                                  uploaded
+                                  (< (.getTime uploaded) cutoff)))))
+                        (mapv #(gobj/get % "key"))))
+                 block-candidates (candidates-for (aget result 1))
+                 object-candidates (candidates-for (aget result 2))
+                 data-candidates (into block-candidates object-candidates)]
              {:reachable (count reachable)
               :heads (count heads)
               :resumable-roots (count resumable-roots)
@@ -2463,17 +2503,18 @@
               :safe-epoch (:safe-epoch oracle)
               :retention-active-by-kind (:active-by-kind oracle)
               :retention-clock-skew-ms (:clock-skew-ms oracle)
-              :candidate-keys (->> (concat candidates
+              :candidate-keys (->> (concat data-candidates
                                            stale-resumable-pointer-keys
                                            stale-database-restore-pointer-keys
                                            stale-ingress-pointer-keys)
                                    distinct sort vec)
-              :block-candidates (count candidates)
+              :block-candidates (count block-candidates)
+              :object-candidates (count object-candidates)
               :pointer-candidates (+ (count stale-resumable-pointer-keys)
                                      (count
                                       stale-database-restore-pointer-keys)
                                      (count stale-ingress-pointer-keys))
-              :candidates (+ (count candidates)
+              :candidates (+ (count data-candidates)
                              (count stale-resumable-pointer-keys)
                              (count
                               stale-database-restore-pointer-keys)
@@ -2493,19 +2534,23 @@
 (defn- restorable-gc-key? [e key]
   (some #(str/starts-with? key %)
         [(str (prefix e) "blocks/")
+         (str (prefix e) "objects/")
          (str (prefix e) "scheduler/resumable/")
          (str (prefix e) "scheduler/database-restore/")
          (str (prefix e) "scheduler/ingress/")]))
 
 (defn- verify-gc-entry-bytes! [e key expected-cid bytes]
   (let [actual (str (ipld/cid bytes))
-        block-prefix (str (prefix e) "blocks/")]
+        cid-key-prefix
+        (some #(when (str/starts-with? key %) %)
+              [(str (prefix e) "blocks/")
+               (str (prefix e) "objects/")])]
     (when-not (= expected-cid actual)
       (throw (ex-info "GC backup content CID mismatch"
                       {:key key :expected expected-cid :actual actual})))
-    (when (and (str/starts-with? key block-prefix)
-               (not= (subs key (count block-prefix)) actual))
-      (throw (ex-info "GC block key does not match its content CID"
+    (when (and cid-key-prefix
+               (not= (subs key (count cid-key-prefix)) actual))
+      (throw (ex-info "GC content-addressed key does not match its content CID"
                       {:key key :actual actual})))
     bytes))
 
@@ -3872,8 +3917,8 @@
   explicitly released pointers are swept after the same grace period and
   two-snapshot fence as unreachable blocks. Queued/running ingress driver
   workloads remain roots through their deadline; failed/expired job pointers
-  follow the same fenced sweep. It then optionally sweeps shared
-  blocks older than GRACE-MS. Leased reader and
+  follow the same fenced sweep. It then optionally sweeps shared IPLD blocks
+  and opaque materialized objects older than GRACE-MS. Leased reader and
   replication roots expire at NOW-MS; legal-hold and release roots remain until
   CAS-released. A second complete head/root ETag snapshot fences detected
   publication, renewal, and release races. DB-ID remains for source compatibility."
