@@ -607,14 +607,46 @@
                    (is (= 7 (:reachable audit)))
                    (is (= 1 (:candidates audit)) "only the orphan is collectible")
                    (is (= 0 (:deleted audit)))
+                   (is (= 1 (:inventory-passes audit)))
                    (worker/gc-unreachable! env "db-a" 0 true)))
           (.then (fn [sweep]
                    (is (= 1 (:deleted sweep)))
+                   (is (= 2 (:inventory-passes sweep)))
                    (is (nil? (get @objects (block-key orphan))))
                    (is (every? #(contains? @objects (block-key %))
                                [root-a child-a root-b child-b
                                 checkpoint resumable-child ingress-workload])
                        "other heads and resumable checkpoint graphs survive")
+                   (let [second-orphan-bytes (ipld/encode {"orphan" 2})
+                         second-orphan (ipld/cid second-orphan-bytes)
+                         block-list-calls (atom 0)
+                         changing-bucket
+                         #js {:get (fn [key] (.get bucket key))
+                              :list
+                              (fn [opts]
+                                (when (= (.-prefix opts) (str prefix "blocks/"))
+                                  (when (= 2 (swap! block-list-calls inc))
+                                    (swap! objects assoc
+                                           (block-key second-orphan)
+                                           second-orphan-bytes)))
+                                (.list bucket opts))
+                              :delete (fn [keys] (.delete bucket keys))}
+                         changing-env #js {"MERKLE_BUCKET" changing-bucket
+                                           "MERKLE_S3_PREFIX" "test"}]
+                     (swap! objects assoc (block-key orphan) orphan-bytes)
+                     (-> (worker/gc-unreachable!
+                          changing-env "db-a" 0 true)
+                         (.then (fn [result]
+                                  (assoc result
+                                         :second-orphan second-orphan)))))))
+          (.then (fn [{:keys [second-orphan] :as changed}]
+                   (is (= :inventory-changed (:aborted changed)))
+                   (is (= 2 (:inventory-passes changed)))
+                   (is (= 0 (:deleted changed)))
+                   (is (contains? @objects (block-key orphan)))
+                   (is (contains? @objects (block-key second-orphan)))
+                   (swap! objects dissoc (block-key orphan)
+                          (block-key second-orphan))
                    (swap! objects assoc
                           (str prefix "scheduler/resumable/db-a/task/current")
                           (js/JSON.stringify
@@ -639,6 +671,7 @@
                    (is (= 3 (:block-candidates stale-sweep)))
                    (is (= 2 (:pointer-candidates stale-sweep)))
                    (is (= 5 (:deleted stale-sweep)))
+                   (is (= 2 (:inventory-passes stale-sweep)))
                    (is (nil? (get @objects
                                   (str prefix
                                        "scheduler/resumable/db-a/task/current"))))
