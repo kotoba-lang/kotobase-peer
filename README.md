@@ -177,6 +177,16 @@ reports the effective minimum safe epoch, and fences sweep when either a head
 or registry ETag changes. `compact-head!` uses the same minimum epoch, so a
 pinned snapshot is protected from both version pruning and physical block GC.
 
+RangeDirectory v1 is a compaction boundary, not another manifest level. A
+later window stops before that boundary, compacts every inherited ref for each
+index it updates, and atomically replaces that index in the next directory;
+untouched indexes remain inherited. CID deduplication and canonical ref order
+make equivalent retries converge on one directory CID instead of accumulating
+overlapping stale refs. Direct legacy VersionManifest chains remain readable
+and become v1 directories on compaction. A directory with a future version,
+wrong database, or epoch beyond its owning manifest fails closed until an
+explicit format migrator is provided.
+
 Production compaction is scheduled with one deterministic task CID per
 database head and compaction bounds. The R2 host claims a per-database lease
 with ETag CAS, fences active contenders, renews only running leases, reclaims

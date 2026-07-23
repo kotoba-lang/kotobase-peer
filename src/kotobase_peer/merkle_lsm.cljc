@@ -118,18 +118,26 @@
   (when-not (pos-int? block-rows)
     (throw (ex-info "Run block rows must be a positive integer"
                     {:block-rows block-rows})))
-  (let [rows (->> entries
-                  (map (fn [{:keys [components epoch op value]}]
-                         (when-not (#{:assert :retract} op)
-                           (throw (ex-info "Merkle-LSM entry op must be :assert or :retract"
-                                           {:op op})))
-                         {"key" (canonical-key index tenant components epoch)
-                          "components" (vec components)
-                          "epoch" epoch
-                          "op" (name op)
-                          "value" value}))
-                  (sort-by #(get % "key"))
-                  vec)
+  (let [candidate-rows
+        (mapv (fn [{:keys [components epoch op value]}]
+                (when-not (#{:assert :retract} op)
+                  (throw (ex-info
+                          "Merkle-LSM entry op must be :assert or :retract"
+                          {:op op})))
+                {"key" (canonical-key index tenant components epoch)
+                 "components" (vec components)
+                 "epoch" epoch
+                 "op" (name op)
+                 "value" value})
+              entries)
+        conflicting-key
+        (some (fn [[key same-key]]
+                (when (< 1 (count (distinct same-key))) key))
+              (group-by #(get % "key") candidate-rows))
+        _ (when conflicting-key
+            (throw (ex-info "Conflicting rows share one physical key"
+                            {:key conflicting-key :index index})))
+        rows (->> candidate-rows distinct (sort-by #(get % "key")) vec)
         keys' (mapv #(get % "key") rows)
         first-components (->> rows
                               (map #(component-text (first (get % "components"))))
@@ -313,10 +321,59 @@
         (map (fn [[index refs]] [(keyword index) (vec refs)]))
         (get directory "indexes")))
 
+(defn validate-range-directory
+  "Validate the v1 checkpoint boundary before it participates in compaction.
+  Legacy manifest chains contain no directory and need no migration; unknown
+  future directory versions fail closed until an explicit migrator exists."
+  [directory expected-db-id maximum-epoch]
+  (let [index-names (set (map name indexes))]
+    (when-not (and (= "kotobase/range-directory" (get directory "format"))
+                   (= format-version (get directory "version"))
+                   (= (str expected-db-id) (get directory "db-id"))
+                   (integer? (get directory "epoch"))
+                   (<= 0 (get directory "epoch") maximum-epoch)
+                   (map? (get directory "indexes"))
+                   (every? index-names (keys (get directory "indexes")))
+                   (every? vector? (vals (get directory "indexes")))
+                   (every? (fn [refs]
+                             (every? #(and (map? %)
+                                           (ipld/link? (get % "cid")))
+                                     refs))
+                           (vals (get directory "indexes"))))
+      (throw (ex-info "Invalid or unsupported range directory"
+                      {:expected-db-id (str expected-db-id)
+                       :maximum-epoch maximum-epoch
+                       :directory directory})))
+    directory))
+
+(defn- canonical-run-refs [refs]
+  (->> refs
+       (reduce (fn [by-cid ref]
+                 (assoc by-cid (str (ipld/link-cid (get ref "cid"))) ref))
+               {})
+       vals
+       (sort-by (juxt #(or (get % "min-key") "")
+                      #(or (get % "max-key") "")
+                      #(str (ipld/link-cid (get % "cid")))))
+       vec))
+
+(defn checkpoint-compaction-refs
+  "Return the canonical input refs for replacing INDEX in an inherited
+  checkpoint. Existing directory refs participate in the compaction, rather
+  than remaining as an ever-growing overlapping suffix."
+  [new-refs inherited-directory index]
+  (canonical-run-refs
+   (concat new-refs (range-directory-refs inherited-directory index))))
+
 (defn merge-range-directory-indexes
-  "Prepend newly compacted refs to an inherited checkpoint directory."
+  "Replace every index present in NEW-INDEXES and preserve untouched inherited
+  indexes. Refs are CID-deduplicated and canonically ordered, so retry and
+  input enumeration order converge on the same directory CID."
   [new-indexes inherited-directory]
-  (merge-with into new-indexes (range-directory-indexes inherited-directory)))
+  (let [inherited (range-directory-indexes inherited-directory)]
+    (into (sorted-map)
+          (map (fn [[index refs]] [index (canonical-run-refs refs)]))
+          (merge inherited new-indexes))))
 
 (defn build-manifest
   "Build VersionManifest v1. INDEXES maps :eavt/:aevt/:avet/:vaet to level
