@@ -390,6 +390,9 @@
              (lsm/row-logical-key first-row))
           (= (get descriptor "logical-max") (get block "logical-max")
              (lsm/row-logical-key last-row))
+          (or (nil? (get descriptor "encoded-bytes"))
+              (= (get descriptor "encoded-bytes")
+                 (.-byteLength (ipld/encode block))))
           (or (nil? expected-index)
               (= (name expected-index) (get block "index")))
           (or (nil? expected-tenant)
@@ -641,13 +644,14 @@
   AFTER is the opaque logical-key cursor returned by the previous page."
   [e db-id index prefixes
    {:keys [after limit max-depth head-cid block-remainder remainder-max-bytes
-           block-get-concurrency]
+           block-get-concurrency block-get-max-wave-bytes]
     :or {limit 256 max-depth 256 block-remainder [] remainder-max-bytes 0
-         block-get-concurrency 4}}]
+         block-get-concurrency 4 block-get-max-wave-bytes 4194304}}]
   (let [prefixes (vec (distinct (map vec prefixes)))]
     (when-not (and (lsm/indexes index) (seq prefixes) (pos-int? limit)
                    (pos-int? max-depth)
                    (pos-int? block-get-concurrency)
+                   (pos-int? block-get-max-wave-bytes)
                    (nat-int? remainder-max-bytes)
                    (valid-block-remainder? block-remainder)
                    (or (zero? remainder-max-bytes)
@@ -662,6 +666,7 @@
                        :limit limit :max-depth max-depth
                        :head-cid head-cid
                        :block-get-concurrency block-get-concurrency
+                       :block-get-max-wave-bytes block-get-max-wave-bytes
                        :remainder-max-bytes remainder-max-bytes})))
     (-> (if head-cid
           (resolve-database-snapshot! e head-cid)
@@ -739,13 +744,54 @@
                                                                  {:cid cid :block block
                                                                   :descriptor descriptor}))
                                              fetched? (update :fetched-blocks inc)
+                                             (and fetched?
+                                                  (pos-int?
+                                                   (get descriptor
+                                                        "encoded-bytes")))
+                                             (update :fetched-block-bytes +
+                                                     (get descriptor
+                                                          "encoded-bytes"))
+                                             (and fetched?
+                                                  (not (pos-int?
+                                                        (get descriptor
+                                                             "encoded-bytes"))))
+                                             (update
+                                              :unknown-fetched-block-bytes inc)
                                              (not (skip-block? candidates descriptor))
                                              (assoc :candidates
                                                     (lsm/visible-page-add-run
                                                      candidates rows query-epoch after
                                                      limit matches-prefix?)))))
+                                       (take-wave [eligible]
+                                         (reduce
+                                          (fn [planned candidate]
+                                            (let [estimate
+                                                  (or (get-in candidate
+                                                              [:descriptor
+                                                               "encoded-bytes"])
+                                                      block-get-max-wave-bytes)
+                                                  next-bytes
+                                                  (+ (reduce
+                                                      + 0
+                                                      (map
+                                                       #(or
+                                                         (get-in
+                                                          % [:descriptor
+                                                             "encoded-bytes"])
+                                                         block-get-max-wave-bytes)
+                                                       planned))
+                                                     estimate)]
+                                              (if (or
+                                                   (>= (count planned)
+                                                       block-get-concurrency)
+                                                   (and (seq planned)
+                                                        (> next-bytes
+                                                           block-get-max-wave-bytes)))
+                                                (reduced planned)
+                                                (conj planned candidate))))
+                                          [] eligible))
                                        (fold-block-waves [state queues]
-                                         (let [planned
+                                         (let [eligible
                                                (->> queues
                                                     (keep-indexed
                                                      (fn [queue-index descriptors]
@@ -756,13 +802,12 @@
                                                                       (:candidates state) %)
                                                                     descriptors))]
                                                          {:queue-index queue-index
-                                                         :descriptor (first remaining)
+                                                          :descriptor (first remaining)
                                                           :remaining (vec (rest remaining))})))
                                                     (sort-by (fn [{:keys [queue-index descriptor]}]
                                                                [(get descriptor "logical-min")
-                                                                queue-index]))
-                                                    (take block-get-concurrency)
-                                                    vec)]
+                                                                queue-index])))
+                                               planned (vec (take-wave eligible))]
                                            (if (empty? planned)
                                              (js/Promise.resolve state)
                                              (-> (mapv #(load-block! (:descriptor %))
@@ -781,7 +826,17 @@
                                                           (-> (reduce fold-loaded-block state loaded)
                                                               (update
                                                                :max-concurrent-block-gets max
-                                                               (count (filter #(nth % 2) loaded))))]
+                                                               (count (filter #(nth % 2) loaded)))
+                                                              (update
+                                                               :max-wave-block-bytes max
+                                                               (reduce
+                                                                + 0
+                                                                (keep
+                                                                 (fn [[descriptor _ fetched?]]
+                                                                   (when fetched?
+                                                                     (get descriptor
+                                                                          "encoded-bytes")))
+                                                                 loaded))))]
                                                       (fold-block-waves
                                                        next-state next-queues))))))))
                                        (fold-legacy-ref [pending ref]
@@ -800,12 +855,18 @@
                                                                matches-prefix?))
                                                        (update :scanned-runs inc)
                                                        (update :scanned-blocks inc)
-                                                       (update :fetched-blocks inc))))))))]
+                                                       (update :fetched-blocks inc)
+                                                       (update
+                                                        :unknown-fetched-block-bytes
+                                                        inc))))))))]
                                  (let [block-refs (filterv #(seq (get % "blocks")) selected)
                                        legacy-refs (filterv #(not (seq (get % "blocks"))) selected)
                                        initial {:candidates {} :scanned-runs 0
                                                 :scanned-blocks 0 :fetched-blocks 0
+                                                :fetched-block-bytes 0
+                                                :unknown-fetched-block-bytes 0
                                                 :max-concurrent-block-gets 0
+                                                :max-wave-block-bytes 0
                                                 :loaded-blocks {}}]
                                    (-> (reduce fold-legacy-ref
                                                (js/Promise.resolve initial)
@@ -826,8 +887,14 @@
                                                  :scanned-runs (:scanned-runs state)
                                                  :scanned-blocks (:scanned-blocks state)
                                                  :fetched-blocks (:fetched-blocks state)
+                                                 :fetched-block-bytes
+                                                 (:fetched-block-bytes state)
+                                                 :unknown-fetched-block-bytes
+                                                 (:unknown-fetched-block-bytes state)
                                                  :max-concurrent-block-gets
                                                  (:max-concurrent-block-gets state)
+                                                 :max-wave-block-bytes
+                                                 (:max-wave-block-bytes state)
                                                  :block-remainder
                                                  (bounded-block-remainder
                                                   (:loaded-blocks state)

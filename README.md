@@ -139,7 +139,10 @@ fully materialized hot `db` (backfill/migration tooling, tests).
 vertical slice replacing full-snapshot folding:
 
 Large immutable runs are stored as a small run root plus logical-key-aligned
-data blocks (128 rows by default).  The block descriptors are copied into the
+data blocks (128 rows and 1 MiB encoded bytes by default). Both bounds are
+applied to canonical encoded bytes, while one indivisible hot logical key may
+exceed them and is marked `oversized-logical-key`. Descriptors carry their
+verified encoded byte length. The block descriptors are copied into the
 manifest run reference, so a bounded prefix page can skip blocks wholly before
 its continuation without fetching the run root or replaying earlier data.
 Continuation reads are demand-only: a block is fetched after its descriptor is
@@ -148,8 +151,10 @@ successor GETs and keeps physical reads attributable to returned page work.
 Required heads from independent runs are fetched in bounded waves, ordered by
 logical minimum. `:block-get-concurrency` caps each wave (default 4), each run
 contributes at most one block to a wave, and the cutoff is recomputed before
-the next wave. Successor blocks from one run are therefore never prefetched in
-the same wave.
+the next wave. `:block-get-max-wave-bytes` (default 4 MiB) also caps the sum of
+descriptor bytes; legacy descriptors without byte metadata conservatively
+occupy a wave alone. Successor blocks from one run are therefore never
+prefetched in the same wave.
 With an explicit `:remainder-max-bytes` budget, a page may return the decoded
 current block as `:block-remainder`. A resumable host can persist that bounded
 value beside the logical cursor and supply it to the next page, avoiding a

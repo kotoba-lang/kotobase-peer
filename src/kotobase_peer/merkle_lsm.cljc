@@ -10,6 +10,7 @@
 (def format-version 1)
 (def indexes #{:eavt :aevt :avet :vaet})
 (def default-run-block-rows 128)
+(def default-run-block-bytes 1048576)
 (def ^:private max-safe-integer 9007199254740991)
 (def ^:private integer-width 16)
 
@@ -81,6 +82,10 @@
 
 (declare partition-logical-groups row-logical-key)
 
+(defn- byte-count [bytes]
+  #?(:clj (alength ^bytes bytes)
+     :cljs (.-byteLength bytes)))
+
 (defn- build-row-block [index tenant ordinal rows]
   (let [keys' (mapv #(get % "key") rows)
         logical-keys (mapv row-logical-key rows)
@@ -100,10 +105,43 @@
            :descriptor {"cid" (ipld/link (:cid encoded-block))
                         "ordinal" ordinal
                         "count" (count rows)
+                        "encoded-bytes" (byte-count (:bytes encoded-block))
                         "min-key" (first keys')
                         "max-key" (peek keys')
                         "logical-min" (first logical-keys)
                         "logical-max" (peek logical-keys)})))
+
+(defn- build-row-blocks
+  "Partition whole logical-key groups under row and exact encoded-byte targets.
+  Row-bounded batches are encoded once and bisected only when their canonical
+  bytes exceed the byte target, avoiding quadratic candidate re-encoding. A
+  single logical key remains indivisible and is explicitly marked oversized."
+  [index tenant groups block-rows max-block-bytes]
+  (letfn [(emit [ordinal grouped-rows]
+            (let [grouped-rows (vec grouped-rows)
+                  block (build-row-block
+                         index tenant ordinal (vec (mapcat identity grouped-rows)))
+                  byte-oversized? (> (get-in block [:descriptor "encoded-bytes"])
+                                     max-block-bytes)]
+              (if (and byte-oversized? (< 1 (count grouped-rows)))
+                (let [middle (quot (count grouped-rows) 2)
+                      [left-blocks next-ordinal]
+                      (emit ordinal (subvec grouped-rows 0 middle))
+                      [right-blocks final-ordinal]
+                      (emit next-ordinal (subvec grouped-rows middle))]
+                  [(into left-blocks right-blocks) final-ordinal])
+                [[(cond-> block
+                    (or byte-oversized?
+                        (> (get-in block [:descriptor "count"]) block-rows))
+                    (assoc-in [:descriptor "oversized-logical-key"] true))]
+                 (inc ordinal)])))]
+    (first
+     (reduce
+      (fn [[blocks ordinal] grouped-rows]
+        (let [[next-blocks next-ordinal] (emit ordinal grouped-rows)]
+          [(into blocks next-blocks) next-ordinal]))
+      [[] 0]
+      (partition-logical-groups block-rows groups)))))
 
 (defn build-run
   "Build a canonical immutable sorted run.
@@ -112,12 +150,16 @@
   Large runs use logical-key-aligned data blocks; effects put those blocks
   before the small run root. Inline legacy-compatible rows remain for small runs."
   ([index tenant entries]
-   (build-run index tenant entries {:block-rows default-run-block-rows}))
-  ([index tenant entries {:keys [block-rows]
-                          :or {block-rows default-run-block-rows}}]
-  (when-not (pos-int? block-rows)
-    (throw (ex-info "Run block rows must be a positive integer"
-                    {:block-rows block-rows})))
+   (build-run index tenant entries
+              {:block-rows default-run-block-rows
+               :max-block-bytes default-run-block-bytes}))
+  ([index tenant entries {:keys [block-rows max-block-bytes]
+                          :or {block-rows default-run-block-rows
+                               max-block-bytes default-run-block-bytes}}]
+  (when-not (and (pos-int? block-rows) (pos-int? max-block-bytes))
+    (throw (ex-info "Run block bounds must be positive integers"
+                    {:block-rows block-rows
+                     :max-block-bytes max-block-bytes})))
   (let [candidate-rows
         (mapv (fn [{:keys [components epoch op value]}]
                 (when-not (#{:assert :retract} op)
@@ -144,15 +186,14 @@
                               sort vec)
         component-min (first first-components)
         component-max (peek first-components)
-        blocks (when (> (count rows) block-rows)
-                 (->> rows
-                      (partition-by #(get % "components"))
-                      (partition-logical-groups block-rows)
-                      (map-indexed
-                       (fn [ordinal groups]
-                         (build-row-block index tenant ordinal
-                                          (vec (mapcat identity groups)))))
-                      vec))
+        inline-block (when (and (seq rows) (<= (count rows) block-rows))
+                       (build-row-block index tenant 0 rows))
+        blocks (when (or (> (count rows) block-rows)
+                         (> (get-in inline-block [:descriptor "encoded-bytes"] 0)
+                            max-block-bytes))
+                 (build-row-blocks
+                  index tenant (partition-by #(get % "components") rows)
+                  block-rows max-block-bytes))
         node (cond-> {"format" "kotobase/merkle-run"
                       "version" format-version
                       "index" (name index)
@@ -161,7 +202,8 @@
                       "min-key" (first keys')
                       "max-key" (peek keys')}
                blocks (assoc "blocks" (mapv :descriptor blocks)
-                             "block-rows" block-rows)
+                             "block-rows" block-rows
+                             "max-block-bytes" max-block-bytes)
                (nil? blocks) (assoc "rows" rows)
                component-min (assoc "first-component-min" component-min
                                     "first-component-max" component-max))
@@ -186,16 +228,18 @@
 (defn build-run-ranges
   "Build deterministic, logical-key-aligned runs of at most TARGET-ROWS.
   A single hot logical key may exceed the target rather than being split."
-  [index tenant target-rows entries]
-  (when-not (and (integer? target-rows) (pos? target-rows))
-    (throw (ex-info "Run target rows must be a positive integer"
-                    {:target-rows target-rows})))
-  (->> entries
-       (sort-by (fn [{:keys [components epoch]}]
-                  (canonical-key index tenant components epoch)))
-       (partition-by :components)
-       (partition-logical-groups target-rows)
-       (mapv #(build-run index tenant (mapcat identity %)))))
+  ([index tenant target-rows entries]
+   (build-run-ranges index tenant target-rows entries {}))
+  ([index tenant target-rows entries block-options]
+   (when-not (and (integer? target-rows) (pos? target-rows))
+     (throw (ex-info "Run target rows must be a positive integer"
+                     {:target-rows target-rows})))
+   (->> entries
+        (sort-by (fn [{:keys [components epoch]}]
+                   (canonical-key index tenant components epoch)))
+        (partition-by :components)
+        (partition-logical-groups target-rows)
+        (mapv #(build-run index tenant (mapcat identity %) block-options)))))
 
 (defn build-index-runs
   "Flush one immutable datom batch into covering index runs. DATOMS are
@@ -215,19 +259,23 @@
 
 (defn build-index-run-ranges
   "Flush one datom batch into bounded L0 ranges for every covering index."
-  [tenant epoch target-rows datoms]
-  (let [datoms (vec datoms)
-        general (fn [index]
-                  (build-run-ranges index tenant target-rows
-                                    (map #(datom-entry index epoch %) datoms)))
-        refs (filter #(ipld/link? (:v %)) datoms)]
-    (cond-> {:eavt (general :eavt)
-             :aevt (general :aevt)
-             :avet (general :avet)}
-      (seq refs) (assoc :vaet
-                        (build-run-ranges
-                         :vaet tenant target-rows
-                         (map #(datom-entry :vaet epoch %) refs))))))
+  ([tenant epoch target-rows datoms]
+   (build-index-run-ranges tenant epoch target-rows datoms {}))
+  ([tenant epoch target-rows datoms block-options]
+   (let [datoms (vec datoms)
+         general (fn [index]
+                   (build-run-ranges index tenant target-rows
+                                     (map #(datom-entry index epoch %) datoms)
+                                     block-options))
+         refs (filter #(ipld/link? (:v %)) datoms)]
+     (cond-> {:eavt (general :eavt)
+              :aevt (general :aevt)
+              :avet (general :avet)}
+       (seq refs) (assoc :vaet
+                         (build-run-ranges
+                          :vaet tenant target-rows
+                          (map #(datom-entry :vaet epoch %) refs)
+                          block-options))))))
 
 (defn run-ref
   "Manifest-safe metadata for a run returned by build-run."
@@ -416,14 +464,21 @@
   a VersionManifest, and ordered BlockPut...HeadCAS effects. No effect is
   executed here."
   [{:keys [db-id tenant epoch safe-epoch previous expected datoms statistics
-           target-run-rows]
-    :or {safe-epoch 0 statistics {} target-run-rows 4096}}]
+           target-run-rows block-rows max-block-bytes]
+    :or {safe-epoch 0 statistics {} target-run-rows 4096
+         block-rows default-run-block-rows
+         max-block-bytes default-run-block-bytes}}]
   (let [runs-by-index (build-index-run-ranges
-                       (or tenant db-id) epoch target-run-rows datoms)
+                       (or tenant db-id) epoch target-run-rows datoms
+                       {:block-rows block-rows
+                        :max-block-bytes max-block-bytes})
         manifest (build-manifest
                   {:db-id db-id :epoch epoch :safe-epoch safe-epoch
                    :previous previous
-                   :statistics (assoc statistics "l0-target-run-rows" target-run-rows)
+                   :statistics (assoc statistics
+                                      "l0-target-run-rows" target-run-rows
+                                      "run-block-rows" block-rows
+                                      "run-max-block-bytes" max-block-bytes)
                    :indexes (into {}
                                   (map (fn [[index runs]] [index {:l0 runs}]))
                                   runs-by-index)})

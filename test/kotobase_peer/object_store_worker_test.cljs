@@ -398,6 +398,9 @@
                                              (ipld/link-cid (get % "cid")))
                                        (get ref "blocks")))
                                 refs))
+          wave-byte-cap (apply max
+                               (map #(get-in % ["blocks" 0 "encoded-bytes"])
+                                    refs))
           gets (atom [])
           active (atom 0)
           max-active (atom 0)
@@ -435,7 +438,11 @@
              (is (= 2 (:scanned-runs page)))
              (is (= 2 (:scanned-blocks page)))
              (is (= 2 (:fetched-blocks page)))
+             (is (pos? (:fetched-block-bytes page)))
+             (is (zero? (:unknown-fetched-block-bytes page)))
              (is (= 2 (:max-concurrent-block-gets page)))
+             (is (= (:fetched-block-bytes page)
+                    (:max-wave-block-bytes page)))
              (is (= 2 @max-active)
                  "only independently selected runs overlap in one GET wave")
              (is (= 2 (count (filter data-cids @gets)))
@@ -453,6 +460,20 @@
                  "a concurrency cap of one is enforced by observed GETs")
              (is (= 2 (count (filter data-cids @gets)))
                  "serial and parallel waves fetch the same required blocks")
+             (reset! gets [])
+             (reset! max-active 0)
+             (worker/find-index-prefix-page!
+              env "db-wave" :aevt [["member"]]
+              {:limit 64 :block-get-concurrency 2
+               :block-get-max-wave-bytes wave-byte-cap})))
+          (.then
+           (fn [page]
+             (is (= 64 (count (:rows page))))
+             (is (= 1 (:max-concurrent-block-gets page))
+                 "the byte cap can reduce a nominally two-way wave")
+             (is (= 1 @max-active))
+             (is (<= (:max-wave-block-bytes page) wave-byte-cap))
+             (is (= 2 (count (filter data-cids @gets))))
              (done)))
           (.catch
            (fn [error]

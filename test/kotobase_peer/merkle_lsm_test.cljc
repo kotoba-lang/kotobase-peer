@@ -313,6 +313,39 @@
                 (partition 2 1 descriptors)))
     (is (= 300 (reduce + (map #(get % "count") descriptors))))))
 
+(deftest run-blocks-honor-canonical-encoded-byte-bound
+  (let [entries (mapv (fn [n]
+                        {:components ["member" (str "team-" n)
+                                      (apply str (repeat 160 (char (+ 65 (mod n 20)))))]
+                         :epoch 1 :op :assert :value n})
+                      (range 24))
+        run (lsm/build-run :aevt "tenant-bytes" entries
+                           {:block-rows 128 :max-block-bytes 2500})
+        descriptors (get-in run [:node "blocks"])]
+    (is (< 1 (count descriptors))
+        "byte pressure splits a run even below the row target")
+    (is (every? #(<= (get % "encoded-bytes") 2500) descriptors))
+    (is (= (mapv (fn [block]
+                   #?(:clj (alength ^bytes (:bytes block))
+                      :cljs (.-byteLength (:bytes block))))
+                 (:blocks run))
+           (mapv #(get % "encoded-bytes") descriptors)))
+    (is (= 24 (reduce + (map #(get % "count") descriptors))))))
+
+(deftest indivisible-hot-key-is-marked-when-it-exceeds-byte-bound
+  (let [run (lsm/build-run
+             :eavt "tenant-hot"
+             (mapv (fn [epoch]
+                     {:components ["hot" "history" (apply str (repeat 80 "x"))]
+                      :epoch epoch :op :assert :value epoch})
+                   (range 1 12))
+             {:block-rows 128 :max-block-bytes 256})
+        descriptor (first (get-in run [:node "blocks"]))]
+    (is (= 1 (count (get-in run [:node "blocks"]))))
+    (is (true? (get descriptor "oversized-logical-key")))
+    (is (> (get descriptor "encoded-bytes") 256))
+    (is (= 11 (get descriptor "count")))))
+
 (deftest partitioned-compaction-keeps-one-logical-key-whole
   (let [run (lsm/build-run :eavt "t"
                            (mapv (fn [epoch]
