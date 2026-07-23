@@ -145,6 +145,9 @@ its continuation without fetching the run root or replaying earlier data.
 Continuation reads are demand-only: a block is fetched after its descriptor is
 known to overlap the cursor and current page cutoff. This avoids speculative
 successor GETs and keeps physical reads attributable to returned page work.
+Callers may pass an immutable `:head-cid`; every page then resolves that legacy
+manifest or EpochPublication directly and never re-reads the mutable head. This
+is the snapshot-pinned path used by resumable remote queries.
 Legacy inline-row runs remain readable.  A single hot logical key is never
 split merely to meet the row target and can therefore produce an oversized
 block; that skew case remains an explicit compaction/query-planning boundary.

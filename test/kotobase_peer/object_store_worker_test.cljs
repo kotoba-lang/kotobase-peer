@@ -194,6 +194,15 @@
                    "the full reader validates the run root")
                (reset! gets [])
                (reset! track-concurrency? true)
+               (worker/find-index-prefix-page!
+                env "db-blocks" :aevt [["member"]]
+                {:limit 64 :head-cid head-cid})))
+            (.then
+             (fn [page]
+               (is (= 64 (count (:rows page))))
+               (is (not-any? #{"paged/heads/db-blocks"} @gets)
+                   "a pinned page never re-reads the mutable head")
+               (reset! gets [])
                (step nil [] [])))
             (.catch (fn [error]
                       (is false (str "subblock prefix page rejected: " error))

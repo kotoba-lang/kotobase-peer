@@ -264,6 +264,22 @@
                    :publication (when (publication/publication-node? node)
                                   node)}))))))))
 
+(defn resolve-database-snapshot!
+  "Resolve one caller-pinned immutable head without consulting the mutable
+  head key. HEAD-CID may identify either a legacy VersionManifest or an
+  EpochPublication."
+  [e head-cid]
+  (when-not (and (string? head-cid) (seq head-cid))
+    (throw (ex-info "Pinned database head CID must be non-empty"
+                    {:head-cid head-cid})))
+  (-> (get-node! e head-cid)
+      (.then
+       (fn [node]
+         {:head-cid head-cid
+          :base-cid (publication/base-manifest-cid node head-cid)
+          :etag nil
+          :publication (when (publication/publication-node? node) node)}))))
+
 (defn- load-publication-view-bundles!
   [e publication-node]
   (-> (mapv (fn [[view-id descriptor]]
@@ -584,17 +600,22 @@
   on demand. A continuation never speculatively fetches its successor block;
   only LIMIT+1 logical-key candidates survive between reads.
   AFTER is the opaque logical-key cursor returned by the previous page."
-  [e db-id index prefixes {:keys [after limit max-depth]
+  [e db-id index prefixes {:keys [after limit max-depth head-cid]
                            :or {limit 256 max-depth 256}}]
   (let [prefixes (vec (distinct (map vec prefixes)))]
     (when-not (and (lsm/indexes index) (seq prefixes) (pos-int? limit)
                    (pos-int? max-depth)
                    (or (nil? after) (string? after))
+                   (or (nil? head-cid)
+                       (and (string? head-cid) (seq head-cid)))
                    (every? #(and (seq %) (string? (first %))) prefixes))
       (throw (ex-info "Invalid bounded Merkle index prefix page"
                       {:index index :prefixes prefixes :after after
-                       :limit limit :max-depth max-depth})))
-    (-> (resolve-database-head! e db-id)
+                       :limit limit :max-depth max-depth
+                       :head-cid head-cid})))
+    (-> (if head-cid
+          (resolve-database-snapshot! e head-cid)
+          (resolve-database-head! e db-id))
         (.then
          (fn [{:keys [base-cid]}]
            (if-not base-cid
