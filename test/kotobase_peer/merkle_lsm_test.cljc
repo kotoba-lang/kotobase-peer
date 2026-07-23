@@ -161,6 +161,37 @@
             (lsm/select-run-refs-by-first-component
              (lsm/range-directory-page-descriptors root :eavt) "e0")))
         "an exact first component selects one bounded leaf")
+    (let [selection
+          (lsm/checkpoint-directory-page-selection
+           [(assoc (first refs) "cid"
+                   (ipld/link
+                    (:cid (lsm/build-run
+                           :eavt "t"
+                           [{:components ["e0" "name" "new"]
+                             :epoch 2 :op :assert :value "new"}]))))]
+           root :eavt)]
+      (is (= 1 (count (:selected-pages selection))))
+      (is (= 2 (count (:untouched-pages selection)))
+          "copy-on-write retains non-overlapping leaf CIDs")
+      (let [replacement
+            (first
+             (get
+              (lsm/build-range-directory-pages
+               {:db-id "db" :epoch 3 :indexes {:eavt [(first refs)]}
+                :page-refs 2})
+              "eavt"))
+            successor
+            (lsm/build-paged-range-directory-root
+             {:db-id "db" :epoch 3 :page-refs 2
+              :indexes
+              {:eavt
+               (conj (:untouched-pages selection)
+                     (:descriptor replacement))}})]
+        (is (= 1 (count (:effects successor)))
+            "copy-on-write publishes one new root, not retained leaves")
+        (is (every? (lsm/linked-cids (:node successor))
+                    (map #(ipld/link-cid (get % "cid"))
+                         (:untouched-pages selection))))))
     (is (every? (lsm/linked-cids root)
                 (map :cid pages))
         "the generic IPLD walker reaches every directory leaf")

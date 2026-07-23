@@ -1,0 +1,37 @@
+{:date "2026-07-23"
+ :feature :range-directory-copy-on-write-page-reuse
+ :runtime {:kind :jvm :samples 10}
+ :fixture {:refs-per-index-before 977
+           :refs-per-index-after 978
+           :indexes 3
+           :page-refs 128
+           :change :one-non-overlapping-range-per-index
+           :source "the final real-R2 1M checkpoint ref cardinality"}
+ :full-rebuild
+ {:page-puts 24
+  :put-bytes 613415
+  :p50-ms 3608.007791
+  :p95-ms 3701.991166}
+ :copy-on-write
+ {:page-gets 0
+  :page-puts 3
+  :reused-pages 24
+  :put-bytes 5204
+  :p50-ms 25.955458
+  :p95-ms 27.320792}
+ :improvement
+ {:page-put-reduction 0.875
+  :put-byte-reduction 0.991516
+  :p50-speedup 139.008}
+ :correctness
+ {:untouched-page-cids-preserved true
+  :new-root-links-reused-and-new-pages true
+  :missing-bounds-select-conservatively true
+  :page-get-concurrency-limit 4}
+ :claim
+ "For an append outside every existing page range at the observed 1M shape,
+ checkpoint metadata work is proportional to the three changed indexes: all
+ 24 prior leaves are retained by CID, no old leaf is fetched, and only three
+ leaves plus one root are written. Overlapping changes fetch/rewrite only the
+ intersecting leaves. This is an in-process metadata benchmark, not a 10M R2
+ throughput result."}
