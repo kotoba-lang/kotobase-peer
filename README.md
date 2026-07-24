@@ -278,6 +278,15 @@ fencing, renewal, expiry reclaim at attempt 2, immutable checkpointing, and
 terminal completion in 935 ms of measured R2 operations (p50 91 ms, p95 138
 ms; remote Worker request 1613 ms).
 
+Global `blocks/` and `objects/` collection also has a resumable bounded path:
+`step-resumable-global-gc!` persists its mark set, traversal frontier,
+candidate set, namespace cursor, and counters under a task-scoped R2 prefix.
+Each invocation lists at most 64 objects and advances one of marking,
+namespace scan, root-fenced backup-before-delete sweep, or mark cleanup. This
+keeps data-namespace and reachable-CID working sets independent of database
+size; the legacy whole-inventory `gc-unreachable!` remains available during
+host migration.
+
 Run `clojure -M:merkle-bench 1000 100000 10000000` for the ADR scale sweep;
 `MERKLE_BENCH_WRITERS` selects simulated concurrent flushers (default 32).
 For release evidence, prefer `npm run bench:merkle-scale`, which runs each

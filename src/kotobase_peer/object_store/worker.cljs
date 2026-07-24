@@ -66,6 +66,23 @@
 (defn database-backup-work-gc-pointer-key [e task-id]
   (str (prefix e) "scheduler/gc/database-backup-work/"
        (js/encodeURIComponent task-id) "/current"))
+(defn global-gc-work-prefix [e task-id]
+  (str (prefix e) "scheduler/gc/global/"
+       (js/encodeURIComponent task-id) "/"))
+(defn global-gc-pointer-key [e task-id]
+  (str (global-gc-work-prefix e task-id) "current"))
+(defn global-gc-mark-prefix [e task-id]
+  (str (global-gc-work-prefix e task-id) "marks/"))
+(defn global-gc-mark-key [e task-id cid]
+  (str (global-gc-mark-prefix e task-id) cid))
+(defn global-gc-frontier-prefix [e task-id]
+  (str (global-gc-work-prefix e task-id) "frontier/"))
+(defn global-gc-frontier-key [e task-id cid]
+  (str (global-gc-frontier-prefix e task-id) cid))
+(defn global-gc-candidate-prefix [e task-id]
+  (str (global-gc-work-prefix e task-id) "candidates/"))
+(defn global-gc-candidate-key [e task-id namespace cid]
+  (str (global-gc-candidate-prefix e task-id) namespace "/" cid))
 (defn retention-root-key [e db-id kind id]
   (str (prefix e) "roots/" (js/encodeURIComponent db-id) "/"
        (name kind) "/" (js/encodeURIComponent id)))
@@ -84,6 +101,7 @@
 (def database-backup-directory-bytes (* 64 1024))
 (def database-backup-frontier-list-limit 64)
 (def database-backup-work-gc-list-limit 64)
+(def global-gc-step-limit 64)
 
 (defn- b2-config [e]
   (when (every? #(seq (env e %))
@@ -2478,6 +2496,409 @@
       (.catch (fn [error]
                 (js/Promise.reject
                  (js/Error. (str "GC root snapshot failed: " error)))))))
+
+(defn- gc-live-root-state
+  [e {:keys [heads roots resumable-roots database-restore-roots
+           database-backup-roots ingress-roots]}
+   grace-ms now-ms]
+  (let [head-by-key (into {} (map (juxt :key :value)) heads)
+        oracle (retention/safe-epoch-oracle
+                (mapv :root roots) now-ms (retention-clock-skew-ms e))
+        active-root-nodes (set (:active-roots oracle))
+        active-roots (filterv #(contains? active-root-nodes (:root %)) roots)
+        active-resumable-roots
+        (filterv (fn [{:keys [db-id expected-head status]}]
+                   (and (contains? #{"running" "completed"} status)
+                        (= expected-head
+                           (get head-by-key (head-key e db-id)))))
+                 resumable-roots)
+        active-database-restore-roots
+        (filterv
+         (fn [{:keys [target-db-id expected-head status]}]
+           (let [current (get head-by-key (head-key e target-db-id))]
+             (and (contains? #{"running" "verifying" "ready-to-publish"}
+                             status)
+                  (or (nil? current) (= expected-head current)))))
+         database-restore-roots)
+        active-ingress-roots
+        (filterv (fn [{:keys [status deadline-at]}]
+                   (and (contains? #{"queued" "running"} status)
+                        (> (or deadline-at 0) now-ms)))
+                 ingress-roots)
+        root-cids
+        (->> (concat (map :value heads)
+                     (map #(get-in % [:root "manifest-cid"]) active-roots)
+                     (map :checkpoint active-resumable-roots)
+                     (map :checkpoint active-database-restore-roots)
+                     (map :workload active-ingress-roots))
+             (remove nil?) distinct sort vec)
+        stable
+        {:heads (mapv #(select-keys % [:key :etag :value]) heads)
+         :roots (mapv #(select-keys % [:key :etag :root]) roots)
+         :resumable-roots
+         (mapv #(select-keys % [:key :etag :expected-head :status :checkpoint])
+               resumable-roots)
+         :database-restore-roots
+         (mapv #(select-keys % [:key :etag :expected-head :status :checkpoint])
+               database-restore-roots)
+         :database-backup-roots
+         (mapv #(select-keys % [:key :etag :head-cid :status])
+               database-backup-roots)
+         :ingress-roots
+         (mapv #(select-keys % [:key :etag :deadline-at :status :workload])
+               ingress-roots)}]
+    {:root-cids root-cids
+     :root-token (str (ipld/cid (ipld/encode stable)))
+     :cutoff (- now-ms grace-ms)}))
+
+(defn- read-reachability-links! [e cid]
+  (let [bucket (env e "MERKLE_BUCKET")
+        bytes! (fn [stored]
+                 (-> (.arrayBuffer stored)
+                     (.then #(js/Uint8Array. %))))
+        verified
+        (fn [bytes decode?]
+          (when-not (= cid (str (ipld/cid bytes)))
+            (throw (ex-info "Reachability object CID mismatch" {:cid cid})))
+          (if decode? (lsm/linked-cids (ipld/decode bytes)) []))]
+    (-> (.get bucket (block-key e cid))
+        (.then
+         (fn [block]
+           (if block
+             (-> (bytes! block) (.then #(verified % true)))
+             (-> (.get bucket (object-key e cid))
+                 (.then
+                  (fn [object]
+                    (if object
+                      (-> (bytes! object) (.then #(verified % false)))
+                      (js/Promise.reject
+                       (ex-info "Reachability object not found" {:cid cid}))))))))))))
+
+(defn- put-create-only! [bucket key value]
+  (.put bucket key value #js {:onlyIf #js {:etagDoesNotMatch "*"}}))
+
+(defn- read-global-gc-pointer! [e task-id]
+  (let [bucket (env e "MERKLE_BUCKET")]
+    (-> (.get bucket (global-gc-pointer-key e task-id))
+        (.then
+         (fn [stored]
+           (when stored
+             (-> (.text stored)
+                 (.then
+                  (fn [text]
+                    {:pointer (js->clj (js/JSON.parse text))
+                     :etag (gobj/get stored "etag")})))))))))
+
+(defn- cas-global-gc-pointer! [e task-id pointer etag]
+  (let [opts (if etag
+               #js {:onlyIf #js {:etagMatches etag}}
+               #js {:onlyIf #js {:etagDoesNotMatch "*"}})]
+    (-> (.put (env e "MERKLE_BUCKET")
+              (global-gc-pointer-key e task-id)
+              (js/JSON.stringify (clj->js pointer)) opts)
+        (.then boolean))))
+
+(defn- list-r2-page! [bucket prefix cursor]
+  (-> (.list bucket
+             (clj->js (cond-> {:prefix prefix :limit global-gc-step-limit}
+                        cursor (assoc :cursor cursor))))
+      (.then
+       (fn [result]
+         {:objects (vec (array-seq (gobj/get result "objects")))
+          :truncated? (boolean (gobj/get result "truncated"))
+          :cursor (gobj/get result "cursor")}))))
+
+(defn- seed-global-gc! [e task-id root-cids]
+  (let [bucket (env e "MERKLE_BUCKET")]
+    (reduce
+     (fn [pending cid]
+       (.then pending
+              (fn [_]
+                (-> (put-create-only!
+                     bucket (global-gc-mark-key e task-id cid) "")
+                    (.then
+                     (fn [_]
+                       (put-create-only!
+                        bucket (global-gc-frontier-key e task-id cid) "")))))))
+     (js/Promise.resolve nil) root-cids)))
+
+(defn- mark-global-gc-page! [e task-id]
+  (let [bucket (env e "MERKLE_BUCKET")
+        frontier-prefix (global-gc-frontier-prefix e task-id)]
+    (-> (list-r2-page! bucket frontier-prefix nil)
+        (.then
+         (fn [{:keys [objects]}]
+           (if (empty? objects)
+             {:empty? true :processed 0}
+             (-> (reduce
+                  (fn [pending object]
+                    (.then
+                     pending
+                     (fn [processed]
+                       (let [key (gobj/get object "key")
+                             cid (subs key (count frontier-prefix))]
+                         (-> (read-reachability-links! e cid)
+                             (.then
+                              (fn [links]
+                                (reduce
+                                 (fn [p child]
+                                   (.then
+                                    p
+                                    (fn [_]
+                                      (-> (put-create-only!
+                                           bucket
+                                           (global-gc-mark-key e task-id child)
+                                           "")
+                                          (.then
+                                           (fn [created]
+                                             (when created
+                                               (put-create-only!
+                                                bucket
+                                                (global-gc-frontier-key
+                                                 e task-id child)
+                                                ""))))))))
+                                 (js/Promise.resolve nil)
+                                 (into [] links))))
+                             (.then
+                              (fn [_]
+                                (-> (.delete bucket key)
+                                    (.then (fn [_] (inc processed)))))))))))
+                  (js/Promise.resolve 0) objects)
+                 (.then #(hash-map :empty? false :processed %)))))))))
+
+(defn- scan-global-gc-page! [e task-id namespace cursor cutoff]
+  (let [bucket (env e "MERKLE_BUCKET")
+        data-prefix (str (prefix e) namespace "/")]
+    (-> (list-r2-page! bucket data-prefix cursor)
+        (.then
+         (fn [{:keys [objects truncated? cursor]}]
+           (-> (reduce
+                (fn [pending object]
+                  (.then
+                   pending
+                   (fn [candidates]
+                     (let [key (gobj/get object "key")
+                           cid (subs key (count data-prefix))
+                           uploaded (gobj/get object "uploaded")]
+                       (-> (.get bucket (global-gc-mark-key e task-id cid))
+                           (.then
+                            (fn [mark]
+                              (if (or mark (nil? uploaded)
+                                      (>= (.getTime uploaded) cutoff))
+                                candidates
+                                (-> (put-create-only!
+                                     bucket
+                                     (global-gc-candidate-key
+                                      e task-id namespace cid)
+                                     key)
+                                    (.then (fn [_] (inc candidates))))))))))))
+                (js/Promise.resolve 0) objects)
+               (.then
+                (fn [candidates]
+                  {:scanned (count objects)
+                   :candidates candidates
+                   :truncated? truncated?
+                   :cursor cursor}))))))))
+
+(declare backup-and-delete-candidates!)
+
+(defn- sweep-global-gc-page! [e task-id root-token now-ms]
+  (let [bucket (env e "MERKLE_BUCKET")
+        candidate-prefix (global-gc-candidate-prefix e task-id)]
+    (-> (list-r2-page! bucket candidate-prefix nil)
+        (.then
+         (fn [{:keys [objects]}]
+           (if (empty? objects)
+             {:empty? true :deleted 0}
+             (-> (gc-root-snapshot! e bucket)
+                 (.then
+                  (fn [snapshot]
+                    (let [current-token
+                          (:root-token
+                           (gc-live-root-state e snapshot 0 now-ms))]
+                      (if-not (= root-token current-token)
+                        {:aborted :roots-changed :deleted 0}
+                        (-> (js/Promise.all
+                             (clj->js
+                              (mapv
+                               (fn [object]
+                                 (-> (.get bucket (gobj/get object "key"))
+                                     (.then
+                                      (fn [stored]
+                                        (when stored (.text stored))))))
+                               objects)))
+                            (.then
+                             (fn [keys]
+                               (let [candidates
+                                     (vec (remove nil? (array-seq keys)))]
+                                 (-> (backup-and-delete-candidates!
+                                      e bucket {} candidates now-ms)
+                                     (.then
+                                      (fn [result]
+                                        (-> (.delete
+                                             bucket
+                                             (clj->js
+                                              (mapv #(gobj/get % "key")
+                                                    objects)))
+                                            (.then
+                                             (fn [_]
+                                               (assoc result
+                                                      :empty? false))))))))))))))))))))))
+
+(defn- cleanup-global-gc-page! [e task-id]
+  (let [bucket (env e "MERKLE_BUCKET")]
+    (-> (list-r2-page! bucket (global-gc-mark-prefix e task-id) nil)
+        (.then
+         (fn [{:keys [objects]}]
+           (if (empty? objects)
+             {:empty? true :cleaned 0}
+             (-> (.delete bucket
+                          (clj->js (mapv #(gobj/get % "key") objects)))
+                 (.then
+                  (fn [_] {:empty? false :cleaned (count objects)})))))))))
+
+(defn step-resumable-global-gc!
+  "Advance one bounded global blocks/objects GC step. Reachability, frontier,
+  candidates and namespace progress live in R2; no invocation materializes the
+  complete data namespace or reachable CID set."
+  ([e task-id grace-ms delete?]
+   (step-resumable-global-gc! e task-id grace-ms delete? (js/Date.now)))
+  ([e task-id grace-ms delete? now-ms]
+   (when-not (and (string? task-id) (seq task-id)
+                  (<= (count task-id) 256)
+                  (integer? grace-ms) (not (neg? grace-ms))
+                  (boolean? delete?)
+                  (integer? now-ms) (not (neg? now-ms)))
+     (throw (ex-info "Invalid resumable global GC request"
+                     {:task-id task-id :grace-ms grace-ms
+                      :delete? delete? :now-ms now-ms})))
+   (if-let [bucket (env e "MERKLE_BUCKET")]
+     (-> (read-global-gc-pointer! e task-id)
+         (.then
+          (fn [current]
+            (if-not current
+              (-> (gc-root-snapshot! e bucket)
+                  (.then
+                   (fn [snapshot]
+                     (let [{:keys [root-cids root-token cutoff]}
+                           (gc-live-root-state e snapshot grace-ms now-ms)
+                           pointer
+                           {"format" "kotobase/resumable-global-gc"
+                            "version" 1 "task-id" task-id
+                            "phase" "marking"
+                            "root-token" root-token
+                            "cutoff" cutoff "delete" (boolean delete?)
+                            "scanned" 0 "candidates" 0 "deleted" 0}]
+                       (-> (seed-global-gc! e task-id root-cids)
+                           (.then
+                            (fn [_]
+                              (-> (cas-global-gc-pointer!
+                                   e task-id pointer nil)
+                                  (.then
+                                   (fn [written?]
+                                     {:status (if written? :started :fenced)
+                                      :phase :marking
+                                      :roots (count root-cids)}))))))))))
+              (let [{:keys [pointer etag]} current
+                    phase (get pointer "phase")
+                    advance
+                    (fn [next response]
+                      (-> (cas-global-gc-pointer! e task-id next etag)
+                          (.then
+                           (fn [written?]
+                             (assoc response
+                                    :status (if written? :advanced :fenced))))))]
+                (case phase
+                  "marking"
+                  (-> (mark-global-gc-page! e task-id)
+                      (.then
+                       (fn [{:keys [empty? processed]}]
+                         (if empty?
+                           (advance (assoc pointer "phase" "scanning"
+                                                   "namespace" "blocks"
+                                                   "cursor" nil)
+                                    {:phase :scanning :namespace :blocks})
+                           {:status :advanced :phase :marking
+                            :processed processed}))))
+
+                  "scanning"
+                  (let [namespace (get pointer "namespace")
+                        cursor (get pointer "cursor")]
+                    (-> (scan-global-gc-page!
+                         e task-id namespace cursor (get pointer "cutoff"))
+                        (.then
+                         (fn [{:keys [scanned candidates truncated? cursor]}]
+                           (let [next
+                                 (-> pointer
+                                     (update "scanned" + scanned)
+                                     (update "candidates" + candidates))]
+                             (if truncated?
+                               (advance (assoc next "cursor" cursor)
+                                        {:phase :scanning
+                                         :namespace (keyword namespace)
+                                         :scanned scanned
+                                         :candidates candidates})
+                               (if (= namespace "blocks")
+                                 (advance (assoc next "namespace" "objects"
+                                                      "cursor" nil)
+                                          {:phase :scanning
+                                           :namespace :objects
+                                           :scanned scanned
+                                           :candidates candidates})
+                                 (advance (assoc next "phase"
+                                                    (if (get pointer "delete")
+                                                      "sweeping" "cleanup")
+                                                    "cursor" nil)
+                                          {:phase (if (get pointer "delete")
+                                                    :sweeping :cleanup)
+                                           :scanned scanned
+                                           :candidates candidates}))))))))
+
+                  "sweeping"
+                  (-> (sweep-global-gc-page!
+                       e task-id (get pointer "root-token") now-ms)
+                      (.then
+                       (fn [{:keys [empty? deleted aborted] :as result}]
+                         (cond
+                           aborted (advance (assoc pointer "phase" "aborted"
+                                                          "aborted" (name aborted))
+                                            {:phase :aborted :aborted aborted})
+                           empty? (advance (assoc pointer "phase" "cleanup")
+                                           {:phase :cleanup})
+                           :else
+                           (advance (update pointer "deleted" + deleted)
+                                    (select-keys result
+                                                 [:deleted :backed-up
+                                                  :backup-inventory]))))))
+
+                  "cleanup"
+                  (-> (cleanup-global-gc-page! e task-id)
+                      (.then
+                       (fn [{:keys [empty? cleaned]}]
+                         (if empty?
+                           (advance (assoc pointer "phase" "completed")
+                                    {:phase :completed
+                                     :scanned (get pointer "scanned")
+                                     :candidates (get pointer "candidates")
+                                     :deleted (get pointer "deleted")})
+                           {:status :advanced :phase :cleanup
+                            :cleaned cleaned}))))
+
+                  "completed"
+                  {:status :completed :phase :completed
+                   :scanned (get pointer "scanned")
+                   :candidates (get pointer "candidates")
+                   :deleted (get pointer "deleted")}
+
+                  "aborted"
+                  {:status :aborted :phase :aborted
+                   :aborted (keyword (get pointer "aborted"))}
+
+                  (js/Promise.reject
+                   (ex-info "Unknown resumable global GC phase"
+                            {:phase phase}))))))))
+     (js/Promise.reject
+      (js/Error. "Resumable global GC currently requires an R2 binding")))))
 
 (defn- gc-audit! [e bucket
                   {:keys [heads roots resumable-roots
