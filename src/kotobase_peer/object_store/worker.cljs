@@ -83,6 +83,13 @@
   (str (global-gc-work-prefix e task-id) "candidates/"))
 (defn global-gc-candidate-key [e task-id namespace cid]
   (str (global-gc-candidate-prefix e task-id) namespace "/" cid))
+(defn global-gc-root-catalog-prefix [e task-id]
+  (str (global-gc-work-prefix e task-id) "root-catalog/"))
+(defn global-gc-root-catalog-pointer-key [e task-id]
+  (str (global-gc-root-catalog-prefix e task-id) "current"))
+(defn global-gc-root-catalog-record-key [e task-id namespace source-key]
+  (str (global-gc-root-catalog-prefix e task-id) "records/" namespace "/"
+       (js/encodeURIComponent source-key)))
 (defn retention-root-key [e db-id kind id]
   (str (prefix e) "roots/" (js/encodeURIComponent db-id) "/"
        (name kind) "/" (js/encodeURIComponent id)))
@@ -2607,6 +2614,109 @@
          {:objects (vec (array-seq (gobj/get result "objects")))
           :truncated? (boolean (gobj/get result "truncated"))
           :cursor (gobj/get result "cursor")}))))
+
+(def global-gc-root-catalogs
+  [["heads" "heads/"]
+   ["roots" "roots/"]
+   ["resumable" "scheduler/resumable/"]
+   ["database-restore" "scheduler/database-restore/"]
+   ["database-backup" "scheduler/database-backup/"]
+   ["ingress" "scheduler/ingress/"]])
+
+(defn step-global-gc-root-catalog!
+  "Copy one bounded page of mutable GC-root metadata into task-scoped R2
+  records. The catalog is an external restart boundary; consumers validate and
+  interpret records only after every namespace reaches `completed`."
+  [e task-id]
+  (let [bucket (env e "MERKLE_BUCKET")
+        pointer-key (global-gc-root-catalog-pointer-key e task-id)]
+    (when-not (and bucket (string? task-id) (seq task-id)
+                   (<= (count task-id) 256))
+      (throw (ex-info "Invalid global GC root catalog request"
+                      {:task-id task-id})))
+    (-> (.get bucket pointer-key)
+        (.then
+         (fn [stored]
+           (if-not stored
+             (let [pointer {"format" "kotobase/global-gc-root-catalog"
+                            "version" 1 "task-id" task-id
+                            "catalog-index" 0 "scanned" 0
+                            "status" "scanning"}]
+               (-> (put-create-only!
+                    bucket pointer-key
+                    (js/JSON.stringify (clj->js pointer)))
+                   (.then (fn [written]
+                            {:phase (if written :started :fenced)
+                             :scanned 0}))))
+             (-> (.text stored)
+                 (.then
+                  (fn [text]
+                    (let [pointer (js->clj (js/JSON.parse text))
+                          etag (gobj/get stored "etag")
+                          index (get pointer "catalog-index")]
+                      (if (= "completed" (get pointer "status"))
+                        {:phase :completed
+                         :scanned (get pointer "scanned")}
+                        (let [[catalog relative]
+                              (nth global-gc-root-catalogs index)
+                              cursor (get pointer "cursor")]
+                          (-> (list-r2-page!
+                               bucket (str (prefix e) relative) cursor)
+                              (.then
+                               (fn [{:keys [objects truncated? cursor]}]
+                                 (-> (reduce
+                                      (fn [pending object]
+                                        (.then
+                                         pending
+                                         (fn [_]
+                                           (let [key (gobj/get object "key")]
+                                             (-> (.get bucket key)
+                                                 (.then
+                                                  (fn [source]
+                                                    (when source
+                                                      (-> (.text source)
+                                                          (.then
+                                                           (fn [value]
+                                                             (put-create-only!
+                                                              bucket
+                                                              (global-gc-root-catalog-record-key
+                                                               e task-id catalog key)
+                                                              (js/JSON.stringify
+                                                               #js {:key key
+                                                                    :etag (gobj/get source "etag")
+                                                                    :value value}))))))))))))
+                                      (js/Promise.resolve nil) objects)
+                                     (.then
+                                      (fn [_]
+                                        (let [last? (and (not truncated?)
+                                                         (= index
+                                                            (dec (count
+                                                                  global-gc-root-catalogs))))
+                                              next (cond-> (update pointer "scanned"
+                                                                   + (count objects))
+                                                     truncated?
+                                                     (assoc "cursor" cursor)
+                                                     (not truncated?)
+                                                     (-> (assoc "catalog-index"
+                                                                (inc index))
+                                                         (dissoc "cursor"))
+                                                     last?
+                                                     (assoc "status" "completed"))]
+                                          (-> (.put bucket pointer-key
+                                                    (js/JSON.stringify
+                                                     (clj->js next))
+                                                    #js {:onlyIf
+                                                         #js {:etagMatches etag}})
+                                              (.then
+                                               (fn [written]
+                                                 {:phase
+                                                  (cond
+                                                    (nil? written) :fenced
+                                                    last? :completed
+                                                    :else :catalog-page)
+                                                  :catalog (keyword catalog)
+                                                  :page-count (count objects)
+                                                  :scanned (get next "scanned")})))))))))))))))))))))))
 
 (defn- seed-global-gc! [e task-id root-cids]
   (let [bucket (env e "MERKLE_BUCKET")]
