@@ -1485,14 +1485,33 @@
                  (doseq [key (js->clj keys)]
                    (swap! objects dissoc key))
                  (js/Promise.resolve nil))}
-          env #js {"MERKLE_BUCKET" bucket "MERKLE_S3_PREFIX" "test"}]
+          env #js {"MERKLE_BUCKET" bucket "MERKLE_S3_PREFIX" "test"}
+          gc-pointer-key
+          (worker/database-backup-work-gc-pointer-key env "gc-1")]
       (-> (worker/step-resumable-database-backup-work-gc!
            env "gc-1" 1000 10000)
           (.then
            (fn [started]
              (is (= :started (:phase started)))
+             (let [pointer
+                   (js->clj
+                    (js/JSON.parse (get @objects gc-pointer-key)))
+                   leased
+                   (assoc pointer
+                          "lease-owner" "other"
+                          "lease-token" "other-token"
+                          "lease-expires-at" 20000)]
+               (swap! objects assoc gc-pointer-key
+                      (js/JSON.stringify (clj->js leased)))
+               (swap! versions update gc-pointer-key (fnil inc 0)))
              (worker/step-resumable-database-backup-work-gc!
               env "gc-1" 1000 10000)))
+          (.then
+           (fn [leased]
+             (is (= :leased (:phase leased)))
+             (is (= :leased (:reason leased)))
+             (worker/step-resumable-database-backup-work-gc!
+              env "gc-1" 1000 20001)))
           (.then
            (fn [first-page]
              (is (= :deleted-page (:phase first-page)))

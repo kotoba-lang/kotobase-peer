@@ -2860,6 +2860,71 @@
                             (< (.getTime uploaded) cutoff)))))
                   (mapv #(gobj/get % "key")))))))))
 
+(defn- release-database-backup-work-gc-lease
+  [pointer]
+  (dissoc pointer "lease-owner" "lease-token" "lease-expires-at"))
+
+(defn- advance-resumable-database-backup-work-gc!
+  [e task-id grace-ms now-ms pointer etag]
+  (let [bucket (env e "MERKLE_BUCKET")
+        work-prefix (str (prefix e) "scheduler/database-backup/")
+        cutoff (- now-ms grace-ms)]
+    (-> (.list
+         bucket
+         (clj->js
+          (cond-> {:prefix work-prefix
+                   :limit database-backup-work-gc-list-limit}
+            (get pointer "cursor")
+            (assoc :cursor (get pointer "cursor")))))
+        (.then
+         (fn [listed]
+           (let [objects (vec (array-seq (gobj/get listed "objects")))
+                 truncated? (boolean (gobj/get listed "truncated"))
+                 next-cursor (when truncated? (gobj/get listed "cursor"))]
+             (-> (completed-database-backup-work-candidates!
+                  e bucket objects cutoff)
+                 (.then
+                  (fn [candidates]
+                    (if (seq candidates)
+                      (-> (backup-and-delete-candidates!
+                           e bucket {} candidates now-ms)
+                          (.then
+                           (fn [deleted]
+                             (let [next
+                                   (-> pointer
+                                       (update "scanned" + (count objects))
+                                       (update "deleted" + (:deleted deleted))
+                                       (assoc "last-backup-inventory"
+                                              (:backup-inventory deleted))
+                                       (dissoc "cursor")
+                                       release-database-backup-work-gc-lease)]
+                               (-> (cas-database-backup-work-gc-pointer!
+                                    e task-id next etag)
+                                   (.then
+                                    #(assoc %
+                                            :phase :deleted-page
+                                            :deleted (:deleted deleted)
+                                            :backup-inventory
+                                            (:backup-inventory deleted))))))))
+                      (let [next
+                            (cond-> (update pointer "scanned"
+                                            + (count objects))
+                              next-cursor (assoc "cursor" next-cursor)
+                              (nil? next-cursor)
+                              (-> (assoc "status" "completed"
+                                         "completed-at" now-ms)
+                                  (dissoc "cursor")))
+                            next (release-database-backup-work-gc-lease next)]
+                        (-> (cas-database-backup-work-gc-pointer!
+                             e task-id next etag)
+                            (.then
+                             #(assoc %
+                                     :phase
+                                     (if truncated?
+                                       :scan-progress
+                                       :completed)
+                                     :completed? (not truncated?)))))))))))))))
+
 (defn step-resumable-database-backup-work-gc!
   "Advance a durable, page-bounded sweep of terminal database-backup work.
   A step lists at most 64 R2 objects. When it deletes a page it resets the
@@ -2869,16 +2934,26 @@
    (step-resumable-database-backup-work-gc!
     e task-id grace-ms (js/Date.now)))
   ([e task-id grace-ms now-ms]
+   (step-resumable-database-backup-work-gc!
+    e task-id grace-ms now-ms
+    {:owner (str "gc-" (random-uuid))
+     :token (str (random-uuid))
+     :lease-ms 300000}))
+  ([e task-id grace-ms now-ms
+    {:keys [owner token lease-ms] :or {lease-ms 300000}}]
    (let [bucket (env e "MERKLE_BUCKET")
-         work-prefix (str (prefix e) "scheduler/database-backup/")
-         cutoff (- now-ms grace-ms)]
+         lease-expires-at (+ now-ms lease-ms)]
      (when-not (and bucket
                     (string? task-id) (seq task-id)
                     (integer? grace-ms) (not (neg? grace-ms))
-                    (integer? now-ms) (not (neg? now-ms)))
+                    (integer? now-ms) (not (neg? now-ms))
+                    (string? owner) (seq owner)
+                    (string? token) (seq token)
+                    (pos-int? lease-ms))
        (throw
         (ex-info "Invalid resumable database backup work GC request"
-                 {:task-id task-id :grace-ms grace-ms :now-ms now-ms})))
+                 {:task-id task-id :grace-ms grace-ms :now-ms now-ms
+                  :owner owner :lease-ms lease-ms})))
      (-> (read-database-backup-work-gc-pointer! e task-id)
          (.then
           (fn [{:keys [pointer etag]}]
@@ -2910,70 +2985,23 @@
                         {:expected (get pointer "grace-ms")
                          :actual grace-ms}))
 
+              (> (or (get pointer "lease-expires-at") 0) now-ms)
+              {:phase :leased :completed? false :reason :leased}
+
               :else
-              (-> (.list
-                   bucket
-                   (clj->js
-                    (cond-> {:prefix work-prefix
-                             :limit database-backup-work-gc-list-limit}
-                      (get pointer "cursor")
-                      (assoc :cursor (get pointer "cursor")))))
+              (let [claimed (assoc pointer
+                                   "lease-owner" owner
+                                   "lease-token" token
+                                   "lease-expires-at" lease-expires-at)]
+                (-> (cas-database-backup-work-gc-pointer!
+                     e task-id claimed etag)
                   (.then
-                   (fn [listed]
-                     (let [objects
-                           (vec (array-seq (gobj/get listed "objects")))
-                           truncated?
-                           (boolean (gobj/get listed "truncated"))
-                           next-cursor
-                           (when truncated? (gobj/get listed "cursor"))]
-                       (-> (completed-database-backup-work-candidates!
-                            e bucket objects cutoff)
-                           (.then
-                            (fn [candidates]
-                              (if (seq candidates)
-                                (-> (backup-and-delete-candidates!
-                                     e bucket {} candidates now-ms)
-                                    (.then
-                                     (fn [deleted]
-                                       (let [next
-                                             (-> pointer
-                                                 (update "scanned"
-                                                         + (count objects))
-                                                 (update "deleted"
-                                                         + (:deleted deleted))
-                                                 (assoc
-                                                  "last-backup-inventory"
-                                                  (:backup-inventory deleted))
-                                                 (dissoc "cursor"))]
-                                         (-> (cas-database-backup-work-gc-pointer!
-                                              e task-id next etag)
-                                             (.then
-                                              #(assoc %
-                                                      :phase :deleted-page
-                                                      :deleted
-                                                      (:deleted deleted)
-                                                      :backup-inventory
-                                                      (:backup-inventory
-                                                       deleted))))))))
-                                (let [next
-                                      (cond-> (update pointer "scanned"
-                                                      + (count objects))
-                                        next-cursor
-                                        (assoc "cursor" next-cursor)
-                                        (nil? next-cursor)
-                                        (-> (assoc "status" "completed"
-                                                   "completed-at" now-ms)
-                                            (dissoc "cursor")))]
-                                  (-> (cas-database-backup-work-gc-pointer!
-                                       e task-id next etag)
-                                      (.then
-                                       #(assoc %
-                                               :phase
-                                               (if truncated?
-                                                 :scan-progress
-                                                 :completed)
-                                               :completed?
-                                               (not truncated?))))))))))))))))))))
+                   (fn [claim]
+                     (if-not (:advanced? claim)
+                       (assoc claim :phase :leased)
+                       (advance-resumable-database-backup-work-gc!
+                        e task-id grace-ms now-ms
+                        claimed (:etag claim))))))))))))))
 
 (defn- validate-gc-inventory [e cid node]
   (let [entries (get node "candidates")]
