@@ -1540,6 +1540,153 @@
              (done)))
           (.catch done)))))
 
+(deftest resumable-global-gc-externalizes-marks-and-bounds-namespace-pages
+  (async done
+    (let [prefix "test/"
+          block (fn [node]
+                  (let [bytes (ipld/encode node)]
+                    {:bytes bytes :cid (str (ipld/cid bytes))}))
+          leaf-nodes (mapv (fn [n] (block {"leaf" n})) (range 70))
+          opaque-bytes (ipld/encode {"opaque" true})
+          opaque-cid (str (ipld/cid opaque-bytes))
+          root (block
+                {"format" "test/root"
+                 "children" (mapv #(ipld/link (:cid %)) leaf-nodes)
+                 "pack" (ipld/link opaque-cid)})
+          orphan (block {"orphan" true})
+          orphan-object-bytes (ipld/encode {"orphan-object" true})
+          orphan-object-cid (str (ipld/cid orphan-object-bytes))
+          entries
+          (atom
+           (into
+            {(str prefix "heads/db") (str (:cid root))
+             (str prefix "blocks/" (:cid root)) (:bytes root)
+             (str prefix "objects/" opaque-cid) opaque-bytes
+             (str prefix "blocks/" (:cid orphan)) (:bytes orphan)
+             (str prefix "objects/" orphan-object-cid) orphan-object-bytes}
+            (map (fn [{:keys [cid bytes]}]
+                   [(str prefix "blocks/" cid) bytes])
+                 leaf-nodes)))
+          versions (atom {})
+          max-listed (atom 0)
+          stored
+          (fn [key value]
+            #js {:etag (str "v" (get @versions key 0))
+                 :arrayBuffer
+                 (fn []
+                   (let [bytes (if (instance? js/Uint8Array value)
+                                 value
+                                 (.encode (js/TextEncoder.) value))]
+                     (js/Promise.resolve
+                      (.slice (.-buffer bytes) (.-byteOffset bytes)
+                              (+ (.-byteOffset bytes)
+                                 (.-byteLength bytes))))))
+                 :text
+                 (fn []
+                   (js/Promise.resolve
+                    (if (string? value)
+                      value
+                      (.decode (js/TextDecoder.) value))))})
+          bucket
+          #js {:get
+               (fn [key]
+                 (js/Promise.resolve
+                  (when-let [value (get @entries key)]
+                    (stored key value))))
+               :put
+               (fn [key value opts]
+                 (let [current (get @entries key)
+                       only-if (some-> opts .-onlyIf)
+                       matches (some-> only-if .-etagMatches)
+                       absent (some-> only-if .-etagDoesNotMatch)
+                       etag (str "v" (get @versions key 0))
+                       won? (cond
+                              matches (= matches etag)
+                              (= "*" absent) (nil? current)
+                              :else true)]
+                   (if-not won?
+                     (js/Promise.resolve nil)
+                     (let [value (if (instance? js/ArrayBuffer value)
+                                   (js/Uint8Array. value)
+                                   value)
+                           version (inc (get @versions key 0))]
+                       (swap! entries assoc key value)
+                       (swap! versions assoc key version)
+                       (js/Promise.resolve
+                        #js {:key key :etag (str "v" version)})))))
+               :list
+               (fn [opts]
+                 (let [wanted (.-prefix opts)
+                       limit (or (.-limit opts) 1000)
+                       offset (js/parseInt (or (.-cursor opts) "0"))
+                       keys (->> (keys @entries)
+                                 (filter #(str/starts-with? % wanted))
+                                 sort vec)
+                       page (subvec keys (min offset (count keys))
+                                    (min (count keys) (+ offset limit)))
+                       next-offset (+ offset (count page))
+                       truncated? (< next-offset (count keys))]
+                   (swap! max-listed max (count page))
+                   (js/Promise.resolve
+                    #js {:objects
+                         (clj->js
+                          (mapv (fn [key]
+                                  #js {:key key :uploaded (js/Date. 0)})
+                                page))
+                         :truncated truncated?
+                         :cursor (when truncated? (str next-offset))})))
+               :delete
+               (fn [keys]
+                 (doseq [key (if (string? keys) [keys] (js->clj keys))]
+                   (swap! entries dissoc key))
+                 (js/Promise.resolve nil))}
+          env #js {"MERKLE_BUCKET" bucket "MERKLE_S3_PREFIX" "test"}
+          task-id "bounded-global"
+          step! #(worker/step-resumable-global-gc!
+                  env task-id 0 true 10000)]
+      (letfn [(drive [remaining phases]
+                (if (zero? remaining)
+                  (js/Promise.reject (js/Error. "global GC did not finish"))
+                  (-> (step!)
+                      (.then
+                       (fn [result]
+                         (let [phases (conj phases (:phase result))]
+                           (if (= :completed (:phase result))
+                             {:result result :phases phases}
+                             (drive (dec remaining) phases))))))))]
+        (-> (drive 30 [])
+            (.then
+             (fn [{:keys [result phases]}]
+               (is (some #{:marking} phases))
+               (is (some #{:scanning} phases))
+               (is (some #{:sweeping} phases))
+               (is (some #{:cleanup} phases))
+               (is (= 74 (:scanned result)))
+               (is (= 2 (:candidates result)))
+               (is (= 2 (:deleted result)))
+               (is (<= @max-listed worker/global-gc-step-limit))
+               (is (contains? @entries
+                              (str prefix "blocks/" (:cid root))))
+               (is (every?
+                    #(contains? @entries (str prefix "blocks/" (:cid %)))
+                    leaf-nodes))
+               (is (contains? @entries
+                              (str prefix "objects/" opaque-cid)))
+               (is (nil? (get @entries
+                              (str prefix "blocks/" (:cid orphan)))))
+               (is (nil? (get @entries
+                              (str prefix "objects/" orphan-object-cid))))
+               (is (empty?
+                    (filter #(str/starts-with?
+                              % (worker/global-gc-mark-prefix env task-id))
+                            (keys @entries))))
+               (done)))
+            (.catch
+             (fn [error]
+               (is false (str "resumable global GC failed: " error "\n"
+                              (.-stack error)))
+               (done))))))))
+
 (deftest gc-marks-every-head-before-sweeping-shared-block-prefix
   (async done
     (let [child-a-bytes (ipld/encode {"value" "a"})
