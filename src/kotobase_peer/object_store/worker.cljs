@@ -63,6 +63,9 @@
 (defn database-backup-entry-key [e db-id backup-id namespace cid]
   (str (database-backup-entry-prefix e db-id backup-id)
        namespace "/" cid))
+(defn database-backup-work-gc-pointer-key [e task-id]
+  (str (prefix e) "scheduler/gc/database-backup-work/"
+       (js/encodeURIComponent task-id) "/current"))
 (defn retention-root-key [e db-id kind id]
   (str (prefix e) "roots/" (js/encodeURIComponent db-id) "/"
        (name kind) "/" (js/encodeURIComponent id)))
@@ -80,6 +83,7 @@
 (def database-backup-directory-fanout 64)
 (def database-backup-directory-bytes (* 64 1024))
 (def database-backup-frontier-list-limit 64)
+(def database-backup-work-gc-list-limit 64)
 
 (defn- b2-config [e]
   (when (every? #(seq (env e %))
@@ -2763,6 +2767,213 @@
                                  :backed-up (count entries)))))))))))
     (js/Promise.reject
      (js/Error. "GC delete requires MERKLE_BUCKET or MERKLE_GC_BACKUP_BUCKET"))))
+
+(defn- database-backup-work-key-prefix
+  [e key]
+  (let [base (str (prefix e) "scheduler/database-backup/")]
+    (when (str/starts-with? key base)
+      (let [suffix (subs key (count base))
+            parts (str/split suffix #"/")]
+        (when (>= (count parts) 3)
+          (str base (nth parts 0) "/" (nth parts 1) "/"))))))
+
+(defn- read-database-backup-work-gc-pointer!
+  [e task-id]
+  (let [bucket (env e "MERKLE_BUCKET")
+        key (database-backup-work-gc-pointer-key e task-id)]
+    (-> (.get bucket key)
+        (.then
+         (fn [stored]
+           (if-not stored
+             {:pointer nil :etag nil}
+             (-> (.text stored)
+                 (.then
+                  (fn [text]
+                    {:pointer (js->clj (js/JSON.parse text))
+                     :etag (gobj/get stored "etag")})))))))))
+
+(defn- cas-database-backup-work-gc-pointer!
+  [e task-id pointer etag]
+  (let [bucket (env e "MERKLE_BUCKET")
+        condition (if etag
+                    #js {:etagMatches etag}
+                    #js {:etagDoesNotMatch "*"})]
+    (-> (.put bucket
+              (database-backup-work-gc-pointer-key e task-id)
+              (js/JSON.stringify (clj->js pointer))
+              #js {:onlyIf condition})
+        (.then
+         (fn [written]
+           (if written
+             {:advanced? true :pointer pointer
+              :etag (gobj/get written "etag")}
+             {:advanced? false :reason :pointer-fenced}))))))
+
+(defn- completed-database-backup-work-prefix!
+  [bucket work-prefix cutoff]
+  (let [current-key (str work-prefix "current")]
+    (-> (.list bucket #js {:prefix current-key :limit 1})
+        (.then
+         (fn [listed]
+           (let [object (first (array-seq (gobj/get listed "objects")))
+                 uploaded (some-> object (gobj/get "uploaded"))]
+             (if-not (and object uploaded (< (.getTime uploaded) cutoff))
+               nil
+               (-> (.get bucket current-key)
+                   (.then
+                    (fn [stored]
+                      (when stored
+                        (-> (.text stored)
+                            (.then
+                             (fn [text]
+                               (let [pointer
+                                     (js->clj (js/JSON.parse text))]
+                                 (when (= "completed"
+                                          (get pointer "status"))
+                                   work-prefix))))))))))))))))
+
+(defn- completed-database-backup-work-candidates!
+  [e bucket objects cutoff]
+  (let [prefixes
+        (->> objects
+             (keep #(database-backup-work-key-prefix
+                     e (gobj/get % "key")))
+             distinct vec)]
+    (-> (js/Promise.all
+         (clj->js
+          (mapv #(completed-database-backup-work-prefix!
+                  bucket % cutoff)
+                prefixes)))
+        (.then
+         (fn [completed]
+           (let [completed (set (remove nil? (array-seq completed)))]
+             (->> objects
+                  (filter
+                   (fn [object]
+                     (let [key (gobj/get object "key")
+                           work-prefix
+                           (database-backup-work-key-prefix e key)
+                           uploaded (gobj/get object "uploaded")]
+                       (and (contains? completed work-prefix)
+                            (not (str/ends-with? key "/current"))
+                            uploaded
+                            (< (.getTime uploaded) cutoff)))))
+                  (mapv #(gobj/get % "key")))))))))
+
+(defn step-resumable-database-backup-work-gc!
+  "Advance a durable, page-bounded sweep of terminal database-backup work.
+  A step lists at most 64 R2 objects. When it deletes a page it resets the
+  listing cursor so deletion cannot shift an opaque continuation past keys.
+  Non-terminal backup prefixes are never deleted by this executor."
+  ([e task-id grace-ms]
+   (step-resumable-database-backup-work-gc!
+    e task-id grace-ms (js/Date.now)))
+  ([e task-id grace-ms now-ms]
+   (let [bucket (env e "MERKLE_BUCKET")
+         work-prefix (str (prefix e) "scheduler/database-backup/")
+         cutoff (- now-ms grace-ms)]
+     (when-not (and bucket
+                    (string? task-id) (seq task-id)
+                    (integer? grace-ms) (not (neg? grace-ms))
+                    (integer? now-ms) (not (neg? now-ms)))
+       (throw
+        (ex-info "Invalid resumable database backup work GC request"
+                 {:task-id task-id :grace-ms grace-ms :now-ms now-ms})))
+     (-> (read-database-backup-work-gc-pointer! e task-id)
+         (.then
+          (fn [{:keys [pointer etag]}]
+            (cond
+              (= "completed" (get pointer "status"))
+              {:phase :completed :completed? true
+               :deleted (get pointer "deleted")
+               :scanned (get pointer "scanned")
+               :last-backup-inventory
+               (get pointer "last-backup-inventory")}
+
+              (nil? pointer)
+              (let [initial {"format"
+                             "kotobase/resumable-database-backup-work-gc"
+                             "version" 1
+                             "task-id" task-id
+                             "status" "scanning"
+                             "grace-ms" grace-ms
+                             "started-at" now-ms
+                             "scanned" 0
+                             "deleted" 0}]
+                (-> (cas-database-backup-work-gc-pointer!
+                     e task-id initial nil)
+                    (.then #(assoc % :phase :started))))
+
+              (not= grace-ms (get pointer "grace-ms"))
+              (js/Promise.reject
+               (ex-info "Database backup work GC grace mismatch"
+                        {:expected (get pointer "grace-ms")
+                         :actual grace-ms}))
+
+              :else
+              (-> (.list
+                   bucket
+                   (clj->js
+                    (cond-> {:prefix work-prefix
+                             :limit database-backup-work-gc-list-limit}
+                      (get pointer "cursor")
+                      (assoc :cursor (get pointer "cursor")))))
+                  (.then
+                   (fn [listed]
+                     (let [objects
+                           (vec (array-seq (gobj/get listed "objects")))
+                           truncated?
+                           (boolean (gobj/get listed "truncated"))
+                           next-cursor
+                           (when truncated? (gobj/get listed "cursor"))]
+                       (-> (completed-database-backup-work-candidates!
+                            e bucket objects cutoff)
+                           (.then
+                            (fn [candidates]
+                              (if (seq candidates)
+                                (-> (backup-and-delete-candidates!
+                                     e bucket {} candidates now-ms)
+                                    (.then
+                                     (fn [deleted]
+                                       (let [next
+                                             (-> pointer
+                                                 (update "scanned"
+                                                         + (count objects))
+                                                 (update "deleted"
+                                                         + (:deleted deleted))
+                                                 (assoc
+                                                  "last-backup-inventory"
+                                                  (:backup-inventory deleted))
+                                                 (dissoc "cursor"))]
+                                         (-> (cas-database-backup-work-gc-pointer!
+                                              e task-id next etag)
+                                             (.then
+                                              #(assoc %
+                                                      :phase :deleted-page
+                                                      :deleted
+                                                      (:deleted deleted)
+                                                      :backup-inventory
+                                                      (:backup-inventory
+                                                       deleted))))))))
+                                (let [next
+                                      (cond-> (update pointer "scanned"
+                                                      + (count objects))
+                                        next-cursor
+                                        (assoc "cursor" next-cursor)
+                                        (nil? next-cursor)
+                                        (-> (assoc "status" "completed"
+                                                   "completed-at" now-ms)
+                                            (dissoc "cursor")))]
+                                  (-> (cas-database-backup-work-gc-pointer!
+                                       e task-id next etag)
+                                      (.then
+                                       #(assoc %
+                                               :phase
+                                               (if truncated?
+                                                 :scan-progress
+                                                 :completed)
+                                               :completed?
+                                               (not truncated?))))))))))))))))))))
 
 (defn- validate-gc-inventory [e cid node]
   (let [entries (get node "candidates")]

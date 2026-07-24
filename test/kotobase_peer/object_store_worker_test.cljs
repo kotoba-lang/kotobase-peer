@@ -1385,6 +1385,142 @@
              (done)))
           (.catch done)))))
 
+(deftest resumable-database-backup-work-gc-bounds-and-resets-pages
+  (async done
+    (let [prefix "test/"
+          work-prefix
+          (str prefix "scheduler/database-backup/db/completed/")
+          current-key (str work-prefix "current")
+          active-prefix
+          (str prefix "scheduler/database-backup/db/active/")
+          active-current (str active-prefix "current")
+          objects
+          (atom
+           (into
+            {current-key
+             (js/JSON.stringify
+              (clj->js {"format" "kotobase/resumable-database-backup"
+                        "version" 1
+                        "db-id" "db"
+                        "backup-id" "completed"
+                        "status" "completed"}))
+             active-current
+             (js/JSON.stringify
+              (clj->js {"format" "kotobase/resumable-database-backup"
+                        "version" 1
+                        "db-id" "db"
+                        "backup-id" "active"
+                        "status" "traversing"}))
+             (str active-prefix "frontier/live") "live"}
+            (map
+             (fn [ordinal]
+               [(str work-prefix "entries/blocks/"
+                     (.padStart (str ordinal) 3 "0"))
+                (str "entry-" ordinal)])
+             (range 70))))
+          versions (atom {})
+          stored
+          (fn [key value]
+            (let [etag (str "v" (get @versions key 0))]
+              (if (string? value)
+                #js {:etag etag
+                     :text (fn [] (js/Promise.resolve value))}
+                #js {:etag etag
+                     :arrayBuffer
+                     (fn []
+                       (js/Promise.resolve
+                        (.slice (.-buffer value)
+                                (.-byteOffset value)
+                                (+ (.-byteOffset value)
+                                   (.-byteLength value)))))})))
+          bucket
+          #js {:get
+               (fn [key]
+                 (js/Promise.resolve
+                  (when-let [value (get @objects key)]
+                    (stored key value))))
+               :put
+               (fn [key value opts]
+                 (let [current (get @objects key)
+                       only-if (some-> opts .-onlyIf)
+                       matches (some-> only-if .-etagMatches)
+                       absent (some-> only-if .-etagDoesNotMatch)
+                       etag (str "v" (get @versions key 0))
+                       won? (cond
+                              matches (= matches etag)
+                              (= "*" absent) (nil? current)
+                              :else true)]
+                   (if-not won?
+                     (js/Promise.resolve nil)
+                     (do
+                       (swap! objects assoc key value)
+                       (swap! versions update key (fnil inc 0))
+                       (js/Promise.resolve
+                        #js {:key key
+                             :etag (str "v" (get @versions key))})))))
+               :list
+               (fn [opts]
+                 (let [wanted (.-prefix opts)
+                       limit (or (.-limit opts) 1000)
+                       offset (js/parseInt (or (.-cursor opts) "0"))
+                       keys (->> (keys @objects)
+                                 (filter #(str/starts-with? % wanted))
+                                 sort vec)
+                       page (subvec keys
+                                    (min offset (count keys))
+                                    (min (+ offset limit) (count keys)))
+                       next-offset (+ offset (count page))
+                       truncated? (< next-offset (count keys))]
+                   (js/Promise.resolve
+                    #js {:objects
+                         (clj->js
+                          (mapv
+                           (fn [key]
+                             #js {:key key :uploaded (js/Date. 0)})
+                           page))
+                         :truncated truncated?
+                         :cursor (when truncated? (str next-offset))})))
+               :delete
+               (fn [keys]
+                 (doseq [key (js->clj keys)]
+                   (swap! objects dissoc key))
+                 (js/Promise.resolve nil))}
+          env #js {"MERKLE_BUCKET" bucket "MERKLE_S3_PREFIX" "test"}]
+      (-> (worker/step-resumable-database-backup-work-gc!
+           env "gc-1" 1000 10000)
+          (.then
+           (fn [started]
+             (is (= :started (:phase started)))
+             (worker/step-resumable-database-backup-work-gc!
+              env "gc-1" 1000 10000)))
+          (.then
+           (fn [first-page]
+             (is (= :deleted-page (:phase first-page)))
+             (is (= 61 (:deleted first-page))
+                 "terminal and active-prefix objects occupy bounded page slots")
+             (worker/step-resumable-database-backup-work-gc!
+              env "gc-1" 1000 10000)))
+          (.then
+           (fn [second-page]
+             (is (= :deleted-page (:phase second-page)))
+             (is (= 9 (:deleted second-page)))
+             (worker/step-resumable-database-backup-work-gc!
+              env "gc-1" 1000 10000)))
+          (.then
+           (fn [completed]
+             (is (= :completed (:phase completed)))
+             (is (:completed? completed))
+             (is (= 70 (get-in completed [:pointer "deleted"])))
+             (is (contains? @objects current-key))
+             (is (contains? @objects active-current))
+             (is (contains? @objects (str active-prefix "frontier/live")))
+             (is (empty?
+                  (filter #(str/starts-with? %
+                                             (str work-prefix "entries/"))
+                          (keys @objects))))
+             (done)))
+          (.catch done)))))
+
 (deftest gc-marks-every-head-before-sweeping-shared-block-prefix
   (async done
     (let [child-a-bytes (ipld/encode {"value" "a"})
