@@ -1,0 +1,37 @@
+{:schema 1
+ :date "2026-07-25"
+ :implementation "kotobase-peer.head-to-head-neo4j (:h2h-neo4j alias) + RisingWave single_node via docker+psql"
+ :environment
+ {:machine "Apple M4, 32GB RAM, macOS (Darwin 25.4.0)"
+  :jvm "OpenJDK 21.0.1"
+  :neo4j "org.neo4j/neo4j 2025.03.0 embedded (community), temp on-disk store, property index awaited online"
+  :risingwave "risingwavelabs/risingwave:latest single_node in Docker 29.4.0 (PostgreSQL 13.14.0-RisingWave-3.0.2), psql over localhost:4566, \\timing"
+  :workload "3,000 string-valued entities, 3 write batches, 200 point lookups by value, 20 full scans -- same shape as 2026-07-25-head-to-head-datomic.edn so the three receipts compose"}
+ :neo4j-run
+ {:kotobase-peer {:transact-total-ms 1739.710666 :hydrate-once-ms 131.926334
+                  :point-by-value {:p50-ms 0.010292 :p95-ms 0.018458}
+                  :full-scan {:p50-ms 8.123125 :p95-ms 16.909292}}
+  :neo4j-embedded {:transact-total-ms 109.225292 :index-build-await-ms 100.885792
+                   :point-by-indexed-property {:p50-ms 0.103625 :p95-ms 0.4405}
+                   :full-scan-cypher {:p50-ms 3.648417 :p95-ms 133.7725}}}
+ :risingwave-run
+ {:insert-batch-ms [34.038 8.356 9.63]
+  :flush-ms 73.106
+  :mv-create-ms 2277.275
+  :point-select {:p50-ms 4.774 :p95-ms 7.161}
+  :mv-point-select {:p50-ms 5.587 :p95-ms 8.11}
+  :full-scan-count {:p50-ms 4.08 :p95-ms 5.449}}
+ :composed-table
+ "3k string entities, point-by-value p50 / full-scan p50 / write-3k:
+  kotobase-peer (in-proc, encrypted): 0.004-0.010ms / 3.6-8.1ms / 438-1740ms
+  Datomic Pro in-mem (in-proc):       0.53ms       / 3.1ms     / 51ms
+  Neo4j embedded (in-proc, on-disk):  0.104ms      / 3.6ms     / 109ms (+101ms index build)
+  RisingWave (server via psql):       4.77ms       / 4.1ms     / ~125ms (insert+flush)"
+ :interpretation
+ {:reads "kotobase-peer's hot db wins point lookups against ALL three peers (10x vs Neo4j's awaited index, 144x vs Datomic's in-mem query, ~500x vs RisingWave-over-psql); full scans are the same order across all four systems (3-8ms)."
+  :writes "kotobase is the slowest writer (AES-GCM per value + HMAC blind per key + content-addressing -- the zero-trust product cost); peers write plaintext."
+  :caveats ["RisingWave numbers include TCP + psql client round-trip per query (~1-3ms floor); the three in-process engines have no such floor -- RisingWave's serving story is streaming MVs, not point-read latency, and its MV point read (5.6ms) is the number its design optimizes for freshness, not speed"
+            "kotobase transact-total varies across the two receipts (438ms in the Datomic run, 1,740ms here) -- machine load during this run (concurrent docker pull); within-run comparisons shared the same load"
+            "Neo4j embedded has no pure in-memory mode; its temp on-disk store pays fsync costs kotobase's atom-store does not"
+            "single attribute, no joins/aggregations/history/concurrency -- first receipts, not a TPC substitute"]
+  :axis-1-status "same-workload direct comparison now measured against ALL THREE named peers (Datomic 2026-07-25, Neo4j + RisingWave this receipt) -- the axis-1 'direct comparison missing' gap is closed at first-receipt depth; deeper workloads (joins, concurrency, scale) remain future work."}}
