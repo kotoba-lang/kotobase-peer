@@ -867,9 +867,17 @@
              (recur (next remaining) (conj batch group) next-count)))
          (list batch))))))
 
-(defn- retained-entries [safe-epoch runs]
-  (->> runs
-       (mapv #(seq (run-rows %)))
+(defn- retained-entries-from-row-seqs
+  "Retention over already-opened per-run row seqs: keep every version newer
+  than SAFE-EPOCH plus the newest version at/before it, per logical key.
+  Retention is idempotent and per-logical-key local, so applying it to a
+  SUBSET of runs and re-applying at a later merge level yields the same
+  final set as one global pass (each subset's own newest-at/before-safe
+  survives its level and the final level picks the global one) -- the
+  property hierarchical/streaming compaction (ADR-2607244000 Stage A/B)
+  relies on."
+  [safe-epoch row-seqs]
+  (->> row-seqs
        merge-sorted-row-seqs
        (partition-by logical-id)
        (mapcat (fn [versions]
@@ -882,6 +890,9 @@
                :epoch (get row "epoch")
                :op (keyword (get row "op"))
                :value (get row "value")}))))
+
+(defn- retained-entries [safe-epoch runs]
+  (retained-entries-from-row-seqs safe-epoch (mapv #(seq (run-rows %)) runs)))
 
 (defn visible-rows
   "MVCC multi-run merge. For each logical key, select the newest version at
@@ -920,6 +931,43 @@
        (partition-logical-groups target-rows)
        (mapv (fn [groups]
                (build-run index tenant (mapcat identity groups))))))
+
+(defn compact-run-readers-streaming
+  "ADR-2607244000 Stage A: `compact-runs-partitioned` without O(dataset)
+  retention at the API boundary. RUN-READERS is a seq of ZERO-ARG fns, each
+  returning that run's canonical rows (e.g. decoding spilled bytes from
+  disk/object storage on demand); EMIT! receives each output run as soon as
+  it is built and MUST persist/drop it -- the engine retains nothing after
+  the call. Returns a summary {:runs n :rows m} (row count per `build-run`'s
+  own \"count\") so callers can assert row conservation without holding
+  the emitted runs.
+
+  What this bounds and what it does not: the engine no longer holds the
+  OUTPUT set (streamed through emit!) nor requires the caller to hold input
+  :bytes (readers decode on demand). It still holds each opened run's
+  decoded rows until that run is exhausted -- a k-way merge over runs with
+  overlapping key ranges therefore still co-resides O(open runs' rows).
+  Bounding THAT is the caller's fan-in/level scheduling (Stage B): merge at
+  most F readers per call, spill emitted runs, recurse -- retention safety
+  across levels is `retained-entries-from-row-seqs`'s documented per-level
+  idempotence.
+
+  Same semantics per output run as `compact-runs-partitioned` (logical keys
+  never split; a hot key may exceed TARGET-ROWS)."
+  [index tenant safe-epoch target-rows run-readers emit!]
+  (when-not (and (integer? target-rows) (pos? target-rows))
+    (throw (ex-info "Compaction target rows must be a positive integer"
+                    {:target-rows target-rows})))
+  (->> (retained-entries-from-row-seqs safe-epoch (mapv (fn [reader] (seq (reader))) run-readers))
+       (partition-by :components)
+       (partition-logical-groups target-rows)
+       (map (fn [groups] (build-run index tenant (mapcat identity groups))))
+       (reduce (fn [summary run]
+                 (emit! run)
+                 (-> summary
+                     (update :runs inc)
+                     (update :rows + (get (:node run) "count"))))
+               {:runs 0 :rows 0})))
 
 (defn query-plan
   "Pure first read step: pin the database by asking the host for its head."
