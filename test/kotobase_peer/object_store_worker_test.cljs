@@ -1036,9 +1036,28 @@
                     (is (contains?
                          @entries
                          (str prefix "blocks/" source-head)))
-                    (worker/verify-and-mark-database-restore-ready!
+                    (worker/begin-database-restore-verification!
                      env (assoc advanced
                                 :now-ms 9050
+                                :lease-ms 1000))))
+                 (.then
+                  (fn [verifying]
+                    (is (:verification-advanced? verifying))
+                    (is (= "verifying"
+                           (get-in verifying
+                                   [:checkpoint "status"])))
+                    (worker/advance-database-restore-verification!
+                     env (assoc verifying
+                                :now-ms 9060
+                                :lease-ms 1000))))
+                 (.then
+                  (fn [processed]
+                    (is (:verification-advanced? processed))
+                    (is (= source-head
+                           (:verification-object processed)))
+                    (worker/advance-database-restore-verification!
+                     env (assoc processed
+                                :now-ms 9070
                                 :lease-ms 1000))))
                  (.then
                   (fn [ready]
@@ -1207,6 +1226,10 @@
           prefix "test/"
           block-key #(str prefix "blocks/" %)
           object-key #(str prefix "objects/" %)
+          stale-verification-key
+          (str prefix
+               "scheduler/database-restore/restored/task/verification/"
+               orphan)
           objects (atom {(str prefix "heads/db-a") root-a
                          (str prefix "heads/db-b") root-b
                          (str prefix "scheduler/resumable/db-a/task/current")
@@ -1230,7 +1253,15 @@
                          (block-key resumable-child) resumable-child-bytes
                          (block-key ingress-workload) ingress-workload-bytes
                          (block-key orphan) orphan-bytes
-                         (object-key orphan-object) orphan-object-bytes})
+                         (object-key orphan-object) orphan-object-bytes
+                         stale-verification-key
+                         (js/JSON.stringify
+                          (clj->js
+                           {"format"
+                            "kotobase/database-restore-verification-marker"
+                            "version" 1
+                            "cid" (str orphan)
+                            "status" "done"}))})
           bytes-object (fn [value]
                          #js {:arrayBuffer
                               (fn []
@@ -1277,19 +1308,23 @@
                    (is (= 1 (:ingress-roots audit)))
                    (is (= 1 (:active-ingress-roots audit)))
                    (is (= 7 (:reachable audit)))
-                   (is (= 2 (:candidates audit)))
+                   (is (= 3 (:candidates audit)))
                    (is (= 1 (:block-candidates audit)))
                    (is (= 1 (:object-candidates audit)))
+                   (is (= 1
+                          (:stale-database-restore-verification-markers
+                           audit)))
                    (is (= 0 (:deleted audit)))
                    (is (= 1 (:inventory-passes audit)))
                    (worker/gc-unreachable! env "db-a" 0 true)))
           (.then (fn [sweep]
-                   (is (= 2 (:deleted sweep)))
+                   (is (= 3 (:deleted sweep)))
                    (is (= 2 (:inventory-passes sweep)))
-                   (is (= 2 (:backed-up sweep)))
+                   (is (= 3 (:backed-up sweep)))
                    (is (string? (:backup-inventory sweep)))
                    (is (nil? (get @objects (block-key orphan))))
                    (is (nil? (get @objects (object-key orphan-object))))
+                   (is (nil? (get @objects stale-verification-key)))
                    (is (every? #(contains? @objects (block-key %))
                                [root-a child-a root-b child-b
                                 checkpoint resumable-child ingress-workload])
@@ -1297,7 +1332,7 @@
                    (-> (worker/restore-gc-inventory!
                         env (:backup-inventory sweep))
                        (.then (fn [restored]
-                                (is (= 2 (:restored restored)))
+                                (is (= 3 (:restored restored)))
                                 (is (= orphan
                                        (ipld/cid
                                         (get @objects (block-key orphan)))))
@@ -1305,10 +1340,12 @@
                                        (ipld/cid
                                         (get @objects
                                              (object-key orphan-object)))))
+                                (is (contains? @objects
+                                               stale-verification-key))
                                 (worker/restore-gc-inventory!
                                  env (:backup-inventory sweep))))
                        (.then (fn [replayed]
-                                (is (= 2 (:already-present replayed)))
+                                (is (= 3 (:already-present replayed)))
                                 (let [backup-key
                                       (worker/gc-backup-object-key env orphan)
                                       good-backup (get @objects backup-key)]
@@ -1330,7 +1367,9 @@
                                          (swap! objects assoc backup-key
                                                 good-backup))))))))))
           (.then (fn [_]
-                   (swap! objects dissoc (object-key orphan-object))
+                   (swap! objects dissoc
+                          (object-key orphan-object)
+                          stale-verification-key)
                    (let [second-orphan-bytes (ipld/encode {"orphan" 2})
                          second-orphan (ipld/cid second-orphan-bytes)
                          block-list-calls (atom 0)

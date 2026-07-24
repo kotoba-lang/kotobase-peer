@@ -8,7 +8,8 @@
   (:require [ipld.core :as ipld]))
 
 (def format-version 1)
-(def statuses #{:running :ready-to-publish :completed :failed :cancelled})
+(def statuses
+  #{:running :verifying :ready-to-publish :completed :failed :cancelled})
 
 (defn- encoded [node]
   (let [bytes (ipld/encode node)]
@@ -85,7 +86,7 @@
   (let [current (validate-checkpoint
                  task checkpoint old-token old-attempt)]
     (when-not
-     (and (contains? #{"running" "ready-to-publish"}
+     (and (contains? #{"running" "verifying" "ready-to-publish"}
                      (get current "status"))
           (string? new-token) (seq new-token)
           (= (inc old-attempt) new-attempt))
@@ -138,16 +139,74 @@
          (update "restored" + restored)
          (update "already-present" + already-present)))))
 
-(defn ready-to-publish
-  "Fence page processing after every declared page and entry is durable. Head
-  publication happens only after this immutable checkpoint is pointer-visible."
-  [{:keys [task checkpoint token attempt verified-reachable]}]
+(defn begin-verification
+  "Move a fully restored page cursor into an external verification scan. The
+  host seeds the expected head marker before publishing this checkpoint."
+  [{:keys [task checkpoint token attempt]}]
   (let [current (validate-checkpoint task checkpoint token attempt)]
     (when-not
      (and (= "running" (get current "status"))
           (= (get-in task [:node "page-count"]) (get current "next-page"))
           (= (get-in task [:node "entry-count"])
+             (get current "processed-entries")))
+      (throw (ex-info "Database restore pages are not ready for verification"
+                      {:checkpoint current})))
+    (encoded
+     (assoc current
+            "status" "verifying"
+            "verification-scan-count" 0
+            "verification-pass" 0))))
+
+(defn advance-verification-scan
+  "Persist one bounded R2 marker listing page. Processing a pending marker
+  resets the count/cursor because the discovered marker set may have grown."
+  [{:keys [task checkpoint token attempt processed-marker?
+           page-count next-cursor]}]
+  (let [current (validate-checkpoint task checkpoint token attempt)
+        next-count (+ (get current "verification-scan-count" 0)
+                      page-count)]
+    (when-not
+     (and (= "verifying" (get current "status"))
+          (boolean? processed-marker?)
+          (nat-int? page-count)
+          (<= next-count (get-in task [:node "entry-count"]))
+          (or (not processed-marker?)
+              (and (zero? page-count) (nil? next-cursor)))
+          (or (nil? next-cursor)
+              (and (string? next-cursor) (seq next-cursor))))
+      (throw (ex-info "Invalid database restore verification scan advance"
+                      {:checkpoint current
+                       :processed-marker? processed-marker?
+                       :page-count page-count
+                       :next-cursor next-cursor})))
+    (encoded
+     (if processed-marker?
+       (-> current
+           (assoc "verification-scan-count" 0)
+           (update "verification-pass" (fnil inc 0))
+           (dissoc "verification-cursor"))
+       (cond-> (update current "verification-scan-count"
+                       (fnil + 0) page-count)
+         next-cursor (assoc "verification-cursor" next-cursor)
+         (nil? next-cursor) (dissoc "verification-cursor"))))))
+
+(defn ready-to-publish
+  "Fence page processing after every declared page and entry is durable. Head
+  publication happens only after this immutable checkpoint is pointer-visible."
+  [{:keys [task checkpoint token attempt verified-reachable
+           verification-page-count]
+    :or {verification-page-count 0}}]
+  (let [current (validate-checkpoint task checkpoint token attempt)]
+    (when-not
+     (and (contains? #{"running" "verifying"}
+                     (get current "status"))
+          (= (get-in task [:node "page-count"]) (get current "next-page"))
+          (= (get-in task [:node "entry-count"])
              (get current "processed-entries"))
+          (or (= "running" (get current "status"))
+              (= verified-reachable
+                 (+ (get current "verification-scan-count")
+                    verification-page-count)))
           (= (get-in task [:node "entry-count"]) verified-reachable))
       (throw (ex-info "Database restore is not ready to publish"
                       {:checkpoint current

@@ -193,6 +193,22 @@ restore is idempotent only when the existing bytes have the expected CID.
 `MERKLE_GC_BACKUP_BUCKET` may bind a separate R2 bucket; otherwise backup uses
 `MERKLE_BUCKET`. Backup retention is explicit—GC never automatically deletes
 these inventories or their content-addressed objects.
+
+Paged database restore externalizes exact reachability verification under
+`scheduler/database-restore/<target>/<task>/verification/`. Each CID has an
+ETag-CAS `pending`/`done` marker. One restore step lists at most 64 markers and
+processes at most one CID-verified block or opaque materialized object; its
+immutable checkpoint stores only the listing cursor and count. Child markers
+are durable before their parent becomes done. A complete scan may publish the
+head only when the unique marker count equals the immutable inventory entry
+count. Active verification checkpoints are GC roots; inactive markers follow
+the database-restore grace, double-snapshot fence, backup-before-delete, and
+CID-verified restore path. The 10,000-entry synthetic gate kept 158 checkpoint
+samples between 421 and 448 bytes; see
+`bench/results/2026-07-23-external-restore-verification-10k.edn`. This removes
+the resumable verifier's O(total entries) process memory, but inventory root
+descriptors and backup-side graph discovery remain separate scale gaps.
+
 The authenticated `/bench/orphan-gc` drill uses an isolated prefix and cleans
 it in `finally`. The 2026-07-23 real-R2 run marked 2 heads and 4 live blocks,
 confirmed the same one-candidate inventory twice, backed up and deleted the

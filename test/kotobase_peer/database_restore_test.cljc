@@ -7,6 +7,9 @@
                      [kotobase-peer.database-restore :as restore])))
 
 (defn cid [value] (ipld/cid (ipld/encode value)))
+(defn byte-count [bytes]
+  #?(:clj (alength bytes)
+     :cljs (.-byteLength bytes)))
 
 (deftest database-restore-page-checkpoints-fence-order-and-publication
   (let [head (cid {"head" 1})
@@ -38,8 +41,17 @@
                    {:task task :checkpoint second-page
                     :old-token "attempt-token" :old-attempt 1
                     :new-token "reclaimed-token" :new-attempt 2})
+        verifying (restore/begin-verification
+                   {:task task :checkpoint reclaimed
+                    :token "reclaimed-token" :attempt 2})
+        scanned (restore/advance-verification-scan
+                 {:task task :checkpoint verifying
+                  :token "reclaimed-token" :attempt 2
+                  :processed-marker? false
+                  :page-count 3
+                  :next-cursor nil})
         ready (restore/ready-to-publish
-               {:task task :checkpoint reclaimed
+               {:task task :checkpoint scanned
                 :token "reclaimed-token" :attempt 2
                 :verified-reachable 3})
         completed (restore/complete
@@ -53,6 +65,8 @@
     (is (= 1 (get-in second-page [:node "already-present"])))
     (is (= 2 (get-in reclaimed [:node "attempt"])))
     (is (= 2 (get-in reclaimed [:node "next-page"])))
+    (is (= "verifying" (get-in verifying [:node "status"])))
+    (is (= 3 (get-in scanned [:node "verification-scan-count"])))
     (is (= "ready-to-publish" (get-in ready [:node "status"])))
     (is (= "completed" (get-in completed [:node "status"])))
     (testing "page replay, token mismatch, incomplete verification and wrong head fail closed"
@@ -74,13 +88,13 @@
                      :last-entry ["objects" "cid-c"]})))
       (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
                    (restore/ready-to-publish
-                    {:task task :checkpoint second-page
+                    {:task task :checkpoint verifying
                      :token "wrong" :attempt 1
                      :verified-reachable 3})))
       (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
                    (restore/ready-to-publish
-                    {:task task :checkpoint second-page
-                     :token "attempt-token" :attempt 1
+                    {:task task :checkpoint verifying
+                     :token "reclaimed-token" :attempt 2
                      :verified-reachable 2})))
       (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
                    (restore/reclaim-checkpoint
@@ -107,3 +121,61 @@
     (is (not= (:cid (restore/restore-task base))
               (:cid (restore/restore-task
                      (assoc base :entry-count 11)))))))
+
+(deftest external-verification-checkpoint-remains-constant-size-at-ten-thousand
+  (let [entry-count 10000
+        page-count 40
+        task (restore/restore-task
+              {:inventory-cid (cid {"inventory" "10k"})
+               :target-db-id "restored-10k"
+               :head-cid (cid {"head" "10k"})
+               :entry-count entry-count
+               :page-count page-count})
+        initial (restore/initial-checkpoint
+                 {:task task :token "bounded" :attempt 1})
+        pages
+        (reduce
+         (fn [checkpoint ordinal]
+           (restore/advance-page
+            {:task task :checkpoint checkpoint
+             :token "bounded" :attempt 1
+             :page-ordinal ordinal
+             :page-cid (cid {"page" ordinal})
+             :entry-count 250 :restored 250 :already-present 0
+             :first-entry ["blocks" (* ordinal 250)]
+             :last-entry ["blocks" (+ (* ordinal 250) 249)]}))
+         initial
+         (range page-count))
+        verifying (restore/begin-verification
+                   {:task task :checkpoint pages
+                    :token "bounded" :attempt 1})
+        scans
+        (loop [checkpoint verifying
+               remaining entry-count
+               ordinal 0
+               maximum-bytes (byte-count (:bytes verifying))]
+          (if (zero? remaining)
+            {:checkpoint checkpoint :maximum-bytes maximum-bytes}
+            (let [n (min 64 remaining)
+                  next (restore/advance-verification-scan
+                        {:task task :checkpoint checkpoint
+                         :token "bounded" :attempt 1
+                         :processed-marker? false
+                         :page-count n
+                         :next-cursor
+                         (when (> remaining n)
+                           (str "cursor-" ordinal))})]
+              (recur next (- remaining n) (inc ordinal)
+                     (max maximum-bytes (byte-count (:bytes next)))))))
+        ready
+        (restore/ready-to-publish
+         {:task task :checkpoint (:checkpoint scans)
+          :token "bounded" :attempt 1
+          :verified-reachable entry-count})]
+    (is (= entry-count
+           (get-in scans [:checkpoint :node
+                          "verification-scan-count"])))
+    (is (< (:maximum-bytes scans) 2048))
+    (is (= "ready-to-publish" (get-in ready [:node "status"])))
+    (is (nil? (get-in scans [:checkpoint :node "entries"]))
+        "checkpoint stores only a cursor/count, never the inventory set")))

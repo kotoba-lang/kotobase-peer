@@ -42,6 +42,12 @@
 (defn database-restore-pointer-key [e target-db-id task-id]
   (str (prefix e) "scheduler/database-restore/"
        (js/encodeURIComponent target-db-id) "/" task-id "/current"))
+(defn database-restore-verification-prefix [e target-db-id task-id]
+  (str (prefix e) "scheduler/database-restore/"
+       (js/encodeURIComponent target-db-id) "/" task-id
+       "/verification/"))
+(defn database-restore-verification-key [e target-db-id task-id cid]
+  (str (database-restore-verification-prefix e target-db-id task-id) cid))
 (defn retention-root-key [e db-id kind id]
   (str (prefix e) "roots/" (js/encodeURIComponent db-id) "/"
        (name kind) "/" (js/encodeURIComponent id)))
@@ -2428,7 +2434,8 @@
          (fn [{:keys [target-db-id expected-head status]}]
            (let [current (get head-by-key
                               (head-key e target-db-id))]
-             (and (contains? #{"running" "ready-to-publish"} status)
+             (and (contains? #{"running" "verifying" "ready-to-publish"}
+                             status)
                   (or (nil? current) (= expected-head current)))))
          database-restore-roots)
         active-ingress-roots
@@ -2455,6 +2462,11 @@
               (fn [{:keys [uploaded-ms]}]
                 (and uploaded-ms (< uploaded-ms cutoff))))
              (mapv :key))
+        active-database-restore-prefixes
+        (mapv
+         (fn [{:keys [key]}]
+           (subs key 0 (- (count key) (count "current"))))
+         active-database-restore-roots)
         stale-ingress-pointer-keys
         (->> ingress-roots
              (remove (set active-ingress-roots))
@@ -2466,7 +2478,9 @@
                     (clj->js (map #(reachable-cids! e %) root-cids)))
                    (.then (fn [sets] (into #{} cat (array-seq sets)))))
               (list-r2-blocks! bucket (str (prefix e) "blocks/"))
-              (list-r2-blocks! bucket (str (prefix e) "objects/"))])
+              (list-r2-blocks! bucket (str (prefix e) "objects/"))
+              (list-r2-blocks!
+               bucket (str (prefix e) "scheduler/database-restore/"))])
         (.then
          (fn [result]
            (let [reachable (aget result 0)
@@ -2484,7 +2498,19 @@
                         (mapv #(gobj/get % "key"))))
                  block-candidates (candidates-for (aget result 1))
                  object-candidates (candidates-for (aget result 2))
-                 data-candidates (into block-candidates object-candidates)]
+                 data-candidates (into block-candidates object-candidates)
+                 verification-marker-candidates
+                 (->> (aget result 3)
+                      (filter
+                       (fn [object]
+                         (let [key (gobj/get object "key")
+                               uploaded (gobj/get object "uploaded")]
+                           (and (str/includes? key "/verification/")
+                                (not-any? #(str/starts-with? key %)
+                                          active-database-restore-prefixes)
+                                uploaded
+                                (< (.getTime uploaded) cutoff)))))
+                      (mapv #(gobj/get % "key")))]
              {:reachable (count reachable)
               :heads (count heads)
               :resumable-roots (count resumable-roots)
@@ -2495,6 +2521,8 @@
               (count active-database-restore-roots)
               :stale-database-restore-pointers
               (count stale-database-restore-pointer-keys)
+              :stale-database-restore-verification-markers
+              (count verification-marker-candidates)
               :ingress-roots (count ingress-roots)
               :active-ingress-roots (count active-ingress-roots)
               :stale-ingress-pointers (count stale-ingress-pointer-keys)
@@ -2506,6 +2534,7 @@
               :candidate-keys (->> (concat data-candidates
                                            stale-resumable-pointer-keys
                                            stale-database-restore-pointer-keys
+                                           verification-marker-candidates
                                            stale-ingress-pointer-keys)
                                    distinct sort vec)
               :block-candidates (count block-candidates)
@@ -2513,11 +2542,13 @@
               :pointer-candidates (+ (count stale-resumable-pointer-keys)
                                      (count
                                       stale-database-restore-pointer-keys)
+                                     (count verification-marker-candidates)
                                      (count stale-ingress-pointer-keys))
               :candidates (+ (count data-candidates)
                              (count stale-resumable-pointer-keys)
                              (count
                               stale-database-restore-pointer-keys)
+                             (count verification-marker-candidates)
                              (count stale-ingress-pointer-keys))})))
         (.catch (fn [error]
                   (js/Promise.reject
@@ -3596,10 +3627,336 @@
                                 [(get (peek entries) "namespace")
                                  (get (peek entries) "cid")]})))))))))))))))
 
+(def database-restore-verification-list-limit 64)
+
+(declare mark-database-restore-ready!)
+
+(defn- database-backup-entry-inventory!
+  "Resolve CID to its unique namespace from at most one candidate page per
+  namespace. Root descriptors are sparse and remain small for inventory v2."
+  [e backup-bucket inventory cid]
+  (let [candidate-descriptors
+        (->> ["blocks" "objects"]
+             (mapcat
+              (fn [namespace]
+                (let [target [namespace cid]]
+                  (filter
+                   (fn [descriptor]
+                     (and (not (neg? (compare target
+                                              [(get-in descriptor
+                                                       ["first" "namespace"])
+                                               (get-in descriptor
+                                                       ["first" "cid"])])))
+                          (not (pos? (compare target
+                                             [(get-in descriptor
+                                                      ["last" "namespace"])
+                                              (get-in descriptor
+                                                      ["last" "cid"])])))))
+                   (get inventory "pages")))))
+             distinct
+             vec)]
+    (-> (js/Promise.all
+         (clj->js
+          (mapv #(load-database-backup-page!
+                  e backup-bucket %)
+                candidate-descriptors)))
+        (.then
+         (fn [pages]
+           (let [matches
+                 (->> (array-seq pages)
+                      (mapcat identity)
+                      (filter #(= cid (get % "cid")))
+                      vec)]
+             (when-not (= 1 (count matches))
+               (throw
+                (ex-info "Database restore verification CID is not unique in inventory"
+                         {:cid cid :matches (count matches)})))
+             (first matches)))))))
+
+(defn- parse-database-restore-verification-marker!
+  [stored expected-cid]
+  (-> (.text stored)
+      (.then
+       (fn [text]
+         (let [marker (js->clj (js/JSON.parse text))]
+           (when-not
+            (and (= "kotobase/database-restore-verification-marker"
+                    (get marker "format"))
+                 (= 1 (get marker "version"))
+                 (= expected-cid (get marker "cid"))
+                 (contains? #{"pending" "done"} (get marker "status")))
+             (throw
+              (ex-info "Invalid database restore verification marker"
+                       {:cid expected-cid :marker marker})))
+           {:marker marker :etag (gobj/get stored "etag")})))))
+
+(defn- ensure-database-restore-verification-marker!
+  [e bucket target-db-id task-id cid]
+  (let [key (database-restore-verification-key
+             e target-db-id task-id cid)
+        marker {"format" "kotobase/database-restore-verification-marker"
+                "version" 1
+                "cid" cid
+                "status" "pending"}]
+    (-> (.put bucket key
+              (js/JSON.stringify (clj->js marker))
+              #js {:onlyIf #js {:etagDoesNotMatch "*"}})
+        (.then
+         (fn [written]
+           (if written
+             {:created? true :key key :marker marker
+              :etag (gobj/get written "etag")}
+             (-> (.get bucket key)
+                 (.then
+                  (fn [stored]
+                    (if-not stored
+                      (js/Promise.reject
+                       (ex-info
+                        "Database restore verification marker CAS lost without winner"
+                        {:cid cid}))
+                      (-> (parse-database-restore-verification-marker!
+                           stored cid)
+                          (.then #(assoc % :created? false
+                                        :key key)))))))))))))
+
+(defn- publish-database-restore-verification-checkpoint!
+  [e {:keys [pointer etag now-ms lease-ms] :as state}
+   next-checkpoint]
+  (let [bucket (env e "MERKLE_BUCKET")
+        target-db-id (get pointer "target-db-id")
+        task-id (get pointer "task-id")
+        now-ms (or now-ms (js/Date.now))
+        lease-ms (or lease-ms 60000)
+        next-pointer
+        (assoc pointer
+               "checkpoint" (str (:cid next-checkpoint))
+               "expires-at" (+ now-ms lease-ms)
+               "status" (get-in next-checkpoint [:node "status"]))]
+    (when-not
+     (and bucket
+          (= task-id (str (:cid (:task state))))
+          (= (get pointer "checkpoint")
+             (str (ipld/cid
+                   (ipld/encode (:checkpoint state))))))
+      (throw
+       (ex-info "Database restore verification pointer/checkpoint mismatch"
+                {:task-id task-id
+                 :checkpoint (get pointer "checkpoint")})))
+    (-> (put-block! e (:cid next-checkpoint) (:bytes next-checkpoint))
+        (.then
+         (fn [_]
+           (-> (.put bucket
+                     (database-restore-pointer-key
+                      e target-db-id task-id)
+                     (js/JSON.stringify (clj->js next-pointer))
+                     #js {:onlyIf #js {:etagMatches etag}})
+               (.then
+                (fn [written]
+                  (if written
+                    (assoc state
+                           :verification-advanced? true
+                           :pointer next-pointer
+                           :checkpoint (:node next-checkpoint)
+                           :etag (gobj/get written "etag"))
+                    {:verification-advanced? false
+                     :reason :pointer-fenced})))))))))
+
+(defn begin-database-restore-verification!
+  "Seed the expected head as the first external marker and durably enter the
+  verification phase. Marker creation precedes pointer publication."
+  [e {:keys [task pointer checkpoint] :as claim}]
+  (let [bucket (env e "MERKLE_BUCKET")
+        target-db-id (get pointer "target-db-id")
+        task-id (get pointer "task-id")
+        expected-head
+        (str (ipld/link-cid (get-in task [:node "head"])))
+        verifying
+        (database-restore/begin-verification
+         {:task task :checkpoint checkpoint
+          :token (get pointer "token")
+          :attempt (get pointer "attempt")})]
+    (-> (ensure-database-restore-verification-marker!
+         e bucket target-db-id task-id expected-head)
+        (.then
+         (fn [_]
+           (publish-database-restore-verification-checkpoint!
+            e claim verifying))))))
+
+(defn- process-database-restore-verification-marker!
+  [e primary backup-bucket inventory target-db-id task-id
+   key marker-state]
+  (let [marker (:marker marker-state)
+        marker-etag (:etag marker-state)
+        cid (get marker "cid")]
+    (-> (database-backup-entry-inventory!
+         e backup-bucket inventory cid)
+        (.then
+         (fn [entry]
+           (let [namespace (get entry "namespace")]
+             (-> (.get primary
+                       (database-storage-key e namespace cid))
+                 (.then
+                  (fn [object]
+                    (if-not object
+                      (js/Promise.reject
+                       (ex-info "Restored database verification object not found"
+                                {:namespace namespace :cid cid}))
+                      (stored-bytes! object))))
+                 (.then
+                  (fn [bytes]
+                    (verify-gc-entry-bytes!
+                     e (database-storage-key e namespace cid) cid bytes)
+                    (if (= "blocks" namespace)
+                      (lsm/linked-cids (ipld/decode bytes))
+                      [])))))))
+        (.then
+         (fn [links]
+           (reduce
+            (fn [pending child-cid]
+              (.then
+               pending
+               (fn [_]
+                 (ensure-database-restore-verification-marker!
+                  e primary target-db-id task-id child-cid))))
+            (js/Promise.resolve nil)
+            links)))
+        (.then
+         (fn [_]
+           (let [done (assoc marker "status" "done")]
+             (-> (.put primary key
+                       (js/JSON.stringify (clj->js done))
+                       #js {:onlyIf #js {:etagMatches marker-etag}})
+                 (.then
+                  (fn [written]
+                    (if written
+                      {:processed? true :cid cid}
+                      {:processed? false
+                       :reason :marker-fenced}))))))))))
+
+(defn advance-database-restore-verification!
+  "Advance one bounded external-verification phase. One invocation reads at
+  most 64 marker records and processes at most one content-addressed object."
+  [e {:keys [task pointer checkpoint] :as claim}]
+  (let [primary (env e "MERKLE_BUCKET")
+        backup-bucket (gc-backup-bucket e)
+        inventory-cid
+        (str (ipld/link-cid (get-in task [:node "inventory"])))
+        target-db-id (get pointer "target-db-id")
+        task-id (get pointer "task-id")
+        marker-prefix
+        (database-restore-verification-prefix
+         e target-db-id task-id)
+        cursor (get checkpoint "verification-cursor")]
+    (-> (load-database-backup-inventory-root!
+         e backup-bucket inventory-cid)
+        (.then
+         (fn [inventory]
+           (-> (.list primary
+                      (clj->js
+                       (cond-> {:prefix marker-prefix
+                                :limit
+                                database-restore-verification-list-limit}
+                         cursor (assoc :cursor cursor))))
+               (.then
+                (fn [listed]
+                  (let [objects
+                        (vec (array-seq
+                              (gobj/get listed "objects")))
+                        truncated? (boolean
+                                    (gobj/get listed "truncated"))
+                        next-cursor
+                        (when truncated?
+                          (gobj/get listed "cursor"))]
+                    (-> (js/Promise.all
+                         (clj->js
+                          (mapv
+                           (fn [object]
+                             (let [key (gobj/get object "key")
+                                   cid (subs key (count marker-prefix))]
+                               (-> (.get primary key)
+                                   (.then
+                                    (fn [stored]
+                                      (if-not stored
+                                        nil
+                                        (-> (parse-database-restore-verification-marker!
+                                             stored cid)
+                                            (.then
+                                             #(assoc % :key key)))))))))
+                           objects)))
+                        (.then
+                         (fn [loaded]
+                           (let [markers
+                                 (vec (remove nil?
+                                              (array-seq loaded)))
+                                 pending
+                                 (first
+                                  (filter
+                                   #(= "pending"
+                                       (get-in % [:marker "status"]))
+                                   markers))]
+                             (if pending
+                               (-> (process-database-restore-verification-marker!
+                                    e primary backup-bucket inventory
+                                    target-db-id task-id
+                                    (:key pending) pending)
+                                   (.then
+                                    (fn [processed]
+                                      (if-not (:processed? processed)
+                                        processed
+                                        (let [advanced
+                                              (database-restore/advance-verification-scan
+                                               {:task task
+                                                :checkpoint checkpoint
+                                                :token (get pointer "token")
+                                                :attempt (get pointer "attempt")
+                                                :processed-marker? true
+                                                :page-count 0
+                                                :next-cursor nil})]
+                                          (-> (publish-database-restore-verification-checkpoint!
+                                               e claim advanced)
+                                              (.then
+                                               #(assoc %
+                                                       :verification-object
+                                                       (:cid processed)))))))))
+                               (let [scan-total
+                                     (+ (get checkpoint
+                                             "verification-scan-count" 0)
+                                        (count markers))]
+                                 (if truncated?
+                                   (let [advanced
+                                         (database-restore/advance-verification-scan
+                                          {:task task
+                                           :checkpoint checkpoint
+                                           :token (get pointer "token")
+                                           :attempt (get pointer "attempt")
+                                           :processed-marker? false
+                                           :page-count (count markers)
+                                           :next-cursor next-cursor})]
+                                     (publish-database-restore-verification-checkpoint!
+                                      e claim advanced))
+                                   (if (= scan-total
+                                          (get-in task
+                                                  [:node "entry-count"]))
+                                     (mark-database-restore-ready!
+                                      e
+                                      (assoc claim
+                                             :verified-reachable
+                                             scan-total
+                                             :verification-page-count
+                                             (count markers)))
+                                     (js/Promise.reject
+                                      (ex-info
+                                       "Restored database reachability mismatch"
+                                       {:inventory inventory-cid
+                                        :expected
+                                        (get-in task
+                                                [:node "entry-count"])
+                                        :actual scan-total})))))))))))))))))))
+
 (defn- mark-database-restore-ready!
   "Persist the verified all-pages barrier before exposing the target head."
   [e {:keys [task pointer checkpoint etag verified-reachable
-             now-ms lease-ms]
+             verification-page-count now-ms lease-ms]
       :or {lease-ms 60000}}]
   (let [target-db-id (get pointer "target-db-id")
         task-id (get pointer "task-id")
@@ -3609,7 +3966,9 @@
           :checkpoint checkpoint
           :token (get pointer "token")
           :attempt (get pointer "attempt")
-          :verified-reachable verified-reachable})
+          :verified-reachable verified-reachable
+          :verification-page-count
+          (or verification-page-count 0)})
         now-ms (or now-ms (js/Date.now))]
     (when-not
      (and (= task-id (str (:cid task)))
@@ -3653,37 +4012,6 @@
                                   :pointer-fenced}))))))))))))
       (js/Promise.reject
        (js/Error. "Resumable database restore requires an R2 binding")))))
-
-(defn verify-and-mark-database-restore-ready!
-  "Verify the exact namespace-aware reachable set against the immutable
-  inventory before publishing the ready barrier. This preserves correctness
-  while the follow-up external visited-set traversal removes the remaining
-  O(total entries) verification working set."
-  [e {:keys [task pointer] :as claim}]
-  (let [primary (env e "MERKLE_BUCKET")
-        backup-bucket (gc-backup-bucket e)
-        inventory-cid
-        (str (ipld/link-cid (get-in task [:node "inventory"])))
-        target-db-id (get pointer "target-db-id")]
-    (if-not (and primary backup-bucket)
-      (js/Promise.reject
-       (js/Error.
-        "Resumable database restore requires primary and backup buckets"))
-      (-> (load-database-backup-inventory!
-           e backup-bucket inventory-cid)
-          (.then
-           (fn [inventory]
-             (let [entries (get inventory "entries")]
-               (-> (verify-restored-database!
-                    e primary backup-bucket inventory-cid inventory
-                    target-db-id entries {})
-                   (.then
-                    (fn [verified]
-                      (mark-database-restore-ready!
-                       e
-                       (assoc claim
-                              :verified-reachable
-                              (:verified-reachable verified)))))))))))))
 
 (defn complete-database-restore!
   "Publish the target head by CAS, then terminally CAS the restore pointer.
@@ -3777,9 +4105,8 @@
 
 (defn step-database-restore!
   "Advance at most one durable restore phase. Callers repeat this operation
-  until :phase is :completed. Page work is invocation-bounded; verification is
-  a separate phase and remains explicitly identified until its visited set is
-  externalized."
+  until :phase is :completed. Page and verification work are invocation-bounded;
+  the verification visited set and scan cursor are durable R2 state."
   [e inventory-cid target-db-id
    {:keys [owner token now-ms lease-ms]
     :or {lease-ms 60000}}]
@@ -3817,6 +4144,42 @@
                                            :completed
                                            :publish-fenced))))
 
+                      "verifying"
+                      (-> (advance-database-restore-verification!
+                           e claim)
+                          (.then
+                           (fn [verified]
+                             (cond
+                               (:ready? verified)
+                               (-> (release-database-restore-lease!
+                                    e verified
+                                    (or now-ms (js/Date.now)))
+                                   (.then
+                                    #(assoc %
+                                            :phase
+                                            :ready-to-publish)))
+
+                               (not (:verification-advanced? verified))
+                               (assoc verified
+                                      :phase :verification-fenced)
+
+                               :else
+                               (-> (release-database-restore-lease!
+                                    e verified
+                                    (or now-ms (js/Date.now)))
+                                   (.then
+                                    #(assoc %
+                                            :phase
+                                            :verification-progress
+                                            :verified-scan-count
+                                            (get-in %
+                                                    [:checkpoint
+                                                     "verification-scan-count"])
+                                            :verification-pass
+                                            (get-in %
+                                                    [:checkpoint
+                                                     "verification-pass"]))))))))
+
                       "running"
                       (cond
                         (< next-page page-count)
@@ -3840,21 +4203,22 @@
                                               page-count)))))))
 
                         (= next-page page-count)
-                        (-> (verify-and-mark-database-restore-ready!
+                        (-> (begin-database-restore-verification!
                              e claim)
                             (.then
-                             (fn [ready]
-                               (if-not (:ready? ready)
-                                 (assoc ready
+                             (fn [verifying]
+                               (if-not
+                                (:verification-advanced? verifying)
+                                 (assoc verifying
                                         :phase
                                         :verification-fenced)
                                  (-> (release-database-restore-lease!
-                                      e ready
+                                      e verifying
                                       (or now-ms (js/Date.now)))
                                      (.then
                                       #(assoc %
                                               :phase
-                                              :ready-to-publish)))))))
+                                              :verification-started)))))))
 
                         :else
                         (js/Promise.reject

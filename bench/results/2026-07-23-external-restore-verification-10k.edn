@@ -1,0 +1,35 @@
+{:date "2026-07-23"
+ :scope :synthetic-checkpoint-scale
+ :entries 10000
+ :inventory-pages 40
+ :marker-list-limit 64
+ :verification-list-steps 157
+ :checkpoint-samples 158
+ :checkpoint-bytes {:minimum 421
+                    :maximum 448
+                    :terminal-scan 423}
+ :working-set {:inventory-entries-in-checkpoint 0
+               :visited-cids-in-checkpoint 0
+               :external-state :r2-verification-markers
+               :per-step {:marker-list-objects 64
+                          :processed-content-objects 1}}
+ :correctness
+ {:head-marker-seeded-before-checkpoint true
+  :marker-transition :pending-to-done-etag-cas
+  :child-markers-before-parent-done true
+  :checkpoint-pointer :etag-cas
+  :ready-condition
+  "every discovered CID is inventory-resolved and CID-verified; a complete marker scan equals inventory entry-count"
+  :gc
+  "inactive verification markers use the database-restore grace, two-snapshot fence, backup-before-delete, and CID-verified restore path"}
+ :validation {:jvm {:tests 242
+                    :assertions 767
+                    :failures 0
+                    :errors 0}
+              :cljs {:tests 247
+                     :assertions 974
+                     :failures 0
+                     :errors 0}
+              :lint {:errors 0}}
+ :claim-limit
+ "This proves checkpoint-size independence and bounded worker state for the synthetic 10,000-entry transition sequence. It is not a live R2 latency, operation-cost, or million-entry restore receipt. Inventory root descriptors remain O(page count), and backup graph discovery still retains an in-process visited set."}
