@@ -48,6 +48,21 @@
        "/verification/"))
 (defn database-restore-verification-key [e target-db-id task-id cid]
   (str (database-restore-verification-prefix e target-db-id task-id) cid))
+(defn database-backup-work-prefix [e db-id backup-id]
+  (str (prefix e) "scheduler/database-backup/"
+       (js/encodeURIComponent db-id) "/"
+       (js/encodeURIComponent backup-id) "/"))
+(defn database-backup-pointer-key [e db-id backup-id]
+  (str (database-backup-work-prefix e db-id backup-id) "current"))
+(defn database-backup-frontier-prefix [e db-id backup-id]
+  (str (database-backup-work-prefix e db-id backup-id) "frontier/"))
+(defn database-backup-frontier-key [e db-id backup-id cid]
+  (str (database-backup-frontier-prefix e db-id backup-id) cid))
+(defn database-backup-entry-prefix [e db-id backup-id]
+  (str (database-backup-work-prefix e db-id backup-id) "entries/"))
+(defn database-backup-entry-key [e db-id backup-id namespace cid]
+  (str (database-backup-entry-prefix e db-id backup-id)
+       namespace "/" cid))
 (defn retention-root-key [e db-id kind id]
   (str (prefix e) "roots/" (js/encodeURIComponent db-id) "/"
        (name kind) "/" (js/encodeURIComponent id)))
@@ -64,6 +79,7 @@
 (def database-backup-page-bytes (* 64 1024))
 (def database-backup-directory-fanout 64)
 (def database-backup-directory-bytes (* 64 1024))
+(def database-backup-frontier-list-limit 64)
 
 (defn- b2-config [e]
   (when (every? #(seq (env e %))
@@ -2876,37 +2892,39 @@
   [{:keys [namespace cid]}]
   {"namespace" namespace "cid" cid})
 
+(defn database-backup-inventory-page
+  [ordinal page-entries]
+  (let [node {"format" "kotobase/database-backup-inventory-page"
+              "version" 1
+              "ordinal" ordinal
+              "entries" (mapv backup-inventory-entry page-entries)}
+        bytes (ipld/encode node)
+        encoded-bytes (.-byteLength bytes)]
+    (when (> encoded-bytes database-backup-page-bytes)
+      (throw
+       (ex-info "Database backup inventory page exceeds byte limit"
+                {:ordinal ordinal
+                 :entries (count page-entries)
+                 :encoded-bytes encoded-bytes
+                 :maximum database-backup-page-bytes})))
+    {:cid (str (ipld/cid bytes))
+     :bytes bytes
+     :node node
+     :descriptor
+     {"cid" (str (ipld/cid bytes))
+      "ordinal" ordinal
+      "count" (count page-entries)
+      "encoded-bytes" encoded-bytes
+      "first" (backup-inventory-entry (first page-entries))
+      "last" (backup-inventory-entry (peek (vec page-entries)))}}))
+
 (defn database-backup-inventory-pages
   "Build deterministic, byte-bounded immutable inventory pages. ENTRIES must
   already be ordered by [namespace CID]."
   [entries]
   (->> entries
        (partition-all database-backup-page-entries)
-       (map-indexed
-        (fn [ordinal page-entries]
-          (let [node {"format" "kotobase/database-backup-inventory-page"
-                      "version" 1
-                      "ordinal" ordinal
-                      "entries" (mapv backup-inventory-entry page-entries)}
-                bytes (ipld/encode node)
-                encoded-bytes (.-byteLength bytes)]
-            (when (> encoded-bytes database-backup-page-bytes)
-              (throw
-               (ex-info "Database backup inventory page exceeds byte limit"
-                        {:ordinal ordinal
-                         :entries (count page-entries)
-                         :encoded-bytes encoded-bytes
-                         :maximum database-backup-page-bytes})))
-            {:cid (str (ipld/cid bytes))
-             :bytes bytes
-             :node node
-             :descriptor
-             {"cid" (str (ipld/cid bytes))
-              "ordinal" ordinal
-              "count" (count page-entries)
-              "encoded-bytes" encoded-bytes
-              "first" (backup-inventory-entry (first page-entries))
-              "last" (backup-inventory-entry (peek (vec page-entries)))}})))
+       (map-indexed database-backup-inventory-page)
        vec))
 
 (defn- inventory-tree-child-descriptor
@@ -2920,6 +2938,41 @@
    "first" (get descriptor "first")
    "last" (get descriptor "last")})
 
+(defn- build-database-backup-directory-node
+  [level node-children]
+  (let [node {"format"
+              "kotobase/database-backup-inventory-directory"
+              "version" 1
+              "level" level
+              "children" (vec node-children)}
+        bytes (ipld/encode node)
+        encoded-bytes (.-byteLength bytes)
+        first-child (first node-children)
+        last-child (peek (vec node-children))]
+    (when (> encoded-bytes database-backup-directory-bytes)
+      (throw
+       (ex-info
+        "Database backup inventory directory exceeds byte limit"
+        {:level level
+         :children (count node-children)
+         :encoded-bytes encoded-bytes
+         :maximum database-backup-directory-bytes})))
+    {:cid (str (ipld/cid bytes))
+     :bytes bytes
+     :node node
+     :descriptor
+     {"kind" "directory"
+      "cid" (str (ipld/cid bytes))
+      "encoded-bytes" encoded-bytes
+      "level" level
+      "first-page" (get first-child "first-page")
+      "page-count"
+      (reduce + 0 (map #(get % "page-count") node-children))
+      "entry-count"
+      (reduce + 0 (map #(get % "entry-count") node-children))
+      "first" (get first-child "first")
+      "last" (get last-child "last")}}))
+
 (defn database-backup-inventory-tree
   "Build a deterministic bounded-fan-out tree over immutable data page
   descriptors. The returned root descriptor is constant-size regardless of
@@ -2932,39 +2985,7 @@
          nodes []]
     (let [built
           (mapv
-           (fn [node-children]
-             (let [node {"format"
-                         "kotobase/database-backup-inventory-directory"
-                         "version" 1
-                         "level" level
-                         "children" (vec node-children)}
-                   bytes (ipld/encode node)
-                   encoded-bytes (.-byteLength bytes)
-                   first-child (first node-children)
-                   last-child (peek (vec node-children))]
-               (when (> encoded-bytes database-backup-directory-bytes)
-                 (throw
-                  (ex-info
-                   "Database backup inventory directory exceeds byte limit"
-                   {:level level
-                    :children (count node-children)
-                    :encoded-bytes encoded-bytes
-                    :maximum database-backup-directory-bytes})))
-               {:cid (str (ipld/cid bytes))
-                :bytes bytes
-                :node node
-                :descriptor
-                {"kind" "directory"
-                 "cid" (str (ipld/cid bytes))
-                 "encoded-bytes" encoded-bytes
-                 "level" level
-                 "first-page" (get first-child "first-page")
-                 "page-count"
-                 (reduce + 0 (map #(get % "page-count") node-children))
-                 "entry-count"
-                 (reduce + 0 (map #(get % "entry-count") node-children))
-                 "first" (get first-child "first")
-                 "last" (get last-child "last")}}))
+           #(build-database-backup-directory-node level %)
            (partition-all database-backup-directory-fanout children))
           all-nodes (into nodes built)]
       (if (= 1 (count built))
@@ -2972,6 +2993,75 @@
          :nodes all-nodes
          :height (inc level)}
         (recur (inc level) (mapv :descriptor built) all-nodes)))))
+
+(defn append-database-backup-inventory-page
+  "Append one data-page descriptor to a bounded base-64 carry. Returns the
+  successor carry and any complete directory nodes that must be persisted
+  before the successor checkpoint is published."
+  [carry page]
+  (loop [level 0
+         descriptor (inventory-tree-child-descriptor page)
+         carry (vec carry)
+         nodes []]
+    (let [carry (into carry
+                      (repeat (max 0 (- (inc level) (count carry))) []))
+          children (conj (get carry level) descriptor)]
+      (if (< (count children) database-backup-directory-fanout)
+        {:carry (assoc carry level children)
+         :nodes nodes}
+        (let [node (build-database-backup-directory-node level children)]
+          (recur (inc level)
+                 (:descriptor node)
+                 (assoc carry level [])
+                 (conj nodes node)))))))
+
+(defn finalize-database-backup-inventory-carry
+  "Flush a bounded base-64 carry into one top directory descriptor. Directory
+  effects are returned explicitly for durable publication before the root."
+  [carry]
+  (loop [carry (vec carry)
+         nodes []]
+    (let [non-empty
+          (keep-indexed (fn [level children]
+                          (when (seq children) [level children]))
+                        carry)]
+      (when-not (seq non-empty)
+        (throw
+         (ex-info "Database backup inventory carry is empty" {})))
+      (let [[_highest-level highest] (last non-empty)]
+        (if (and (= 1 (count non-empty))
+                 (= 1 (count highest))
+                 (= "directory" (get (first highest) "kind")))
+          {:root (first highest)
+           :nodes nodes
+           :height (inc (get (first highest) "level"))}
+          (let [[level children] (first non-empty)
+                node (build-database-backup-directory-node level children)
+                cleared (assoc carry level [])
+                successor
+                (loop [target (inc level)
+                       carry cleared
+                       descriptor (:descriptor node)
+                       emitted [node]]
+                  (let [carry
+                        (into carry
+                              (repeat
+                               (max 0 (- (inc target) (count carry))) []))
+                        next-children
+                        (conj (get carry target) descriptor)]
+                    (if (< (count next-children)
+                           database-backup-directory-fanout)
+                      {:carry (assoc carry target next-children)
+                       :nodes emitted}
+                      (let [next-node
+                            (build-database-backup-directory-node
+                             target next-children)]
+                        (recur (inc target)
+                               (assoc carry target [])
+                               (:descriptor next-node)
+                               (conj emitted next-node))))))]
+            (recur (:carry successor)
+                   (into nodes (:nodes successor)))))))))
 
 (defn- publish-database-backup-pages!
   [e backup-bucket objects]
@@ -3122,7 +3212,433 @@
                                                           (:root root)
                                                           :idempotent?
                                                           (:idempotent?
-                                                           root)}))))))))))))))))))))))
+                                                          root)}))))))))))))))))))))))
+
+(defn- read-database-backup-pointer!
+  [e db-id backup-id]
+  (let [bucket (env e "MERKLE_BUCKET")]
+    (-> (.get bucket (database-backup-pointer-key e db-id backup-id))
+        (.then
+         (fn [stored]
+           (if-not stored
+             {:pointer nil :etag nil}
+             (-> (.text stored)
+                 (.then
+                  (fn [text]
+                    {:pointer (js->clj (js/JSON.parse text))
+                     :etag (gobj/get stored "etag")})))))))))
+
+(defn- cas-database-backup-pointer!
+  [e db-id backup-id pointer etag]
+  (let [bucket (env e "MERKLE_BUCKET")
+        condition (if etag
+                    #js {:etagMatches etag}
+                    #js {:etagDoesNotMatch "*"})]
+    (-> (.put bucket
+              (database-backup-pointer-key e db-id backup-id)
+              (js/JSON.stringify (clj->js pointer))
+              #js {:onlyIf condition})
+        (.then
+         (fn [written]
+           (if written
+             {:advanced? true
+              :pointer pointer
+              :etag (gobj/get written "etag")}
+             {:advanced? false :reason :pointer-fenced}))))))
+
+(defn- parse-database-backup-frontier-marker!
+  [stored expected-cid]
+  (-> (.text stored)
+      (.then
+       (fn [text]
+         (let [marker (js->clj (js/JSON.parse text))]
+           (when-not
+            (and (= "kotobase/database-backup-frontier" (get marker "format"))
+                 (= 1 (get marker "version"))
+                 (= expected-cid (get marker "cid"))
+                 (contains? #{"pending" "done"} (get marker "status")))
+             (throw
+              (ex-info "Invalid database backup frontier marker"
+                       {:cid expected-cid :marker marker})))
+           {:marker marker :etag (gobj/get stored "etag")})))))
+
+(defn- ensure-database-backup-frontier-marker!
+  [e bucket db-id backup-id cid]
+  (let [key (database-backup-frontier-key e db-id backup-id cid)
+        marker {"format" "kotobase/database-backup-frontier"
+                "version" 1
+                "cid" cid
+                "status" "pending"}]
+    (-> (.put bucket key
+              (js/JSON.stringify (clj->js marker))
+              #js {:onlyIf #js {:etagDoesNotMatch "*"}})
+        (.then
+         (fn [written]
+           (if written
+             {:created? true :key key}
+             (-> (.get bucket key)
+                 (.then
+                  (fn [stored]
+                    (if-not stored
+                      (js/Promise.reject
+                       (ex-info
+                        "Database backup frontier CAS lost without winner"
+                        {:cid cid}))
+                      (parse-database-backup-frontier-marker!
+                       stored cid)))))))))))
+
+(defn begin-resumable-database-backup!
+  "Pin one head and seed an external traversal. Replays return the existing
+  pointer; a backup ID can never move to another immutable head."
+  ([e db-id backup-id]
+   (begin-resumable-database-backup! e db-id backup-id (js/Date.now)))
+  ([e db-id backup-id now-ms]
+   (let [primary (env e "MERKLE_BUCKET")
+         backup-bucket (gc-backup-bucket e)]
+     (when-not (and primary backup-bucket
+                    (string? db-id) (seq db-id)
+                    (string? backup-id) (seq backup-id)
+                    (<= (count backup-id) 256)
+                    (integer? now-ms) (not (neg? now-ms)))
+       (throw
+        (ex-info "Invalid resumable database backup request"
+                 {:db-id db-id :backup-id backup-id :now-ms now-ms})))
+     (-> (read-database-backup-pointer! e db-id backup-id)
+         (.then
+          (fn [{existing :pointer :keys [etag]}]
+            (if existing
+              {:advanced? false :reason :existing
+               :pointer existing :etag etag}
+              (-> (resolve-database-head! e db-id)
+                  (.then
+                   (fn [{:keys [head-cid base-cid]}]
+                     (if-not head-cid
+                       (js/Promise.reject
+                        (ex-info "Database head not found" {:db-id db-id}))
+                       (-> (get-node! e base-cid)
+                           (.then
+                            (fn [manifest]
+                              (let [epoch (get manifest "epoch")]
+                                (when-not
+                                 (and (integer? epoch) (not (neg? epoch)))
+                                  (throw
+                                   (ex-info
+                                    "Database manifest has no valid epoch"
+                                    {:db-id db-id :base-cid base-cid})))
+                                (-> (ensure-backup-retention-root!
+                                     e db-id backup-id head-cid epoch)
+                                    (.then
+                                     (fn [_]
+                                       (ensure-database-backup-frontier-marker!
+                                        e primary db-id backup-id head-cid)))
+                                    (.then
+                                     (fn [_]
+                                       (let [pointer
+                                             {"format"
+                                              "kotobase/resumable-database-backup"
+                                              "version" 1
+                                              "db-id" db-id
+                                              "backup-id" backup-id
+                                              "head-cid" head-cid
+                                              "base-cid" base-cid
+                                              "epoch" epoch
+                                              "status" "traversing"
+                                              "traversal-scan-count" 0
+                                              "processed-entries" 0
+                                              "created-at" now-ms}]
+                                         (cas-database-backup-pointer!
+                                          e db-id backup-id pointer nil))))))))))))))))))))
+
+(defn- process-database-backup-frontier-marker!
+  [e primary backup-bucket db-id backup-id key marker-state]
+  (let [marker (:marker marker-state)
+        cid (get marker "cid")]
+    (-> (read-database-storage-entry! e primary cid)
+        (.then
+         (fn [entry]
+           (-> (put-immutable-gc-backup!
+                backup-bucket (gc-backup-object-key e cid)
+                cid (:bytes entry))
+               (.then
+                (fn [_]
+                  (reduce
+                   (fn [pending child]
+                     (.then
+                      pending
+                      (fn [_]
+                        (ensure-database-backup-frontier-marker!
+                         e primary db-id backup-id child))))
+                   (js/Promise.resolve nil)
+                   (:links entry))))
+               (.then
+                (fn [_]
+                  (-> (.put
+                       primary
+                       (database-backup-entry-key
+                        e db-id backup-id (:namespace entry) cid)
+                       ""
+                       #js {:onlyIf #js {:etagDoesNotMatch "*"}})
+                      (.then
+                       (fn [_]
+                         (let [done (assoc marker
+                                           "status" "done"
+                                           "namespace" (:namespace entry))]
+                           (-> (.put
+                                primary key
+                                (js/JSON.stringify (clj->js done))
+                                #js {:onlyIf
+                                     #js {:etagMatches (:etag marker-state)}})
+                               (.then
+                                (fn [written]
+                                  (if written
+                                    {:processed? true
+                                     :namespace (:namespace entry)
+                                     :cid cid}
+                                    {:processed? false
+                                     :reason :marker-fenced}))))))))))))))))
+
+(defn- step-database-backup-traversal!
+  [e db-id backup-id pointer etag]
+  (let [primary (env e "MERKLE_BUCKET")
+        backup-bucket (gc-backup-bucket e)
+        marker-prefix (database-backup-frontier-prefix e db-id backup-id)
+        cursor (get pointer "traversal-cursor")]
+    (-> (.list primary
+               (clj->js
+                (cond-> {:prefix marker-prefix
+                         :limit database-backup-frontier-list-limit}
+                  cursor (assoc :cursor cursor))))
+        (.then
+         (fn [listed]
+           (let [objects (vec (array-seq (gobj/get listed "objects")))
+                 truncated? (boolean (gobj/get listed "truncated"))
+                 next-cursor (when truncated? (gobj/get listed "cursor"))]
+             (-> (js/Promise.all
+                  (clj->js
+                   (mapv
+                    (fn [object]
+                      (let [key (gobj/get object "key")
+                            cid (subs key (count marker-prefix))]
+                        (-> (.get primary key)
+                            (.then
+                             (fn [stored]
+                               (when stored
+                                 (-> (parse-database-backup-frontier-marker!
+                                      stored cid)
+                                     (.then #(assoc % :key key)))))))))
+                    objects)))
+                 (.then
+                  (fn [loaded]
+                    (let [markers (vec (remove nil? (array-seq loaded)))
+                          pending
+                          (first
+                           (filter
+                            #(= "pending" (get-in % [:marker "status"]))
+                            markers))]
+                      (if pending
+                        (-> (process-database-backup-frontier-marker!
+                             e primary backup-bucket db-id backup-id
+                             (:key pending) pending)
+                            (.then
+                             (fn [processed]
+                               (if-not (:processed? processed)
+                                 processed
+                                 (-> (cas-database-backup-pointer!
+                                      e db-id backup-id
+                                      (-> pointer
+                                          (assoc "traversal-scan-count" 0)
+                                          (update "processed-entries" inc)
+                                          (dissoc "traversal-cursor"))
+                                      etag)
+                                     (.then
+                                      #(assoc %
+                                              :phase :traversal-progress
+                                              :processed-cid
+                                              (:cid processed))))))))
+                        (if truncated?
+                          (-> (cas-database-backup-pointer!
+                               e db-id backup-id
+                               (-> pointer
+                                   (update "traversal-scan-count"
+                                           + (count markers))
+                                   (assoc "traversal-cursor" next-cursor))
+                               etag)
+                              (.then #(assoc % :phase :traversal-scan)))
+                          (-> (cas-database-backup-pointer!
+                               e db-id backup-id
+                               (-> pointer
+                                   (assoc "status" "indexing"
+                                          "page-ordinal" 0
+                                          "indexed-entries" 0
+                                          "directory-carry" [])
+                                   (dissoc "traversal-cursor"
+                                           "traversal-scan-count"))
+                               etag)
+                              (.then
+                               #(assoc % :phase
+                                       :traversal-completed)))))))))))))))
+
+(defn- parse-database-backup-entry-key
+  [entry-prefix key]
+  (let [suffix (subs key (count entry-prefix))
+        slash (.indexOf suffix "/")
+        namespace (subs suffix 0 slash)
+        cid (subs suffix (inc slash))
+        entry {:namespace namespace :cid cid}]
+    (when-not (and (pos? slash)
+                   (contains? #{"blocks" "objects"} namespace)
+                   (re-matches #"b[a-z2-7]+" cid))
+      (throw
+       (ex-info "Invalid external database backup entry key"
+                {:key key})))
+    entry))
+
+(defn- publish-database-backup-build-effects!
+  [e backup-bucket page nodes]
+  (publish-database-backup-pages!
+   e backup-bucket (into [page] nodes)))
+
+(defn- step-database-backup-index!
+  [e db-id backup-id pointer etag]
+  (let [primary (env e "MERKLE_BUCKET")
+        backup-bucket (gc-backup-bucket e)
+        entry-prefix (database-backup-entry-prefix e db-id backup-id)
+        cursor (get pointer "entry-cursor")]
+    (-> (.list primary
+               (clj->js
+                (cond-> {:prefix entry-prefix
+                         :limit database-backup-page-entries}
+                  cursor (assoc :cursor cursor))))
+        (.then
+         (fn [listed]
+           (let [objects (sort-by #(gobj/get % "key")
+                                  (array-seq (gobj/get listed "objects")))
+                 entries
+                 (mapv #(parse-database-backup-entry-key
+                         entry-prefix (gobj/get % "key"))
+                       objects)
+                 truncated? (boolean (gobj/get listed "truncated"))
+                 next-cursor (when truncated? (gobj/get listed "cursor"))]
+             (when-not (seq entries)
+               (throw
+                (ex-info "Database backup external entry index is empty"
+                         {:db-id db-id :backup-id backup-id})))
+             (let [page (database-backup-inventory-page
+                         (get pointer "page-ordinal") entries)
+                   appended
+                   (append-database-backup-inventory-page
+                    (get pointer "directory-carry") page)
+                   next-pointer
+                   (cond-> (-> pointer
+                               (assoc "directory-carry" (:carry appended))
+                               (update "page-ordinal" inc)
+                               (update "indexed-entries" + (count entries)))
+                     next-cursor (assoc "entry-cursor" next-cursor)
+                     (nil? next-cursor)
+                     (-> (assoc "status" "finalizing")
+                         (dissoc "entry-cursor")))]
+               (-> (publish-database-backup-build-effects!
+                    e backup-bucket page (:nodes appended))
+                   (.then
+                    (fn [_]
+                      (-> (cas-database-backup-pointer!
+                           e db-id backup-id next-pointer etag)
+                          (.then
+                           #(assoc %
+                                   :phase
+                                   (if truncated?
+                                     :inventory-page
+                                     :inventory-pages-completed)
+                                   :page-cid (:cid page))))))))))))))
+
+(defn- step-database-backup-finalize!
+  [e db-id backup-id pointer etag now-ms]
+  (let [backup-bucket (gc-backup-bucket e)
+        finalized
+        (finalize-database-backup-inventory-carry
+         (get pointer "directory-carry"))
+        node {"format" "kotobase/database-backup-inventory"
+              "version" 3
+              "source-prefix" (prefix e)
+              "db-id" db-id
+              "backup-id" backup-id
+              "head-cid" (get pointer "head-cid")
+              "base-cid" (get pointer "base-cid")
+              "epoch" (get pointer "epoch")
+              "entry-count" (get pointer "indexed-entries")
+              "page-entry-limit" database-backup-page-entries
+              "page-byte-limit" database-backup-page-bytes
+              "directory-fanout" database-backup-directory-fanout
+              "directory-byte-limit" database-backup-directory-bytes
+              "page-count" (get pointer "page-ordinal")
+              "directory-height" (:height finalized)
+              "page-tree" (:root finalized)}
+        bytes (ipld/encode node)
+        cid (str (ipld/cid bytes))
+        completed
+        (-> pointer
+            (assoc "status" "completed"
+                   "inventory" cid
+                   "completed-at" now-ms)
+            (dissoc "directory-carry"))]
+    (-> (publish-database-backup-pages!
+         e backup-bucket (:nodes finalized))
+        (.then
+         (fn [_]
+           (put-immutable-gc-backup!
+            backup-bucket (database-backup-inventory-key e cid)
+            cid bytes)))
+        (.then
+         (fn [_]
+           (-> (cas-database-backup-pointer!
+                e db-id backup-id completed etag)
+               (.then
+                #(assoc %
+                        :phase :completed
+                        :completed? (:advanced? %)
+                        :inventory cid
+                        :entries (get pointer "indexed-entries")
+                        :inventory-pages (get pointer "page-ordinal")
+                        :inventory-directory-height
+                        (:height finalized)))))))))
+
+(defn step-resumable-database-backup!
+  "Advance at most one external traversal marker, bounded scan, inventory
+  page, or terminal directory/root publication."
+  ([e db-id backup-id]
+   (step-resumable-database-backup!
+    e db-id backup-id (js/Date.now)))
+  ([e db-id backup-id now-ms]
+   (-> (read-database-backup-pointer! e db-id backup-id)
+       (.then
+        (fn [{:keys [pointer etag]}]
+          (if-not pointer
+            (-> (begin-resumable-database-backup!
+                 e db-id backup-id now-ms)
+                (.then #(assoc % :phase :started)))
+            (case (get pointer "status")
+              "traversing"
+              (step-database-backup-traversal!
+               e db-id backup-id pointer etag)
+
+              "indexing"
+              (step-database-backup-index!
+               e db-id backup-id pointer etag)
+
+              "finalizing"
+              (step-database-backup-finalize!
+               e db-id backup-id pointer etag now-ms)
+
+              "completed"
+              {:advanced? false :reason :terminal
+               :phase :completed :completed? true
+               :inventory (get pointer "inventory")
+               :entries (get pointer "indexed-entries")
+               :inventory-pages (get pointer "page-ordinal")}
+
+              (js/Promise.reject
+               (ex-info "Invalid resumable database backup status"
+                        {:status (get pointer "status")})))))))))
 
 (defn- valid-database-backup-entry? [entry]
   (and (map? entry)

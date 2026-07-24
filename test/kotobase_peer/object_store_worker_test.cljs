@@ -917,6 +917,7 @@
           manifest (lsm/build-manifest {:db-id "source" :epoch 7})
           source-head (:cid manifest)
           backup-receipt (atom nil)
+          external-backup-receipt (atom nil)
           restore-ready (atom nil)
           entries
           (atom {(str prefix "heads/source")
@@ -987,7 +988,41 @@
                  (js/Promise.resolve nil))}
           env #js {"MERKLE_BUCKET" bucket
                    "MERKLE_S3_PREFIX" "database-restore"}]
-      (-> (worker/backup-database! env "source" "daily-7" 7000)
+      (-> (worker/step-resumable-database-backup!
+           env "source" "daily-external" 6900)
+          (.then
+           (fn [started]
+             (is (= :started (:phase started)))
+             (worker/step-resumable-database-backup!
+              env "source" "daily-external" 6901)))
+          (.then
+           (fn [traversed]
+             (is (= :traversal-progress (:phase traversed)))
+             (worker/step-resumable-database-backup!
+              env "source" "daily-external" 6902)))
+          (.then
+           (fn [scanned]
+             (is (= :traversal-completed (:phase scanned)))
+             (worker/step-resumable-database-backup!
+              env "source" "daily-external" 6903)))
+          (.then
+           (fn [indexed]
+             (is (= :inventory-pages-completed (:phase indexed)))
+             (worker/step-resumable-database-backup!
+              env "source" "daily-external" 6904)))
+          (.then
+           (fn [completed]
+             (is (:completed? completed))
+             (is (= :completed (:phase completed)))
+             (is (= 1 (:entries completed)))
+             (reset! external-backup-receipt completed)
+             (worker/step-resumable-database-backup!
+              env "source" "daily-external" 6905)))
+          (.then
+           (fn [replayed]
+             (is (:completed? replayed))
+             (is (= :terminal (:reason replayed)))
+             (worker/backup-database! env "source" "daily-7" 7000)))
           (.then
            (fn [backup]
              (is (= source-head (:head-cid backup)))
@@ -1013,7 +1048,7 @@
                     (str prefix "heads/source")
                     (str prefix "blocks/" source-head))
              (-> (worker/prepare-database-restore-task!
-                  env (:inventory backup) "restored")
+                  env (:inventory @external-backup-receipt) "restored")
                  (.then
                   (fn [{:keys [task]}]
                     (worker/claim-database-restore!
@@ -1101,7 +1136,7 @@
                             (get @entries
                                  (str prefix "heads/restored")))))
                     (worker/step-database-restore!
-                     env (:inventory @backup-receipt) "restored"
+                     env (:inventory @external-backup-receipt) "restored"
                      {:owner "replay-worker"
                       :token "replay-token"
                       :now-ms 12000
@@ -1229,7 +1264,20 @@
              "last" entry}})
          (range 4097))
         tree (worker/database-backup-inventory-tree pages)
-        root-node (peek (:nodes tree))]
+        root-node (peek (:nodes tree))
+        incremental
+        (reduce
+         (fn [{:keys [carry nodes]} page]
+           (let [next
+                 (worker/append-database-backup-inventory-page
+                  carry page)]
+             {:carry (:carry next)
+              :nodes (into nodes (:nodes next))}))
+         {:carry [] :nodes []}
+         pages)
+        finalized
+        (worker/finalize-database-backup-inventory-carry
+         (:carry incremental))]
     (is (= 3 (:height tree)))
     (is (= 4097 (get-in tree [:root "page-count"])))
     (is (= (* 4097 256) (get-in tree [:root "entry-count"])))
@@ -1239,7 +1287,13 @@
             worker/database-backup-directory-bytes))
     (is (= (:root tree)
            (:root (worker/database-backup-inventory-tree pages)))
-        "the same page descriptors produce the same constant-size root")))
+        "the same page descriptors produce the same constant-size root")
+    (is (= (:root tree) (:root finalized))
+        "bounded incremental carry produces the batch tree root")
+    (is (= (set (map :cid (:nodes tree)))
+           (set (map :cid
+                     (into (:nodes incremental) (:nodes finalized)))))
+        "incremental publication effects are byte-identical")))
 
 (deftest gc-marks-every-head-before-sweeping-shared-block-prefix
   (async done
