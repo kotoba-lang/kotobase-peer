@@ -1,0 +1,35 @@
+{:schema 1
+ :date "2026-07-25"
+ :implementation "kotobase-peer.stream-bench (compact-run-readers-streaming, ADR-2607244000 Stage A+B minimal)"
+ :command "clojure -J-Xmx4g -M:stream-bench 1000000"
+ :environment
+ {:machine "Apple M4, 32GB RAM, macOS (Darwin 25.4.0)"
+  :jvm "OpenJDK 21.0.1"
+  :fan-in 64
+  :target-rows 4096
+  :heap-cap-bytes 4294967296
+  :spill "content-addressed block files on local disk (every run effect block; readers stream row blocks <=128 rows per open run)"}
+ :result
+ {:datoms 1000000
+  :final-runs 245
+  :final-rows 1000000
+  :rows-lost 0
+  :build-ms 269199.375792
+  :compact-ms 540648.574417
+  :total-ms 809847.950209
+  :throughput-per-sec 1234.7996926360397}
+ :memory
+ {:peak-rss-bytes 3401236480
+  :peak-memory-footprint-bytes 3409415408
+  :source "/usr/bin/time -l"}
+ :supporting-run
+ {:datoms 100000 :heap "-Xmx1g" :peak-rss-bytes 938115072 :final-rows 100000
+  :note "same harness, 2026-07-25 -- 5.2x below the in-memory harness's 4.88GB at the same scale"}
+ :interpretation
+ {:gate "ADR-2607244000 gate-1M: PASS. 1M datoms build+compact with zero row loss under a 4GB heap -- the in-memory harness needed 6.93GB peak RSS at the same scale (2026-07-24 receipt) and its measured slope (~2.3KB/datom) made 10M infeasible. The streaming/spill path bounds co-resident rows at O(fan-in x target-rows) per merge level, independent of dataset size."
+  :throughput "1,235 rows/s end-to-end -- ABOVE the in-memory harness's 1,102 rows/s at 1M despite double-writing every block to disk across levels; the in-memory harness's GC pressure at ~7GB evidently cost more than the spill I/O."
+  :equivalence "final output runs are identical to a single global compact-runs-partitioned pass -- per-level retention idempotence and 2-level==global CID parity are unit-tested (merkle_lsm_test: streaming-compaction-*, retention-is-per-level-idempotent)."
+  :next "gate-10M (-Xmx8g, ADR-2607244000) -- now feasible by design; to be run on this same harness."
+  :caveats ["local SSD spill, not object storage -- adds no network latency; production spill via B2/R2 would shift wall-clock, not memory"
+            "single process; fan-in groups within a level run sequentially (parallelism would raise co-resident bound by the parallelism factor)"
+            "synthetic unique-key workload (no shadowed versions): retention filter exercised but drops nothing; conservation check is exact"]}}

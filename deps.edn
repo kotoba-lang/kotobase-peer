@@ -38,6 +38,9 @@
           :main-opts ["-m" "kotobase-peer.load-test"]}
   :merkle-bench {:extra-paths ["bench"]
                  :main-opts ["-m" "kotobase-peer.merkle-lsm-bench"]}
+  ;; ADR-2607244000 streaming/spill gate harness (bounded-heap compaction).
+  :stream-bench {:extra-paths ["bench"]
+                 :main-opts ["-m" "kotobase-peer.stream-bench"]}
   :view-bench {:extra-paths ["bench"]
                :main-opts ["-m" "kotobase-peer.materialized-view-bench"]}
   :view-delta-bench {:extra-paths ["bench"]

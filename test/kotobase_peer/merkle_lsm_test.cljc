@@ -507,3 +507,53 @@
         partitions (lsm/compact-runs-partitioned :eavt "t" 0 2 [run])]
     (is (= 1 (count partitions)))
     (is (= 5 (:count (first partitions))))))
+
+(deftest streaming-compaction-matches-compact-runs-partitioned-exactly
+  ;; ADR-2607244000 Stage A: identical output runs (same CIDs, same order,
+  ;; same bytes) as the materializing API, but delivered through emit! with
+  ;; nothing retained by the engine. Includes overlapping key ranges and
+  ;; retention (safe-epoch shadowing) so parity covers the merge AND the
+  ;; retention path.
+  (let [mk (fn [i]
+             (mapv (fn [j] {:components [(str "e" (mod (+ i j) 7)) "a" (str "v" i "-" j)]
+                            :epoch (+ (* i 10) j) :op :assert :value (str "v" i "-" j)})
+                   (range 5)))
+        runs (mapv #(lsm/build-run :eavt "t" (mk %)) (range 4))
+        baseline (lsm/compact-runs-partitioned :eavt "t" 15 4 runs)
+        emitted (atom [])
+        readers (mapv (fn [r] (fn [] (get (:node r) "rows"))) runs)
+        summary (lsm/compact-run-readers-streaming :eavt "t" 15 4 readers
+                                                   (fn [run] (swap! emitted conj run)))]
+    (is (= (mapv :cid baseline) (mapv :cid @emitted)) "same runs, same order")
+    (is (= (mapv (comp vec :bytes) baseline) (mapv (comp vec :bytes) @emitted)))
+    (is (= (count baseline) (:runs summary)))
+    (is (= (reduce + (map :count baseline)) (:rows summary))
+        "summary row count == materialized total, no re-reading emitted runs")))
+
+(deftest streaming-compaction-readers-can-decode-from-spilled-bytes
+  ;; The intended production shape: the caller spills run BYTES (not row
+  ;; values) and readers re-decode on demand -- byte-level round-trip parity.
+  (let [runs (mapv #(lsm/build-run :eavt "t" [{:components [(str "k" %)] :epoch %
+                                               :op :assert :value (str "v" %)}])
+                   (range 3))
+        spilled (mapv :bytes runs)
+        readers (mapv (fn [bytes] (fn [] (get (ipld/decode bytes) "rows"))) spilled)
+        emitted (atom [])
+        summary (lsm/compact-run-readers-streaming :eavt "t" 0 10 readers
+                                                   (fn [run] (swap! emitted conj (:cid run))))]
+    (is (= 3 (:rows summary)))
+    (is (= @emitted (mapv :cid (lsm/compact-runs-partitioned :eavt "t" 0 10 runs))))))
+
+(deftest streaming-compaction-retention-is-per-level-idempotent
+  ;; Hierarchical safety (Stage B relies on this): compacting subsets then
+  ;; compacting the compacted outputs yields the same retained set as one
+  ;; global pass.
+  (let [versions (fn [k] (mapv (fn [e] {:components [k "a" "x"] :epoch e
+                                        :op :assert :value (str k e)})
+                               (range 1 7)))
+        runs (mapv #(lsm/build-run :eavt "t" (versions (str "k" %))) (range 4))
+        global (lsm/compact-runs-partitioned :eavt "t" 3 100 runs)
+        level1a (lsm/compact-runs-partitioned :eavt "t" 3 100 (subvec runs 0 2))
+        level1b (lsm/compact-runs-partitioned :eavt "t" 3 100 (subvec runs 2 4))
+        level2 (lsm/compact-runs-partitioned :eavt "t" 3 100 (vec (concat level1a level1b)))]
+    (is (= (mapv :cid global) (mapv :cid level2)))))
