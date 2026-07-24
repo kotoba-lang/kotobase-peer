@@ -1,0 +1,32 @@
+{:schema 1
+ :date "2026-07-25"
+ :implementation "kotobase-peer.stream-bench (compact-run-readers-streaming, ADR-2607244000)"
+ :command "clojure -J-Xmx8g -M:stream-bench 10000000"
+ :environment
+ {:machine "Apple M4, 32GB RAM, macOS (Darwin 25.4.0)"
+  :jvm "OpenJDK 21.0.1"
+  :fan-in 64
+  :target-rows 4096
+  :heap-cap-bytes 8589934592
+  :levels 3
+  :spill "content-addressed block files on local disk"}
+ :result
+ {:datoms 10000000
+  :final-runs 2442
+  :final-rows 10000000
+  :rows-lost 0
+  :build-ms 2372800.130083
+  :compact-ms 7891070.034
+  :total-ms 1.0263870164083E7
+  :throughput-per-sec 974.2913579512748}
+ :memory
+ {:peak-rss-bytes 8473903104
+  :peak-memory-footprint-bytes 8839289792
+  :source "/usr/bin/time -l"}
+ :interpretation
+ {:gate "ADR-2607244000 gate-10M: PASS. 10,000,000 datoms build+compact, zero row loss, under the -Xmx8g heap cap the gate specifies. This is the scale ADR-2607211343 P1 defined in 2026-07-21 and that was MEASURABLY INFEASIBLE for the in-memory compaction path (measured slope ~2.3KB/datom over a ~4.5GB floor -> ~27GB at 10M; two 20GB attempts were stopped)."
+  :scaling "10x data over gate-1M cost 12.7x wall-clock (974 vs 1,235 rows/s; one extra merge level + larger level-2 merges) -- time grows mildly super-linearly, memory stays capped."
+  :rss-note "Peak RSS 8.47GB = the 8GB heap cap plus JVM non-heap overhead; -Xmx bounds the heap and modern GCs expand toward the cap rather than collecting eagerly, so RSS tracks the CAP, not the requirement (gate-1M peaked at 3.40GB under a 4GB cap the same way). The true floor at 10M is untested -- a 10M run under a smaller cap would measure it; not claimed here."
+  :caveats ["local SSD spill; object-storage spill shifts wall-clock, not memory"
+            "sequential groups within a level; parallelism raises the memory bound by its factor"
+            "synthetic unique-key workload: retention exercised, drops nothing, conservation exact"]}}
