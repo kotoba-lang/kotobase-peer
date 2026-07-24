@@ -41,6 +41,11 @@
   ;; ADR-2607244000 streaming/spill gate harness (bounded-heap compaction).
   :stream-bench {:extra-paths ["bench"]
                  :main-opts ["-m" "kotobase-peer.stream-bench"]}
+  ;; ADR-2607250100 axis 1: direct same-JVM comparison vs Datomic Pro
+  ;; (free, in-memory peer). Bench-only dep -- never on the library path.
+  :h2h {:extra-paths ["bench"]
+        :extra-deps {com.datomic/peer {:mvn/version "1.0.7387"}}
+        :main-opts ["-m" "kotobase-peer.head-to-head-datomic"]}
   :view-bench {:extra-paths ["bench"]
                :main-opts ["-m" "kotobase-peer.materialized-view-bench"]}
   :view-delta-bench {:extra-paths ["bench"]
