@@ -819,6 +819,35 @@
            (is (= #{["v1"]} (eng/query db-at-0 {:find '[?v] :where '[["alice" "role" ?v]]} everything))))))))
 
 #?(:clj
+   (deftest hydrate-chain-cached-matches-hydrate-chain-and-reuses-the-rows-cache
+     (let [{:keys [put! get-fn]} (mem-store)
+           c0 (eng/commit! put! get-fn [{:s "alice" :p "role" :o "v1"}] nil test-encrypt-fn)
+           c1 (eng/commit! put! get-fn [{:s "bob" :p "role" :o "v2"}] c0 test-encrypt-fn)
+           folded (eng/fold! put! get-fn c1 test-blind-fn test-encrypt-fn test-decrypt-fn)
+           c2 (eng/commit! put! get-fn [{:s "carol" :p "role" :o "v3"}] folded test-encrypt-fn)
+           cache (atom {})
+           gets (atom 0)
+           counting-get (fn [cid] (swap! gets inc) (get-fn cid))
+           cache-get (fn [k] (get @cache k))
+           cache-put! (fn [k s] (swap! cache assoc k s))
+           plain (eng/hydrate-chain get-fn c2 test-blind-fn test-decrypt-fn)
+           first-run (eng/hydrate-chain-cached counting-get c2 test-blind-fn test-decrypt-fn cache-get cache-put!)
+           first-gets @gets]
+       (testing "parity with hydrate-chain across snapshot AND novelty"
+         (is (= (eng/pull plain "alice") (eng/pull first-run "alice")))
+         (is (= (eng/pull plain "bob") (eng/pull first-run "bob")))
+         (is (= (eng/pull plain "carol") (eng/pull first-run "carol")) "post-fold novelty replays on top")
+         (is (= 1 (count @cache)) "snapshot rows landed in the cache under one snapshot-cid key"))
+       (testing "a second hydration serves the snapshot from the cache (novelty still replays)"
+         (reset! gets 0)
+         (let [second-run (eng/hydrate-chain-cached counting-get c2 test-blind-fn test-decrypt-fn cache-get cache-put!)]
+           (is (= (eng/pull plain "carol") (eng/pull second-run "carol")))
+           (is (< @gets first-gets) "snapshot block walk skipped; only state/novelty reads remain")))
+       (testing "nil cache fns degrade to plain hydrate-chain behavior"
+         (let [degraded (eng/hydrate-chain-cached get-fn c2 test-blind-fn test-decrypt-fn nil nil)]
+           (is (= (eng/pull plain "alice") (eng/pull degraded "alice"))))))))
+
+#?(:clj
    (deftest commit-serialized-basic-single-writer-usage
      (let [{:keys [put! get-fn]} (mem-store)
            heads (atom {})

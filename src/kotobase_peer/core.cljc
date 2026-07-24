@@ -1987,6 +1987,51 @@
                                                            (attempt actual (inc attempts))))))))))))))))]
           (attempt expected-chain-cid 0))))))
 
+(defn hydrate-chain-cached
+  "`hydrate-chain`, with the SNAPSHOT portion memoized through
+   `hydrate-db-cached`'s encoded-rows cache -- `cache-get`/`cache-put!`
+   (both optional; nil for either falls back to plain `hydrate-db`
+   behavior for the snapshot), keyed by snapshot-cid via
+   `hydrate-cache-key`, plus `hydrate-db-cached`'s optional
+   `async-get-fn` (`:cljs` only) for `cold-datoms-async`'s
+   batched-concurrent block discovery. The NOVELTY portion is replayed
+   fresh every call, exactly as `hydrate-chain` does -- novelty is the
+   part that changes between commits, and (post-fold) the part that is
+   small; the snapshot is the part that is big and immutable per
+   snapshot-cid, hence the only part worth caching.
+
+   Motivation (net-kotobase/kotobase-cf-wasm, 2026-07-24): a serving
+   isolate's FIRST read of a graph re-pays the full snapshot
+   decrypt-and-scan even when a sibling isolate in the same colo hydrated
+   the same snapshot moments earlier; a colo-shared rows cache (e.g.
+   Cloudflare Cache API) behind `cache-get`/`cache-put!` turns that into
+   one blob fetch + decode. Same contract as `hydrate-db-cached` for the
+   cache fns: sync bytes|nil on JVM, Promise-returning on cljs.
+
+   Sound by immutability: the cache key is the snapshot-cid (content
+   address); a fold produces a NEW snapshot-cid. Rows land in the cache
+   DECRYPTED (encoded via `hydrate-db-cached`'s own codec) -- callers
+   whose cache medium is less trusted than their own runtime memory must
+   encrypt the blob themselves inside `cache-put!`/`cache-get`.
+
+   Synchronous on JVM; a `js/Promise` of the db on cljs."
+  ([get-fn chain-cid blind-fn decrypt-fn cache-get cache-put!]
+   (hydrate-chain-cached get-fn chain-cid blind-fn decrypt-fn cache-get cache-put! nil))
+  ([get-fn chain-cid blind-fn decrypt-fn cache-get cache-put! async-get-fn]
+   (let [state (state-at get-fn chain-cid)]
+     #?(:clj
+        (let [base (hydrate-db-cached get-fn (indexed-cid state) blind-fn decrypt-fn cache-get cache-put!)
+              novelty-quads (mapcat #(read-tx-block get-fn % decrypt-fn) (novelty-cids get-fn state))]
+          (reduce (fn [db q] (apply-quad db q ipld/link?)) base novelty-quads))
+        :cljs
+        (-> (js/Promise.all
+             #js [(hydrate-db-cached get-fn (indexed-cid state) blind-fn decrypt-fn cache-get cache-put! async-get-fn)
+                  (pmap-async (fn [cid] (read-tx-block get-fn cid decrypt-fn)) (novelty-cids get-fn state))])
+            (.then (fn [results]
+                     (let [[base novelty-quads-per-cid] (vec results)
+                           novelty-quads (apply concat novelty-quads-per-cid)]
+                       (reduce (fn [db q] (apply-quad db q ipld/link?)) base novelty-quads)))))))))
+
 (defn- newly-added-tx-cids
   "Walk `chain-cid`'s full history: for each commit whose OWN novelty list
    grew by exactly one entry relative to the PREVIOUS commit (a plain
