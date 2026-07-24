@@ -1642,8 +1642,9 @@
                  (js/Promise.resolve nil))}
           env #js {"MERKLE_BUCKET" bucket "MERKLE_S3_PREFIX" "test"}
           task-id "bounded-global"
+          pointer-key (worker/global-gc-pointer-key env task-id)
           step! #(worker/step-resumable-global-gc!
-                  env task-id 0 true 10000)]
+                  env task-id 0 true 20001)]
       (letfn [(drive [remaining phases]
                 (if (zero? remaining)
                   (js/Promise.reject (js/Error. "global GC did not finish"))
@@ -1654,7 +1655,29 @@
                            (if (= :completed (:phase result))
                              {:result result :phases phases}
                              (drive (dec remaining) phases))))))))]
-        (-> (drive 30 [])
+        (-> (worker/step-resumable-global-gc!
+             env task-id 0 true 10000
+             {:owner "owner-a" :token "token-a" :lease-ms 10000})
+            (.then
+             (fn [started]
+               (is (= :started (:status started)))
+               (let [pointer
+                     (-> (get @entries pointer-key)
+                         js/JSON.parse js->clj
+                         (assoc "lease-owner" "owner-a"
+                                "lease-token" "token-a"
+                                "lease-expires-at" 20000))]
+                 (swap! entries assoc pointer-key
+                        (js/JSON.stringify (clj->js pointer)))
+                 (swap! versions update pointer-key inc))
+               (worker/step-resumable-global-gc!
+                env task-id 0 true 10001
+                {:owner "owner-b" :token "token-b" :lease-ms 10000})))
+            (.then
+             (fn [leased]
+               (is (= :leased (:status leased)))
+               (is (= :leased (:phase leased)))
+               (drive 30 [])))
             (.then
              (fn [{:keys [result phases]}]
                (is (some #{:marking} phases))

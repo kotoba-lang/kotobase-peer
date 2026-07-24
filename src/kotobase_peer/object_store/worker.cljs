@@ -2764,14 +2764,25 @@
   ([e task-id grace-ms delete?]
    (step-resumable-global-gc! e task-id grace-ms delete? (js/Date.now)))
   ([e task-id grace-ms delete? now-ms]
+   (step-resumable-global-gc!
+    e task-id grace-ms delete? now-ms
+    {:owner (str "global-gc-" (random-uuid))
+     :token (str (random-uuid))
+     :lease-ms 300000}))
+  ([e task-id grace-ms delete? now-ms
+    {:keys [owner token lease-ms] :or {lease-ms 300000} :as lease}]
    (when-not (and (string? task-id) (seq task-id)
                   (<= (count task-id) 256)
                   (integer? grace-ms) (not (neg? grace-ms))
                   (boolean? delete?)
-                  (integer? now-ms) (not (neg? now-ms)))
+                  (integer? now-ms) (not (neg? now-ms))
+                  (string? owner) (seq owner)
+                  (string? token) (seq token)
+                  (pos-int? lease-ms))
      (throw (ex-info "Invalid resumable global GC request"
                      {:task-id task-id :grace-ms grace-ms
-                      :delete? delete? :now-ms now-ms})))
+                      :delete? delete? :now-ms now-ms
+                      :owner owner :lease-ms lease-ms})))
    (if-let [bucket (env e "MERKLE_BUCKET")]
      (-> (read-global-gc-pointer! e task-id)
          (.then
@@ -2787,7 +2798,8 @@
                             "version" 1 "task-id" task-id
                             "phase" "marking"
                             "root-token" root-token
-                            "cutoff" cutoff "delete" (boolean delete?)
+                            "cutoff" cutoff "grace-ms" grace-ms
+                            "delete" (boolean delete?)
                             "scanned" 0 "candidates" 0 "deleted" 0}]
                        (-> (seed-global-gc! e task-id root-cids)
                            (.then
@@ -2801,14 +2813,65 @@
                                       :roots (count root-cids)}))))))))))
               (let [{:keys [pointer etag]} current
                     phase (get pointer "phase")
+                    lease-active?
+                    (> (or (get pointer "lease-expires-at") 0) now-ms)
+                    owned? (= token (get pointer "lease-token"))
                     advance
                     (fn [next response]
-                      (-> (cas-global-gc-pointer! e task-id next etag)
+                      (-> (cas-global-gc-pointer!
+                           e task-id
+                           (dissoc next "lease-owner" "lease-token"
+                                   "lease-expires-at")
+                           etag)
                           (.then
                            (fn [written?]
                              (assoc response
                                     :status (if written? :advanced :fenced))))))]
-                (case phase
+                (cond
+                  (= phase "completed")
+                  {:status :completed :phase :completed
+                   :scanned (get pointer "scanned")
+                   :candidates (get pointer "candidates")
+                   :deleted (get pointer "deleted")}
+
+                  (= phase "aborted")
+                  {:status :aborted :phase :aborted
+                   :aborted (keyword (get pointer "aborted"))}
+
+                  (not= grace-ms (get pointer "grace-ms"))
+                  (js/Promise.reject
+                   (ex-info "Global GC grace mismatch"
+                            {:expected (get pointer "grace-ms")
+                             :actual grace-ms}))
+
+                  (not= (boolean delete?) (get pointer "delete"))
+                  (js/Promise.reject
+                   (ex-info "Global GC delete mode mismatch"
+                            {:expected (get pointer "delete")
+                             :actual delete?}))
+
+                  (and lease-active? (not owned?))
+                  {:status :leased :phase :leased :reason :leased}
+
+                  (not owned?)
+                  (let [claimed
+                        (assoc pointer
+                               "lease-owner" owner
+                               "lease-token" token
+                               "lease-expires-at" (+ now-ms lease-ms))]
+                    (-> (.put bucket (global-gc-pointer-key e task-id)
+                              (js/JSON.stringify (clj->js claimed))
+                              #js {:onlyIf #js {:etagMatches etag}})
+                        (.then
+                         (fn [written]
+                           (if written
+                             (step-resumable-global-gc!
+                              e task-id grace-ms delete? now-ms lease)
+                             {:status :fenced :phase :leased
+                              :reason :pointer-fenced})))))
+
+                  :else
+                  (case phase
                   "marking"
                   (-> (mark-global-gc-page! e task-id)
                       (.then
@@ -2818,8 +2881,9 @@
                                                    "namespace" "blocks"
                                                    "cursor" nil)
                                     {:phase :scanning :namespace :blocks})
-                           {:status :advanced :phase :marking
-                            :processed processed}))))
+                           (advance pointer
+                                    {:phase :marking
+                                     :processed processed})))))
 
                   "scanning"
                   (let [namespace (get pointer "namespace")
@@ -2881,22 +2945,13 @@
                                      :scanned (get pointer "scanned")
                                      :candidates (get pointer "candidates")
                                      :deleted (get pointer "deleted")})
-                           {:status :advanced :phase :cleanup
-                            :cleaned cleaned}))))
-
-                  "completed"
-                  {:status :completed :phase :completed
-                   :scanned (get pointer "scanned")
-                   :candidates (get pointer "candidates")
-                   :deleted (get pointer "deleted")}
-
-                  "aborted"
-                  {:status :aborted :phase :aborted
-                   :aborted (keyword (get pointer "aborted"))}
+                           (advance pointer
+                                    {:phase :cleanup
+                                     :cleaned cleaned})))))
 
                   (js/Promise.reject
                    (ex-info "Unknown resumable global GC phase"
-                            {:phase phase}))))))))
+                            {:phase phase})))))))))
      (js/Promise.reject
       (js/Error. "Resumable global GC currently requires an R2 binding")))))
 

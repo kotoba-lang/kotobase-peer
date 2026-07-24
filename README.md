@@ -285,7 +285,10 @@ Each invocation lists at most 64 objects and advances one of marking,
 namespace scan, root-fenced backup-before-delete sweep, or mark cleanup. This
 keeps data-namespace and reachable-CID working sets independent of database
 size; the legacy whole-inventory `gc-unreachable!` remains available during
-host migration.
+host migration. Every non-terminal step is first claimed with an expiring
+ETag-CAS lease; active contenders return `:leased`, expired work is reclaimed,
+and the lease is removed from the committed checkpoint after each bounded
+effect.
 
 Run `clojure -M:merkle-bench 1000 100000 10000000` for the ADR scale sweep;
 `MERKLE_BENCH_WRITERS` selects simulated concurrent flushers (default 32).
