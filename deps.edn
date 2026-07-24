@@ -46,6 +46,11 @@
   :h2h {:extra-paths ["bench"]
         :extra-deps {com.datomic/peer {:mvn/version "1.0.7387"}}
         :main-opts ["-m" "kotobase-peer.head-to-head-datomic"]}
+  ;; ADR-2607250100 axis 1: direct same-JVM comparison vs Neo4j embedded
+  ;; (community). Bench-only dep -- never on the library path.
+  :h2h-neo4j {:extra-paths ["bench"]
+              :extra-deps {org.neo4j/neo4j {:mvn/version "2025.03.0"}}
+              :main-opts ["-m" "kotobase-peer.head-to-head-neo4j"]}
   :view-bench {:extra-paths ["bench"]
                :main-opts ["-m" "kotobase-peer.materialized-view-bench"]}
   :view-delta-bench {:extra-paths ["bench"]
