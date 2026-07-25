@@ -12,7 +12,8 @@
             [kotobase-peer.merkle-lsm :as lsm]
             [kotobase-peer.resumable-execution :as resumable]
             [kotobase-peer.retention :as retention]
-            [kotobase-peer.object-store.s3-sigv4 :as sigv4]))
+            [sigv4.crypto :as sigv4-crypto]
+            [sigv4.request :as sigv4]))
 
 (defn- env [e k] (gobj/get e k))
 (defn retention-clock-skew-ms [e]
@@ -123,11 +124,27 @@
 (defn configured? [e]
   (boolean (or (env e "MERKLE_BUCKET") (b2-config e))))
 
-(defn- s3-request! [config method key & [{:keys [body headers]}]]
-  (-> (sigv4/signed-headers
-       (assoc config :method method :key key :body body :headers headers))
+(def ^:private signer-crypto (sigv4-crypto/crypto))
+
+(defn signed-s3-request
+  "Sign one S3-compatible request. → Promise<{:method :url :headers :body}>.
+
+  The signer is kotoba-lang/sigv4 (ADR-2607254100); this repo used to carry its
+  own copy, byte-identical to two sibling peers' and subtly different from the
+  other six in the workspace. Public so `object_store_sigv4_test` can check
+  what we actually sign without stubbing the network."
+  [config method key {:keys [body headers]}]
+  (sigv4/signed signer-crypto
+                (assoc config :method method :key key :body body :headers headers
+                       ;; the library reads no clock — signing stays reproducible
+                       :now (.toISOString (js/Date.)))))
+
+(defn- s3-request! [config method key & [{:keys [body headers] :as opts}]]
+  (-> (signed-s3-request config method key (or opts {}))
       (.then (fn [{:keys [url headers]}]
-               (js/fetch url #js {:method method :headers headers :body body})))))
+               (js/fetch url #js {:method method
+                                  :headers (clj->js headers)
+                                  :body body})))))
 
 (defn put-block!
   "Idempotently put CID bytes into R2 or a configured S3-compatible bucket."
