@@ -2806,6 +2806,31 @@
    (deftest history-datoms-nil-chain-cid-is-empty
      (is (= [] (eng/history-datoms nil nil (constantly true) test-decrypt-fn)))))
 
+#?(:clj
+   (deftest tx-range-preserves-transaction-boundaries-across-folds
+     (let [{:keys [put! get-fn]} (mem-store)
+           c1 (eng/commit! put! get-fn
+                           [["e" ":a/x" "v1"] ["e" ":a/y" "v2"]]
+                           nil test-encrypt-fn)
+           c2 (eng/commit! put! get-fn
+                           [[:db/retract "e" ":a/x" "v1"]]
+                           c1 test-encrypt-fn)
+           folded (eng/fold! put! get-fn c2
+                             test-blind-fn test-encrypt-fn test-decrypt-fn)
+           c3 (eng/commit! put! get-fn
+                           [[:db/retractEntity "e"]]
+                           folded test-encrypt-fn)
+           entries (eng/tx-range get-fn c3 nil nil test-decrypt-fn)]
+       (is (= [0 1 3] (mapv :t entries))
+           "fold sequence 2 is administrative and does not become a tx report")
+       (is (= [2 1 1] (mapv (comp count :data) entries)))
+       (is (= {:e "e" :a ":a/x" :v_edn "\"v1\"" :added false}
+              (-> entries second :data first)))
+       (is (= {:e "e" :retract-entity true :added false}
+              (-> entries last :data first)))
+       (is (= [1] (mapv :t
+                        (eng/tx-range get-fn c3 1 3 test-decrypt-fn)))))))
+
 ;; ── materialized views (ADR-2607166600 IVM) ──────────────────────────────────
 
 #?(:clj

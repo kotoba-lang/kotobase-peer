@@ -2049,7 +2049,7 @@
                            novelty-quads (apply concat novelty-quads-per-cid)]
                        (reduce (fn [db q] (apply-quad db q ipld/link?)) base novelty-quads)))))))))
 
-(defn- newly-added-tx-cids
+(defn- newly-added-transactions
   "Walk `chain-cid`'s full history: for each commit whose OWN novelty list
    grew by exactly one entry relative to the PREVIOUS commit (a plain
    `commit!` append, not a `fold!` compaction/reset) AND whose `:seq` is
@@ -2079,8 +2079,57 @@
         (recur cur-count
                (rest remaining)
                (if (and (> seq after-seq) (= cur-count (inc prev-count)))
-                 (conj acc (newest-novelty-cid get-fn norm))
+                 (conj acc {:t seq
+                            :tx-cid (newest-novelty-cid get-fn norm)})
                  acc))))))
+
+(defn- newly-added-tx-cids [get-fn chain-cid after-seq]
+  (mapv :tx-cid
+        (newly-added-transactions get-fn chain-cid after-seq)))
+
+(defn tx-range
+  "Return committed transaction-log entries in `[start, end)`.
+
+  Each entry contains the immutable chain sequence `:t`, the encrypted
+  transaction block CID as `:tx-cid`, and raw operation-shaped `:data`.
+  Assertions/retractions carry Datomic-shaped `:added`; retractEntity is
+  retained as an explicit marker because the original transaction block does
+  not duplicate every affected datom. Synchronous on JVM and Promise-returning
+  on ClojureScript."
+  ([get-fn chain-cid decrypt-fn]
+   (tx-range get-fn chain-cid nil nil decrypt-fn))
+  ([get-fn chain-cid start end decrypt-fn]
+   (let [start (or start 0)
+         selected
+         (filterv
+          (fn [{:keys [t]}]
+            (and (<= start t) (or (nil? end) (< t end))))
+          (newly-added-transactions get-fn chain-cid (dec start)))
+         entry
+         (fn [{:keys [t tx-cid]} quads]
+           {:t t
+            :tx-cid tx-cid
+            :data
+            (mapv
+             (fn [{:keys [s p o op]}]
+               (if (= :retract-entity op)
+                 {:e s :retract-entity true :added false}
+                 {:e s :a p :v_edn (v->edn o)
+                  :added (not= :retract op)}))
+             quads)})]
+     #?(:clj
+        (mapv (fn [transaction]
+                (entry transaction
+                       (read-tx-block get-fn (:tx-cid transaction)
+                                      decrypt-fn)))
+              selected)
+        :cljs
+        (-> (pmap-async
+             (fn [transaction]
+               (-> (read-tx-block get-fn (:tx-cid transaction) decrypt-fn)
+                   (.then #(entry transaction %))))
+             selected)
+            (.then vec))))))
 
 (defn since
   "A hot db containing ONLY the quads from commits with `:seq` greater
