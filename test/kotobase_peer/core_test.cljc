@@ -1033,6 +1033,42 @@
        (is (= (:chain-cid-after folded) (get @heads "actors"))))))
 
 #?(:clj
+   (deftest fold-serialized-if-needed-views-forces-the-fold-below-threshold
+     ;; A caller declaring/updating a materialized view via :views must not
+     ;; have that declaration silently dropped just because novelty happens
+     ;; to be below :threshold right now -- this is the SAME class of
+     ;; "wire opt accepted then ignored" bug kotobase-server's do-fold
+     ;; already guards against for :max-novelty, one layer down in the
+     ;; primitive both do-fold and kotobase-engine's fold! wrapper share.
+     (let [{:keys [put! get-fn store]} (mem-store)
+           heads (atom {})
+           cas! (fn [head-key expected new]
+                  (if (= (get @heads head-key) expected)
+                    (do (swap! heads assoc head-key new) new)
+                    (get @heads head-key)))
+           head1 (:chain-cid-after
+                  (eng/commit-serialized-effective!
+                   put! get-fn cas! "actors" nil
+                   [["entity-1" "role" "user"]]
+                   test-encrypt-fn test-blind-fn test-decrypt-fn))
+           blocks-before (count @store)
+           below (eng/fold-serialized-if-needed!
+                  put! get-fn cas! "actors" head1
+                  test-blind-fn test-encrypt-fn test-decrypt-fn
+                  {:threshold 10})]
+       (is (false? (:committed? below)) "ordinarily a no-op this far below threshold")
+       (is (= blocks-before (count @store)))
+       (let [forced (eng/fold-serialized-if-needed!
+                     put! get-fn cas! "actors" head1
+                     test-blind-fn test-encrypt-fn test-decrypt-fn
+                     {:threshold 10 :views {"roles" {"attrs" ["role"]}}})]
+         (is (true? (:committed? forced)) ":views forces the fold to run despite being below :threshold")
+         (let [view (eng/view-rows get-fn (:chain-cid-after forced) "roles"
+                                  (constantly true) test-decrypt-fn)]
+           (is (some? view) "the declared view is now readable")
+           (is (= 1 (count (:rows view)))))))))
+
+#?(:clj
    (deftest commit-serialized-effective-publishes-only-effective-deltas
      (let [{:keys [put! get-fn]} (mem-store)
            heads (atom {})

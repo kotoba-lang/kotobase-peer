@@ -2626,16 +2626,26 @@
    at least `:threshold`, publish the fold through HeadCAS, and retry from the
    winning head after contention. Below threshold it performs no block writes
    and no CAS. OPTS: `:threshold` (default 64), `:max-novelty` (default the
-   threshold, bounding one invocation), and `:max-retries` (default 10).
+   threshold, bounding one invocation), `:max-retries` (default 10), and
+   `:views` (default nil — a map of `{view-name spec-or-nil}` materialized
+   view declarations, threaded straight to `fold!`'s own `views` param;
+   see its docstring/`materialize-views!`). A non-nil `:views` FORCES the
+   fold to run even when novelty is below `:threshold` — a caller declaring
+   or updating a view needs that declaration persisted regardless of
+   whether there happens to be unfolded novelty to compact right now;
+   without this the view would be silently dropped whenever the graph is
+   already caught up (the same fold-is-a-no-op-below-threshold path this
+   fn otherwise takes for its ordinary maintenance role).
    Returns {:committed? :chain-cid-before :chain-cid-after :novelty-before
    :novelty-after :attempts}. Sync JVM / Promise cljs."
   ([put! get-fn cas! head-key expected-chain-cid blind-fn encrypt-fn decrypt-fn]
    (fold-serialized-if-needed! put! get-fn cas! head-key expected-chain-cid
                                blind-fn encrypt-fn decrypt-fn {}))
   ([put! get-fn cas! head-key expected-chain-cid blind-fn encrypt-fn decrypt-fn
-    {:keys [threshold max-novelty max-retries]
+    {:keys [threshold max-novelty max-retries views]
      :or {threshold default-fold-threshold max-retries default-max-cas-retries}}]
    (let [max-novelty (or max-novelty threshold)
+         force? (some? views)
          report (fn [before after novelty-before attempts committed?]
                   {:committed? committed?
                    :chain-cid-before before :chain-cid-after after
@@ -2648,10 +2658,10 @@
             (throw (ex-info "kotobase-peer: fold-serialized-if-needed! exceeded max-cas-retries"
                             {:head-key head-key :attempts attempts})))
           (let [size (novelty-size get-fn current)]
-            (if (< size threshold)
+            (if (and (not force?) (< size threshold))
               (report current current size attempts false)
               (let [next (fold! put! get-fn current ipld/link? max-novelty
-                                blind-fn encrypt-fn decrypt-fn)
+                                blind-fn encrypt-fn decrypt-fn nil nil nil views)
                     actual (cas! head-key current next)]
                 (if (= actual next)
                   (report current next size attempts true)
@@ -2663,10 +2673,10 @@
                      (ex-info "kotobase-peer: fold-serialized-if-needed! exceeded max-cas-retries"
                               {:head-key head-key :attempts attempts}))
                     (let [size (novelty-size get-fn current)]
-                      (if (< size threshold)
+                      (if (and (not force?) (< size threshold))
                         (js/Promise.resolve (report current current size attempts false))
                         (-> (fold! put! get-fn current ipld/link? max-novelty
-                                   blind-fn encrypt-fn decrypt-fn)
+                                   blind-fn encrypt-fn decrypt-fn nil nil nil views)
                             (.then (fn [next]
                                      (-> (js/Promise.resolve (cas! head-key current next))
                                          (.then (fn [actual]
