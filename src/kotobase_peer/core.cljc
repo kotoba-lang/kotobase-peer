@@ -2026,7 +2026,24 @@
         :cljs
         (-> (js/Promise.all
              #js [(hydrate-db-cached get-fn (indexed-cid state) blind-fn decrypt-fn cache-get cache-put! async-get-fn)
-                  (pmap-async (fn [cid] (read-tx-block get-fn cid decrypt-fn)) (novelty-cids get-fn state))])
+                  ;; Novelty goes through `read-tx-block-async` whenever an
+                  ;; `async-get-fn` is available, for the same reason the snapshot
+                  ;; half does -- and the reason `read-tx-block-async` was written
+                  ;; for `fold!` in the first place: `pmap-async` calls its `f`
+                  ;; inside a promise continuation, so a synchronous `get-fn` miss
+                  ;; thrown there does not return through a `with-blocks` trampoline's
+                  ;; `.catch`, and the read dies on the first un-folded novelty block
+                  ;; against a real async store. `hot-datoms` already routes BOTH
+                  ;; halves; this arity threaded `async-get-fn` to the snapshot half
+                  ;; only, which left every caller that hydrates a full db VALUE --
+                  ;; anything doing q/pull/datoms over `hydrate-chain-cached` rather
+                  ;; than `hot-datoms` -- unable to read back what it had just
+                  ;; written. `async-get-fn` nil keeps the previous path exactly.
+                  (pmap-async (fn [cid]
+                                (if async-get-fn
+                                  (read-tx-block-async async-get-fn cid decrypt-fn)
+                                  (read-tx-block get-fn cid decrypt-fn)))
+                              (novelty-cids get-fn state))])
             (.then (fn [results]
                      (let [[base novelty-quads-per-cid] (vec results)
                            novelty-quads (apply concat novelty-quads-per-cid)]
