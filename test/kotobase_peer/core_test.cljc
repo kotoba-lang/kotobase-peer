@@ -1032,6 +1032,42 @@
        (is (= 2 (:novelty-after folded)) "one scheduler invocation makes bounded progress")
        (is (= (:chain-cid-after folded) (get @heads "actors"))))))
 
+#?(:cljs
+   (deftest fold-serialized-if-needed-forwards-async-block-reads
+     (async done
+       (let [{:keys [put! get-fn]} (mem-store)
+             heads (atom {})
+             async-reads (atom 0)
+             async-get-fn (fn [cid]
+                            (swap! async-reads inc)
+                            (js/Promise.resolve (get-fn cid)))
+             cas! (fn [head-key expected new]
+                    (if (= (get @heads head-key) expected)
+                      (do (swap! heads assoc head-key new) new)
+                      (get @heads head-key)))]
+         (-> (eng/commit! put! get-fn
+                          [{:s "entity-1" :p "role" :o "user"}]
+                          nil test-encrypt-fn)
+             (.then
+              (fn [head]
+                (swap! heads assoc "actors" head)
+                (eng/fold-serialized-if-needed!
+                 put! get-fn cas! "actors" head
+                 test-blind-fn test-encrypt-fn test-decrypt-fn
+                 {:threshold 1
+                  :max-novelty 1
+                  :async-get-fn async-get-fn})))
+             (.then
+              (fn [result]
+                (is (:committed? result))
+                (is (pos? @async-reads)
+                    "serialized fold uses the direct async reader for payload blocks")
+                (done)))
+             (.catch
+              (fn [error]
+                (is false (str error))
+                (done))))))))
+
 #?(:clj
    (deftest fold-serialized-if-needed-views-forces-the-fold-below-threshold
      ;; A caller declaring/updating a materialized view via :views must not

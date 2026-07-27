@@ -2676,7 +2676,10 @@
    winning head after contention. Below threshold it performs no block writes
    and no CAS. OPTS: `:threshold` (default 64), `:max-novelty` (default the
    threshold, bounding one invocation), `:max-retries` (default 10), and
-   `:views` (default nil — a map of `{view-name spec-or-nil}` materialized
+   `:async-get-fn` (default nil — cljs direct Promise-returning block fetch,
+   forwarded to `fold!` so cold snapshots and novelty blocks do not restart
+   an async-store trampoline on every cache miss), and `:views` (default nil
+   — a map of `{view-name spec-or-nil}` materialized
    view declarations, threaded straight to `fold!`'s own `views` param;
    see its docstring/`materialize-views!`). A non-nil `:views` FORCES the
    fold to run even when novelty is below `:threshold` — a caller declaring
@@ -2691,7 +2694,7 @@
    (fold-serialized-if-needed! put! get-fn cas! head-key expected-chain-cid
                                blind-fn encrypt-fn decrypt-fn {}))
   ([put! get-fn cas! head-key expected-chain-cid blind-fn encrypt-fn decrypt-fn
-    {:keys [threshold max-novelty max-retries views]
+    {:keys [threshold max-novelty max-retries async-get-fn views]
      :or {threshold default-fold-threshold max-retries default-max-cas-retries}}]
    (let [max-novelty (or max-novelty threshold)
          force? (some? views)
@@ -2710,7 +2713,7 @@
             (if (and (not force?) (< size threshold))
               (report current current size attempts false)
               (let [next (fold! put! get-fn current ipld/link? max-novelty
-                                blind-fn encrypt-fn decrypt-fn nil nil nil views)
+                                blind-fn encrypt-fn decrypt-fn nil nil async-get-fn views)
                     actual (cas! head-key current next)]
                 (if (= actual next)
                   (report current next size attempts true)
@@ -2725,7 +2728,7 @@
                       (if (and (not force?) (< size threshold))
                         (js/Promise.resolve (report current current size attempts false))
                         (-> (fold! put! get-fn current ipld/link? max-novelty
-                                   blind-fn encrypt-fn decrypt-fn nil nil nil views)
+                                   blind-fn encrypt-fn decrypt-fn nil nil async-get-fn views)
                             (.then (fn [next]
                                      (-> (js/Promise.resolve (cas! head-key current next))
                                          (.then (fn [actual]
