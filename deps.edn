@@ -43,6 +43,15 @@
   :merkle-bench {:extra-paths ["bench"]
                  :main-opts ["-m" "kotobase-peer.merkle-lsm-bench"]}
   ;; ADR-2607244000 streaming/spill gate harness (bounded-heap compaction).
+  ;; ADR-2607244000 Stage B gate: peak RSS vs dataset size, blocks on disk.
+  :chunk-bench {:extra-paths ["bench"]
+                ;; A FIXED SMALL HEAP is the gate, not an RSS slope. RSS tracks
+                ;; the JVM's high-water allocation, so with a large default
+                ;; -Xmx it grows with churn even when the live set is flat, and
+                ;; measures nothing. Completing under a cap the Worker's 128 MB
+                ;; is comparable to is the property we actually need.
+                :jvm-opts ["-Xmx2g"]
+                :main-opts ["-m" "kotobase-peer.chunk-bench"]}
   :stream-bench {:extra-paths ["bench"]
                  :main-opts ["-m" "kotobase-peer.stream-bench"]}
   ;; ADR-2607250100 axis 1: direct same-JVM comparison vs Datomic Pro
