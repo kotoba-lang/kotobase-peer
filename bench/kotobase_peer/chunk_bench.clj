@@ -125,7 +125,17 @@
       (println)
       (let [[a b] [(first results) (last results)]
             d-datoms (- (:datoms b) (:datoms a))
-            d-rss (- (:delta b) (:delta a))]
+            ;; from the ABSOLUTE peak, not from :delta. Delta is peak minus a
+            ;; baseline taken after the same forced collection, so it is ~0 by
+            ;; construction and a slope computed from it always prints 0.0 --
+            ;; a number that reads like a pass while measuring nothing.
+            ;;
+            ;; Sampling is at chunk boundaries, so the in-chunk peak (k readers
+            ;; x one block, plus the chunk's entries) is not observed here; that
+            ;; bound comes from the design and the block-read counts in
+            ;; chunked-compaction-test. What this establishes is that nothing
+            ;; accumulates ACROSS chunks, which is where the old slope came from.
+            d-rss (- (:peak-live b) (:peak-live a))]
         (when (pos? d-datoms)
           (println (format "live-set slope: %.1f bytes/datom  (the 1M RSS receipt measured ~2300)"
                            (/ (double d-rss) d-datoms))))
