@@ -969,6 +969,175 @@
                      (update :rows + (get (:node run) "count"))))
                {:runs 0 :rows 0})))
 
+;; Appended to src/kotobase_peer/merkle_lsm.cljc by add_chunk.py.
+;; Kept in one file with the existing kernel because it needs the private
+;; retention/merge helpers; splitting it would mean making them public.
+
+;; ── CID-checkpointed chunked compaction (ADR-2607244000 Stage B) ─────────────
+;;
+;; `compact-run-readers-streaming` (Stage A) stopped holding the OUTPUT set,
+;; and says so plainly: it "still holds each opened run's decoded rows until
+;; that run is exhausted". That residual is the whole 2.3 KB/datom slope --
+;; a k-way merge over overlapping runs co-resides every opened run's rows, so
+;; peak RSS tracks the DATASET, not the fan-in. Measured: 6.93 GB at 1M datoms
+;; (bench/results/2026-07-24-merkle-lsm-1m.edn), extrapolating past 27 GB at
+;; 10M, against a 128 MB Worker.
+;;
+;; What changes here is not the merge but what a reader is allowed to hold.
+;; A run is already a sequence of row BLOCKS, each descriptor carrying
+;; `logical-min`/`logical-max`, and `row-logical-key` is already documented as
+;; "a portable continuation token". So:
+;;
+;;   * a reader decodes ONE block at a time and drops it when exhausted, so a
+;;     merge of k runs holds O(k x block-rows) rows -- 128 rows/block by
+;;     default, independent of how large the runs are;
+;;   * blocks whose `logical-max` sorts at or before the resume point are
+;;     skipped WITHOUT being fetched, so resuming does not re-read the prefix;
+;;   * a chunk stops at a logical-key boundary and returns that key, so the
+;;     cursor is one string rather than serialized iterator state.
+;;
+;; Because a chunk is a pure function of (inputs, safe-epoch, target, cursor),
+;; its output run is content-addressed: re-running a chunk yields the same CID,
+;; which makes a retry a cache hit instead of recomputation, and makes crash
+;; recovery "which task CIDs already have outputs" rather than a write-ahead
+;; log. That is the property the theory-flavoured version of this idea (trade
+;; space for recomputation) does not get: we are allowed a cache, so the
+;; recomputation is replaced by a lookup.
+;;
+;; RETENTION SAFETY: `retained-entries-from-row-seqs` is per-logical-key local
+;; and idempotent across subsets (its own docstring). A chunk covers whole
+;; logical keys across ALL inputs simultaneously, so per-chunk retention gives
+;; the same surviving set as one global pass.
+
+(defn run-blocks
+  "Block descriptors of a run NODE, or nil when the run stores rows inline."
+  [node]
+  (get node "blocks"))
+
+(defn- block-after?
+  "Can this block be skipped when resuming after AFTER? True when every logical
+  key in the block sorts at or before the cursor."
+  [descriptor after]
+  (and (some? after)
+       (<= (compare (get descriptor "logical-max") after) 0)))
+
+(defn- rows-after
+  "Drop rows whose logical key is at or before AFTER."
+  [rows after]
+  (if (nil? after)
+    rows
+    (drop-while #(<= (compare (row-logical-key %) after) 0) rows)))
+
+(defn block-row-seq
+  "Lazy rows of a block-based run, one decoded block at a time.
+
+  FETCH-BLOCK takes a descriptor's cid string and returns the decoded block
+  node (a map with \"rows\"). Blocks entirely at or before AFTER are skipped
+  without fetching -- that is what keeps a resumed chunk from re-reading the
+  prefix it already compacted.
+
+  Only the current block's rows are reachable from the returned seq, so a
+  consumer that walks it once holds O(block-rows), not O(run)."
+  [descriptors after fetch-block]
+  (letfn [(step [ds]
+            (lazy-seq
+             (when-let [d (first ds)]
+               (if (block-after? d after)
+                 (step (next ds))
+                 (let [cid (get d "cid")
+                       ;; hand the callback a plain CID string, not the IPLD
+                       ;; link wrapper — a caller keying object storage by
+                       ;; (str link) would look up 
+                       cid (if (ipld/link? cid) (str (ipld/link-cid cid)) (str cid))
+                       rows (rows-after (get (fetch-block cid) "rows") after)]
+                   (concat rows (step (next ds))))))))]
+    (step (seq descriptors))))
+
+(defn run-row-seq
+  "Rows of RUN-NODE from just after AFTER, whether the run is inline or blocked."
+  [node after fetch-block]
+  (if-let [descriptors (run-blocks node)]
+    (block-row-seq descriptors after fetch-block)
+    (rows-after (get node "rows") after)))
+
+(defn compact-chunk
+  "One resumable, deterministic slice of a compaction.
+
+  Merges RUN-NODES from just after :after, retains per `safe-epoch`, and emits
+  a single run of at most :target-rows rows, cut at a logical-key boundary (a
+  single hot logical key may exceed the target, exactly as
+  `compact-runs-partitioned` allows).
+
+  Returns
+    {:run          the built run, or nil when nothing remained
+     :next-after   logical key to resume after, or nil when finished
+     :done?        true when the inputs are exhausted
+     :rows         rows in this chunk
+     :blocks-read  blocks actually fetched, so callers can assert bounded work}
+
+  Deterministic: identical arguments produce a byte-identical run and therefore
+  the same CID. Tests pin this, because a non-deterministic chunk would make
+  every cache lookup miss and every resume redo work while still looking
+  correct."
+  [{:keys [index tenant safe-epoch target-rows run-nodes after fetch-block]}]
+  (when-not (and (integer? target-rows) (pos? target-rows))
+    (throw (ex-info "Compaction target rows must be a positive integer"
+                    {:target-rows target-rows})))
+  (let [fetched (atom 0)
+        counting-fetch (fn [cid] (swap! fetched inc) (fetch-block cid))
+        ;; NOTHING here may hold the head of the merged sequence. Binding it to
+        ;; a local that is read again later keeps every realized element — and
+        ;; therefore every decoded block behind it — reachable for the whole
+        ;; chunk, which is the same class of mistake as the eager `mapv` this
+        ;; is replacing. So the walk below consumes the seq exactly once, and
+        ;; learns whether more follows by peeking at the next group rather than
+        ;; by re-traversing.
+        [entries more?]
+        (loop [gs (->> (retained-entries-from-row-seqs
+                        safe-epoch
+                        (mapv #(seq (run-row-seq % after counting-fetch)) run-nodes))
+                       (partition-by :components))
+               acc (transient [])
+               n 0]
+          (if-let [g (first gs)]
+            (if (and (pos? n) (>= n target-rows))
+              [(persistent! acc) true]
+              (recur (next gs)
+                     (reduce conj! acc g)
+                     (+ n (count g))))
+            [(persistent! acc) false]))]
+    (if (empty? entries)
+      {:run nil :next-after nil :done? true :rows 0 :blocks-read @fetched}
+      (let [run (build-run index tenant entries)
+            last-key (row-logical-key (peek (:rows run)))]
+        {:run run
+         :next-after (when more? last-key)
+         :done? (not more?)
+         :rows (count entries)
+         :blocks-read @fetched}))))
+
+(defn compact-chunks
+  "Drive `compact-chunk` to exhaustion, handing each run to EMIT! and keeping
+  nothing. This is the in-process driver; a Worker or a Durable Object runs the
+  same steps one call at a time, persisting :next-after between invocations.
+
+  Returns {:runs n :rows m :chunks c :blocks-read b}."
+  [{:keys [index tenant safe-epoch target-rows run-nodes fetch-block]} emit!]
+  (loop [after nil, acc {:runs 0 :rows 0 :chunks 0 :blocks-read 0}]
+    (let [{:keys [run next-after done? rows blocks-read]}
+          (compact-chunk {:index index :tenant tenant :safe-epoch safe-epoch
+                          :target-rows target-rows :run-nodes run-nodes
+                          :after after :fetch-block fetch-block})
+          acc (cond-> (-> acc
+                          (update :chunks inc)
+                          (update :rows + rows)
+                          (update :blocks-read + blocks-read))
+                run (update :runs inc))]
+      (when run (emit! run))
+      (if (or done? (nil? next-after))
+        acc
+        (recur next-after acc)))))
+
 (defn query-plan
   "Pure first read step: pin the database by asking the host for its head."
   [db-id query]
