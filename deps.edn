@@ -24,7 +24,10 @@
         ;; its own copy of the signer, byte-identical to the one in
         ;; kotobase-peer-atomic and kotobase-peer-main-test.
         io.github.kotoba-lang/sigv4 {:git/sha "9babf9f29b99f128059515e74b00b19ac9cc5436"}
-        io.github.kotoba-lang/prolly-tree {:git/sha "e91eefcd21a4c5302868e519659433385a020961"}}
+        io.github.kotoba-lang/prolly-tree {:git/sha "e91eefcd21a4c5302868e519659433385a020961"}
+        ;; the host-side implementation of the :cache/get//:cache/put effects
+        ;; merkle-lsm has always declared and nothing has ever interpreted.
+        io.github.kotoba-lang/block-cache {:git/sha "f4630b042c6cb365dff32a9ec7ed3d0e76205144"}}
  :aliases
  {:test {:extra-paths ["test"]
          :extra-deps {io.github.cognitect-labs/test-runner
