@@ -291,26 +291,49 @@
       (.commit tx))))
 
 (defn- neo4j-load!
-  "Nodes, then indexes (own transaction -- Neo4j forbids schema and data
-  changes in the same tx), then await online, then relationships."
+  "Nodes, then constraints (own transaction -- Neo4j forbids schema and data
+  changes in the same tx), then await online, then relationships.
+
+  Two things here are load-bearing and were both wrong in the first draft:
+
+  UNIQUENESS CONSTRAINTS, not plain indexes. A unique constraint gives the
+  planner a UniqueIndexSeek it will always prefer; a plain index on a label
+  whose statistics are still empty right after creation can lose to a
+  NodeByLabelScan.
+
+  SEPARATE MATCH CLAUSES, not `MATCH (a:X {..}), (b:Y {..})`. The comma form
+  is planned as a cartesian product of two node scans unless the planner
+  pushes both property predicates into seeks; when it does not, a 20,000-row
+  batch turns into 20,000 x 2 x |label| node touches. Measured symptom: the
+  relationship phase ran for tens of minutes at ~20% of one core with the
+  store file not growing at all. Two separate MATCH clauses give the planner
+  no cartesian option to choose."
   [gdb {:keys [persons knows messages creator reply-of likes]}]
   (batched! gdb "UNWIND $rows AS r CREATE (:Person {pid:r.pid, firstName:r.f, lastName:r.l})"
             (mapv (fn [[id [f l]]] {"pid" id "f" f "l" l}) persons))
   (batched! gdb "UNWIND $rows AS r CREATE (:Message {pid:r.pid, creationDate:r.d, content:r.c})"
             (mapv (fn [[id [d c]]] {"pid" id "d" d "c" (or c "")}) messages))
   (with-open [tx (.beginTx gdb)]
-    (-> (.schema tx) (.indexFor (Label/label "Person")) (.on "pid") (.create))
-    (-> (.schema tx) (.indexFor (Label/label "Message")) (.on "pid") (.create))
+    (-> (.schema tx) (.constraintFor (Label/label "Person")) (.assertPropertyIsUnique "pid") (.create))
+    (-> (.schema tx) (.constraintFor (Label/label "Message")) (.assertPropertyIsUnique "pid") (.create))
     (.commit tx))
   (with-open [tx (.beginTx gdb)]
     (-> (.schema tx) (.awaitIndexesOnline 600 TimeUnit/SECONDS)))
-  (batched! gdb "UNWIND $rows AS r MATCH (a:Person {pid:r.a}), (b:Person {pid:r.b}) CREATE (a)-[:KNOWS]->(b)"
+  (batched! gdb (str "UNWIND $rows AS r "
+                     "MATCH (a:Person {pid:r.a}) MATCH (b:Person {pid:r.b}) "
+                     "CREATE (a)-[:KNOWS]->(b)")
             (mapv (fn [[a b]] {"a" a "b" b}) knows))
-  (batched! gdb "UNWIND $rows AS r MATCH (m:Message {pid:r.m}), (p:Person {pid:r.p}) CREATE (m)-[:HAS_CREATOR]->(p)"
+  (batched! gdb (str "UNWIND $rows AS r "
+                     "MATCH (m:Message {pid:r.m}) MATCH (p:Person {pid:r.p}) "
+                     "CREATE (m)-[:HAS_CREATOR]->(p)")
             (mapv (fn [[m p]] {"m" m "p" p}) creator))
-  (batched! gdb "UNWIND $rows AS r MATCH (c:Message {pid:r.c}), (p:Message {pid:r.p}) CREATE (c)-[:REPLY_OF]->(p)"
+  (batched! gdb (str "UNWIND $rows AS r "
+                     "MATCH (c:Message {pid:r.c}) MATCH (p:Message {pid:r.p}) "
+                     "CREATE (c)-[:REPLY_OF]->(p)")
             (mapv (fn [[c p]] {"c" c "p" p}) reply-of))
-  (batched! gdb "UNWIND $rows AS r MATCH (p:Person {pid:r.p}), (m:Message {pid:r.m}) CREATE (p)-[:LIKES {creationDate:r.d}]->(m)"
+  (batched! gdb (str "UNWIND $rows AS r "
+                     "MATCH (p:Person {pid:r.p}) MATCH (m:Message {pid:r.m}) "
+                     "CREATE (p)-[:LIKES {creationDate:r.d}]->(m)")
             (mapv (fn [[p m d]] {"p" p "m" m "d" d}) likes)))
 
 (defn- neo4j-rows [tx cypher params]
@@ -420,7 +443,7 @@
                  :ic02 (stats (:ic02 kb-times)) :ic07 (stats (:ic07 kb-times))
                  :ic08 (stats (:ic08 kb-times)) :ic09 (stats (:ic09 kb-times))}
       :neo4j-embedded {:load-ms (:ms neo-load)
-                       :version "org.neo4j/neo4j 2025.03.0 embedded (community), temp on-disk store, pid indexes awaited online"
+                       :version "org.neo4j/neo4j 2025.03.0 embedded (community), temp on-disk store, pid UNIQUE constraints awaited online"
                        :ic02 (stats (:ic02 neo-times)) :ic07 (stats (:ic07 neo-times))
                        :ic08 (stats (:ic08 neo-times)) :ic09 (stats (:ic09 neo-times))}
       :answers-agree agreement
