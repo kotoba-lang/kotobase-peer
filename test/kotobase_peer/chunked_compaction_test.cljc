@@ -122,7 +122,15 @@
           a (lsm/compact-chunk args)
           b (lsm/compact-chunk args)]
       (is (= (str (:cid (:run a))) (str (:cid (:run b)))))
-      (is (= (seq (:bytes (:run a))) (seq (:bytes (:run b)))))
+      ;; `vec`, not `seq`. On ClojureScript `(seq some-Uint8Array)` yields a
+      ;; sequence that is not `=` to ANY other -- including itself:
+      ;; `(= (seq a) (seq a))` is false. So this assertion failed on cljs even
+      ;; though the bytes were byte-identical (measured: 1394 elements, zero
+      ;; differing positions) and the CID assertion above passed. It was
+      ;; testing the runtime's typed-array seq semantics, not this code's
+      ;; determinism. `vec` compares elementwise and is correct on both hosts
+      ;; -- which is what `arrangement`'s cljs crypto test already does.
+      (is (= (vec (:bytes (:run a))) (vec (:bytes (:run b)))))
       (is (= (:next-after a) (:next-after b))))))
 
 (deftest whole-run-is-deterministic
