@@ -45,6 +45,7 @@
                :cljs [cljs.reader :as edn])   ; both expose read-string over EDN
             [clojure.string :as str]
             [ipld.core :as ipld]
+            [ipld.value :as ipld-value]
             [prolly-tree.core :as pt]
             [arrangement.core :as qs]
             [arrangement.query :as kqe]
@@ -1567,6 +1568,25 @@
                       (str (subs s 0 (dec (count s))) " ")))))
        (js/Promise.resolve nil))))
 
+(defn- leaf-decoder
+  "Decode a persisted index leaf with the codec that WROTE it.
+
+  `arrangement` schema-version 2 (ADR-kotoba-canonical-value-codec) moved the
+  leaf value slot from the node codec to `kotoba.value.v1`, so a component
+  keeps its TYPE across the round-trip. A reader that assumes version 1
+  against a version-2 snapshot does not fail — it decodes the typed wrapper
+  as if it were the triple, and every row comes back shaped
+  `{:e 16 :a [[4 \"alice\"] ...] :v_edn \"nil\"}`. Silent and wrong, which is
+  why the version is READ from the snapshot rather than assumed.
+
+  Mirrors `arrangement.core/restore`'s own dispatch deliberately: two copies
+  of a codec choice that can disagree are how a format migration corrupts a
+  reader."
+  [snap]
+  (if (= 1 (get snap "schema-version"))
+    (fn [bytes] (mapv qs/edn->link (ipld/decode bytes)))
+    ipld-value/decode-value))
+
 (defn cold-datoms
   "`datomic.datoms`-shaped rows read DIRECTLY from a persisted snapshot without
   rehydrating the whole db. `snapshot-cid` is an arrangement commit CID
@@ -1605,8 +1625,7 @@
                          []
                          (pt/scan-prefix get-fn root-cid (or (components-prefix components blind-fn) "")))
              rows      (for [[_ ciphertext] entries
-                             :let [[k1 k2 v3] (ipld/decode (decrypt-fn ciphertext))
-                                   [e a v]    (->eav (mapv qs/edn->link [k1 k2 v3]))]]
+                             :let [[e a v] (->eav ((leaf-decoder snap) (decrypt-fn ciphertext)))]]
                          {:e e :a a :v_edn (v->edn v) :added true})
              rows      (filter visible? rows)
              rows      (cond->> rows limit (take limit))]
@@ -1623,11 +1642,11 @@
                                       []
                                       (pt/scan-prefix get-fn root-cid (or prefix "")))]
                         (pmap-async (fn [[_ ciphertext]]
-                                      (.then (decrypt-fn ciphertext) ipld/decode))
+                                      (.then (decrypt-fn ciphertext) (leaf-decoder snap)))
                                     entries))))
              (.then (fn [triples]
-                      (let [rows (for [[k1 k2 v3] triples
-                                       :let [[e a v] (->eav (mapv qs/edn->link [k1 k2 v3]))]]
+                      (let [rows (for [triple triples
+                                       :let [[e a v] (->eav triple)]]
                                    {:e e :a a :v_edn (v->edn v) :added true})
                             rows (filter visible? rows)
                             rows (cond->> rows limit (take limit))]
@@ -1664,20 +1683,24 @@
        (let [{:keys [root ->eav]} (index-spec (or index :eavt))]
          (-> (async-get-fn snapshot-cid)
              (.then ipld/decode)
+             ;; the decode has to happen INSIDE this closure: the leaf codec is
+             ;; chosen from the snapshot's own schema-version, and `snap` is
+             ;; not in scope in the `.then`s below.
              (.then (fn [snap]
-                      (let [root-cid (some-> (get-in snap ["index-roots" root]) ipld/link-cid)]
+                      (let [root-cid (some-> (get-in snap ["index-roots" root]) ipld/link-cid)
+                            decode (leaf-decoder snap)]
                         (-> (components-prefix components blind-fn)
                             (.then (fn [prefix]
                                      (if (nil? root-cid)
                                        []
-                                       (pt/scan-prefix-async async-get-fn root-cid (or prefix "")))))))))
-             (.then (fn [entries]
-                      (pmap-async (fn [[_ ciphertext]]
-                                    (.then (decrypt-fn ciphertext) ipld/decode))
-                                  entries)))
+                                       (pt/scan-prefix-async async-get-fn root-cid (or prefix "")))))
+                            (.then (fn [entries]
+                                     (pmap-async (fn [[_ ciphertext]]
+                                                   (.then (decrypt-fn ciphertext) decode))
+                                                 entries)))))))
              (.then (fn [triples]
-                      (let [rows (for [[k1 k2 v3] triples
-                                       :let [[e a v] (->eav (mapv qs/edn->link [k1 k2 v3]))]]
+                      (let [rows (for [triple triples
+                                       :let [[e a v] (->eav triple)]]
                                    {:e e :a a :v_edn (v->edn v) :added true})
                             rows (filter visible? rows)
                             rows (cond->> rows limit (take limit))]
