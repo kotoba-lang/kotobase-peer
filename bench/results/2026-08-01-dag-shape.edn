@@ -1,6 +1,6 @@
 {:schema 1
  :receipt/type :dag-shape
- :date "2026-08-02"
+ :date "2026-08-01"
  :implementation "kotobase-peer.dag-shape-bench (clojure -M:dag-shape-bench)"
  :adr "ADR-2607310900 訂正5 / ADR-2608021000 -- the precondition 訂正4 set: measure the block DAG's depth and width before retrying a prefetch strategy"
  :environment
