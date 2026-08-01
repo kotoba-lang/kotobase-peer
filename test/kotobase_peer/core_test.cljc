@@ -1330,12 +1330,22 @@
              c0 (eng/commit! put! get-fn [{:s "alice" :p "role" :o "admin"}] nil test-encrypt-fn)
              c1 (eng/commit! put! get-fn [{:s "bob" :p "role" :o "user"}] c0 test-encrypt-fn)
              {:keys [state]} (cd/head get-fn c1)
+             ;; The fixture below needs the tx links out of a REAL chain so it
+             ;; can rebuild them in the legacy flat-vector shape. Novelty nodes
+             ;; carry up to `novelty-segment-size` entries under "es" as of
+             ;; ADR-2608021000 §3; older nodes carry one under "e". This reads
+             ;; either, because what is under test is how a LEGACY STATE reads,
+             ;; not what shape today's writer happens to emit.
              walk-chain (fn walk-chain [head-link]
                           (loop [cid (some-> head-link ipld/link-cid) acc []]
                             (if (nil? cid)
                               acc
-                              (let [{:strs [e rest]} (ipld/get-node get-fn cid)]
-                                (recur (some-> rest ipld/link-cid) (conj acc e))))))
+                              (let [node (ipld/get-node get-fn cid)
+                                    links (if (contains? node "es")
+                                            (mapv #(get % "e") (get node "es"))
+                                            [(get node "e")])]
+                                (recur (some-> (get node "rest") ipld/link-cid)
+                                       (into acc links))))))
              tx-links (into (walk-chain (get state "novelty-front"))
                             (rseq (walk-chain (get state "novelty-back"))))
              legacy-state {"indexed" nil "novelty" tx-links}
@@ -2414,12 +2424,22 @@
      (async done
        (let [{:keys [put! get-fn]} (mem-store)
              everything (constantly true)
+             ;; The fixture below needs the tx links out of a REAL chain so it
+             ;; can rebuild them in the legacy flat-vector shape. Novelty nodes
+             ;; carry up to `novelty-segment-size` entries under "es" as of
+             ;; ADR-2608021000 §3; older nodes carry one under "e". This reads
+             ;; either, because what is under test is how a LEGACY STATE reads,
+             ;; not what shape today's writer happens to emit.
              walk-chain (fn walk-chain [head-link]
                           (loop [cid (some-> head-link ipld/link-cid) acc []]
                             (if (nil? cid)
                               acc
-                              (let [{:strs [e rest]} (ipld/get-node get-fn cid)]
-                                (recur (some-> rest ipld/link-cid) (conj acc e))))))]
+                              (let [node (ipld/get-node get-fn cid)
+                                    links (if (contains? node "es")
+                                            (mapv #(get % "e") (get node "es"))
+                                            [(get node "e")])]
+                                (recur (some-> (get node "rest") ipld/link-cid)
+                                       (into acc links))))))]
          (-> (eng/commit! put! get-fn [{:s "alice" :p "role" :o "admin"}] nil test-encrypt-fn)
              (.then (fn [c0] (eng/commit! put! get-fn [{:s "bob" :p "role" :o "user"}] c0 test-encrypt-fn)))
              (.then (fn [c1]
