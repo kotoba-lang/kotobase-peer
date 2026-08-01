@@ -56,62 +56,91 @@
 
 ;; ── CSV ────────────────────────────────────────────────────────────────────
 
-(defn- rows
-  "Lazy seq of split rows (header dropped) for one LDBC composite CSV."
-  [dir file]
+(defn- reduce-rows
+  "Stream one LDBC composite CSV through `rf` (header dropped), splitting each
+  line only as it is consumed. The comment and likes files are 2M+ rows each;
+  realising them as a seq of vectors was costing multiple GB of heap for data
+  the subset immediately discards."
+  [dir file rf init]
   (let [f (io/file dir file)]
     (when-not (.exists f)
       (throw (ex-info "LDBC csv missing" {:file (.getPath f)})))
     (with-open [r (io/reader f)]
-      (doall (map #(str/split % #"\|" -1) (rest (line-seq r)))))))
+      (reduce (fn [acc line] (rf acc (str/split line #"\|" -1)))
+              init (rest (line-seq r))))))
+
+(defn- rows
+  "Fully realised rows -- only for the small files (person, knows)."
+  [dir file]
+  (reduce-rows dir file conj []))
 
 (defn- load-subset
-  "Real LDBC SF1, subset per the ns docstring. Returns plain maps/vectors."
+  "Real LDBC SF1, subset per the ns docstring. Two passes on purpose: the
+  reply forest is resolved from the (small-per-row) replyOf files first, so
+  the 2M-row comment body file is streamed once and only the kept rows are
+  retained."
   [dir n-posts]
   (let [persons (into {} (map (fn [[id fname lname & _]] [id [fname lname]]))
                       (rows dir "person_0_0.csv"))
         knows (mapv (fn [[a b & _]] [a b]) (rows dir "person_knows_person_0_0.csv"))
         ;; posts: keep the n-posts most recent by creationDate
-        all-posts (mapv (fn [[id _img cd _ip _br _lang content _len]] [id (parse-long cd) content])
-                        (rows dir "post_0_0.csv"))
-        kept-posts (->> all-posts (sort-by second >) (take n-posts) vec)
+        kept-posts (->> (reduce-rows dir "post_0_0.csv"
+                                     (fn [acc [id _img cd _ip _br _lang content _len]]
+                                       (conj! acc [id (parse-long cd) content]))
+                                     (transient []))
+                        persistent! (sort-by second >) (take n-posts) vec)
         post-ids (into #{} (map first) kept-posts)
-        ;; comments: every comment transitively replying into kept posts.
-        c-rows (rows dir "comment_0_0.csv")
-        comment-meta (into {} (map (fn [[id cd _ip _br content _len]] [id [(parse-long cd) content]])) c-rows)
-        reply-post (into {} (map (fn [[c p]] [c p])) (rows dir "comment_replyOf_post_0_0.csv"))
-        reply-comment (into {} (map (fn [[c p]] [c p])) (rows dir "comment_replyOf_comment_0_0.csv"))
+        reply-post (reduce-rows dir "comment_replyOf_post_0_0.csv"
+                                (fn [acc [c p]] (if (post-ids p) (conj! acc c) acc))
+                                (transient []))
+        reply-comment (persistent!
+                       (reduce-rows dir "comment_replyOf_comment_0_0.csv"
+                                    (fn [acc [c p]] (conj! acc [c p])) (transient [])))
         ;; fixpoint over the reply forest: a comment is kept if its parent is kept
         kept-comments
-        (loop [frontier (into #{} (comp (filter (fn [[_ p]] (post-ids p))) (map first)) reply-post)
-               kept #{}]
+        (loop [frontier (set (persistent! reply-post)) kept #{}]
           (if (empty? frontier)
             kept
             (let [kept' (into kept frontier)
-                  next (into #{} (comp (filter (fn [[_ parent]] (frontier parent))) (map first))
-                             reply-comment)]
-              (recur (into #{} (remove kept') next) kept'))))
-        msg-ids (into post-ids kept-comments)
-        post-creator (into {} (comp (filter (fn [[m _]] (post-ids m))) (map vec))
-                           (rows dir "post_hasCreator_person_0_0.csv"))
-        comment-creator (into {} (comp (filter (fn [[m _]] (kept-comments m))) (map vec))
-                              (rows dir "comment_hasCreator_person_0_0.csv"))
-        likes (into (vec (keep (fn [[p m cd]] (when (post-ids m) [p m (parse-long cd)]))
-                               (rows dir "person_likes_post_0_0.csv")))
-                    (keep (fn [[p m cd]] (when (kept-comments m) [p m (parse-long cd)]))
-                          (rows dir "person_likes_comment_0_0.csv")))]
+                  nxt (into #{} (comp (filter (fn [[_ parent]] (frontier parent)))
+                                      (map first)
+                                      (remove kept'))
+                            reply-comment)]
+              (recur nxt kept'))))
+        comment-meta (persistent!
+                      (reduce-rows dir "comment_0_0.csv"
+                                   (fn [acc [id cd _ip _br content _len]]
+                                     (if (kept-comments id)
+                                       (assoc! acc id [(parse-long cd) content])
+                                       acc))
+                                   (transient {})))
+        keep-pairs (fn [file pred]
+                     (persistent!
+                      (reduce-rows dir file
+                                   (fn [acc [a b]] (if (pred a) (assoc! acc a b) acc))
+                                   (transient {}))))
+        keep-likes (fn [file pred]
+                     (persistent!
+                      (reduce-rows dir file
+                                   (fn [acc [p m cd]]
+                                     (if (pred m) (conj! acc [p m (parse-long cd)]) acc))
+                                   (transient []))))]
     {:persons persons
      :knows knows
      :messages (into (into {} (map (fn [[id cd content]] [id [cd content]])) kept-posts)
                      (map (fn [c] [c (comment-meta c)])) kept-comments)
      :post-ids post-ids
      :comment-ids kept-comments
-     :creator (merge post-creator comment-creator)
-     :reply-of (into (into {} (comp (filter (fn [[c p]] (and (kept-comments c) (post-ids p)))) (map vec)) reply-post)
-                     (comp (filter (fn [[c p]] (and (kept-comments c) (kept-comments p)))) (map vec))
+     :creator (merge (keep-pairs "post_hasCreator_person_0_0.csv" post-ids)
+                     (keep-pairs "comment_hasCreator_person_0_0.csv" kept-comments))
+     :reply-of (into (into {} (filter (fn [[c p]] (and (kept-comments c) (post-ids p))))
+                           (persistent!
+                            (reduce-rows dir "comment_replyOf_post_0_0.csv"
+                                         (fn [acc [c p]] (conj! acc [c p])) (transient []))))
+                     (filter (fn [[c p]] (and (kept-comments c) (kept-comments p))))
                      reply-comment)
-     :likes likes
-     :msg-ids msg-ids}))
+     :likes (into (keep-likes "person_likes_post_0_0.csv" post-ids)
+                  (keep-likes "person_likes_comment_0_0.csv" kept-comments))}))
 
 ;; ── kotobase side ──────────────────────────────────────────────────────────
 
@@ -166,25 +195,27 @@
 
 (defn- kb-ic09
   "IC09: same as IC02 but over friends AND friends-of-friends, excluding the
-  start person. Two joins unioned in the harness -- `or-join` over two
-  different path lengths is expressible but the union is the same answer and
-  keeps the two engines' semantics obviously identical."
+  start person. TWO joins unioned, not one join plus a query per reachable
+  person: a high-degree LDBC start person reaches ~1,300 people at two hops,
+  and issuing 1,300 point queries would measure the harness's loop rather
+  than the engine's join."
   [db person max-date]
-  (let [one (eng/query db '{:find [?friend] :in [?person]
-                            :where [[?person "knows" ?friend]]}
+  (let [one (eng/query db '{:find [?f ?msg ?date]
+                            :in [?person]
+                            :where [[?person "knows" ?f]
+                                    [?msg "hasCreator" ?f]
+                                    [?msg "message/creationDate" ?date]]}
                        everything [person])
-        two (eng/query db '{:find [?fof] :in [?person]
-                            :where [[?person "knows" ?f1] [?f1 "knows" ?fof]]}
-                       everything [person])
-        reach (disj (into (into #{} (map first) one) (map first) two) person)]
-    (->> reach
-         (mapcat (fn [p]
-                   (map (fn [[m d]] [p m (parse-long d)])
-                        (eng/query db '{:find [?msg ?date] :in [?p]
-                                        :where [[?msg "hasCreator" ?p]
-                                                [?msg "message/creationDate" ?date]]}
-                                   everything [p]))))
-         (filter (fn [[_ _ d]] (< d max-date)))
+        two (eng/query db '{:find [?f2 ?msg ?date]
+                            :in [?person]
+                            :where [[?person "knows" ?f1]
+                                    [?f1 "knows" ?f2]
+                                    [?msg "hasCreator" ?f2]
+                                    [?msg "message/creationDate" ?date]]}
+                       everything [person])]
+    (->> (into one two)
+         (remove (fn [[f _ _]] (= f person)))
+         (keep (fn [[f m d]] (let [dl (parse-long d)] (when (< dl max-date) [f m dl]))))
          (sort-by (juxt (comp - #(nth % 2)) second))
          (take 20) vec)))
 
