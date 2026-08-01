@@ -67,6 +67,13 @@
   :h2h-neo4j {:extra-paths ["bench"]
               :extra-deps {org.neo4j/neo4j {:mvn/version "2025.03.0"}}
               :main-opts ["-m" "kotobase-peer.head-to-head-neo4j"]}
+  :ic09-diag {:extra-paths ["bench"]
+              ;; ldbc-snb-bench imports Neo4j classes at ns load; this
+              ;; diagnostic only reuses its loader, but the ns still has to
+              ;; resolve.
+              :extra-deps {org.neo4j/neo4j {:mvn/version "2025.03.0"}}
+              :jvm-opts ["-Xmx12g"]
+              :main-opts ["-m" "kotobase-peer.ic09-diag"]}
   :ldbc-snb-bench {:extra-paths ["bench"]
                    :extra-deps {org.neo4j/neo4j {:mvn/version "2025.03.0"}}
                    :jvm-opts ["-Xmx12g"]
