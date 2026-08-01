@@ -7,6 +7,7 @@ on:
 
 jobs:
   test:
+    name: JVM
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -14,3 +15,25 @@ jobs:
         with:
           cli: latest
       - run: clojure -M:test
+
+  # The ClojureScript half was missing, and that is not a hypothetical cost:
+  # `chunk-is-deterministic` was FAILING on cljs and nothing reported it. The
+  # runtime that actually ships this code is ClojureScript -- the object-store
+  # Worker is a Cloudflare Worker -- so the untested half was the one that
+  # matters. A `.cljc` portability claim that no machine checks is a claim.
+  test-cljs:
+    name: ClojureScript
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeLaGuardo/setup-clojure@13.4
+        with:
+          cli: latest
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm install
+      # `test:cljs` regenerates shadow-cljs.edn from `clojure -Spath`, so the
+      # cljs build resolves the same pinned SHAs the JVM job uses rather than a
+      # separately-drifting source list.
+      - run: npm run test:cljs
