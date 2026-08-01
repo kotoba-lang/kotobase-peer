@@ -980,22 +980,68 @@
 
 ;; ── novelty cons-chains (front/back) ────────────────────────────────────────
 
+(def ^:private novelty-segment-size
+  "Entries per novelty chain node. 1 was the original shape: one block per
+  unfolded transaction, so ENUMERATING novelty cost one sequential block
+  fetch per transaction. Measured (bench/results/2026-08-01-dag-shape.edn,
+  ADR-2608021000): at the fold threshold of 64 that walk was 91-97% of a
+  hydrate's sequential round trips, against 2-3 for the whole prolly-tree,
+  and no prefetch can flatten it because each successor CID only exists
+  inside its predecessor. Batching k entries per node divides the hops by k.
+
+  16 matches `novelty-index-segment-size`, which already uses this exact
+  shape for the subject directory -- the pattern was in the codebase, just
+  not applied to the queue it was measured on. The trade is that a push into
+  a partly-filled head segment re-encodes that segment's <=16 entries
+  instead of writing one fresh node; that is a bounded constant on a small
+  block, paid on the write path, to remove a linear term from every read."
+  16)
+
 (defn- novelty-node-cid!
   "Puts one {\"e\" tx-link \"rest\" rest-link|nil \"subjects\" [...]?} node, returns its cid
   (string, NOT wrapped in a Link -- callers wrap when storing it as a
-  value)."
+  value). Single-entry shape, kept because live chains are full of these
+  nodes and `walk-novelty-entries` must keep reading them; new pushes write
+  the segment shape below."
   ([put! tx-cid rest-link] (novelty-node-cid! put! tx-cid rest-link nil))
   ([put! tx-cid rest-link subject-tokens]
    (ipld/put-node! put! (cond-> {"e" (ipld/link tx-cid) "rest" rest-link}
                           (seq subject-tokens) (assoc "subjects" (vec subject-tokens))))))
 
+(defn- entry->node-entry [{:keys [cid subjects]}]
+  (cond-> {"e" (ipld/link cid)}
+    (seq subjects) (assoc "subjects" (vec subjects))))
+
+(defn- node-entry->entry [{:strs [e subjects]}]
+  {:cid (ipld/link-cid e) :subjects subjects})
+
+(defn- novelty-segment-cid!
+  "Puts one {\"es\" [entry ...] \"rest\" rest-link|nil} node. `entries` are in
+  WALK ORDER -- the order `walk-novelty-entries` should emit them for this
+  chain's direction -- so the same node shape serves the newest-first `back`
+  chain and the oldest-first `front` chain without either needing to know
+  about the other."
+  [put! entries rest-link]
+  (ipld/put-node! put! {"es" (mapv entry->node-entry entries) "rest" rest-link}))
+
+(defn- node-entries
+  "Entries of one novelty chain node, in walk order, for EITHER shape: the
+  single-entry `{\"e\" ..}` nodes every live chain is made of, and the
+  `{\"es\" [..]}` segments this build writes. A chain freely mixes both --
+  a graph that was written before this landing keeps its old nodes and grows
+  segments on top, with no migration step."
+  [node]
+  (if (contains? node "es")
+    (mapv node-entry->entry (get node "es"))
+    [{:cid (ipld/link-cid (get node "e")) :subjects (get node "subjects")}]))
+
 (defn- walk-novelty-entries [get-fn head-cid]
   (loop [cid head-cid acc []]
     (if (nil? cid)
       acc
-      (let [{:strs [e rest subjects]} (ipld/get-node get-fn cid)]
-        (recur (some-> rest ipld/link-cid)
-               (conj acc {:cid (ipld/link-cid e) :subjects subjects}))))))
+      (let [node (ipld/get-node get-fn cid)]
+        (recur (some-> (get node "rest") ipld/link-cid)
+               (into acc (node-entries node)))))))
 
 (defn- build-novelty-chain!
   "Builds a new cons-chain from `cids` (a vector, in the order you want when
@@ -1006,11 +1052,11 @@
   cost either of those two callers pays, never repeated per-entry on a later
   unrelated push."
   [put! entries]
-  (reduce (fn [rest-link entry]
-            (let [{:keys [cid subjects]} (if (map? entry) entry {:cid entry})]
-              (ipld/link (novelty-node-cid! put! cid rest-link subjects))))
-          nil
-          (reverse entries)))
+  (let [normalized (mapv (fn [entry] (if (map? entry) entry {:cid entry})) entries)]
+    (reduce (fn [rest-link segment]
+              (ipld/link (novelty-segment-cid! put! segment rest-link)))
+            nil
+            (reverse (partition-all novelty-segment-size normalized)))))
 
 (defn- novelty-entries [get-fn state]
   (if (legacy-novelty-state? state)
@@ -1080,27 +1126,57 @@
   (if (legacy-novelty-state? state)
     (some-> (peek (get state "novelty" [])) ipld/link-cid)
     (when-let [back-cid (some-> (get state "novelty-back") ipld/link-cid)]
-      (ipld/link-cid (get (ipld/get-node get-fn back-cid) "e")))))
+      ;; `back` walks newest-first and a segment's entries are stored in that
+      ;; same walk order, so the newest push is the FIRST entry of the head
+      ;; node -- for a legacy single-entry node that is its only entry, which
+      ;; is why this reads through `node-entries` rather than "e" directly.
+      (:cid (first (node-entries (ipld/get-node get-fn back-cid)))))))
 
 (defn- push-novelty!
   "Returns a NEW {\"novelty-front\" .. \"novelty-back\" .. \"novelty-count\"
-  ..} triple with `tx-cid` pushed onto the back. O(1) in steady state (one
-  new small cons node; `front` and every EXISTING `back` node are never
-  touched/re-encoded) -- THE actual fix for kotoba-lang/kotobase-peer#16
-  (the flat vector this replaces had to be decoded+re-encoded WHOLE on
-  every single push). Migrates a legacy flat-vector novelty into the new
-  front chain the first time a push touches it -- O(legacy length), paid
-  once, never again for that chain."
-  ([put! state tx-cid] (push-novelty! put! state tx-cid nil))
-  ([put! state tx-cid subject-tokens]
+  ..} triple with `tx-cid` pushed onto the back. Migrates a legacy
+  flat-vector novelty into the new front chain the first time a push touches
+  it -- O(legacy length), paid once, never again for that chain.
+
+  Cost, and why it changed: this used to write ONE single-entry node per
+  push and touch nothing else, which was the fix for kotoba-lang/
+  kotobase-peer#16 (the flat vector it replaced was decoded and re-encoded
+  WHOLE on every push). It now appends into a bounded head SEGMENT of up to
+  `novelty-segment-size` entries, which means reading that head node and
+  re-encoding its <=16 entries. That is deliberately trading a bounded
+  constant on the WRITE path for a linear term on every READ path: measured
+  (ADR-2608021000), enumerating novelty was 91-97% of a hydrate's sequential
+  round trips at the fold threshold, because the successor CID of a
+  single-entry node only exists inside that node. It is NOT a return to
+  kotobase-peer#16 -- the re-encoded node is bounded at 16 entries and never
+  grows with the backlog, which is exactly the property the flat vector
+  lacked.
+
+  `get-fn` is required for that head read. A legacy single-entry head is
+  never rewritten -- the new entry starts a fresh segment pointing at it --
+  so an existing chain keeps its old nodes and grows segments on top, with
+  no migration step and no rewrite of history."
+  ([put! get-fn state tx-cid] (push-novelty! put! get-fn state tx-cid nil))
+  ([put! get-fn state tx-cid subject-tokens]
   (if (legacy-novelty-state? state)
     (let [legacy-cids (mapv ipld/link-cid (get state "novelty" []))]
       {"novelty-front" (build-novelty-chain! put! legacy-cids)
        "novelty-back" (ipld/link (novelty-node-cid! put! tx-cid nil subject-tokens))
        "novelty-count" (inc (count legacy-cids))})
-    (let [back-link (get state "novelty-back")]
+    (let [back-link (get state "novelty-back")
+          head (when back-link (ipld/get-node get-fn (ipld/link-cid back-link)))
+          head-entries (when (and head (contains? head "es")) (get head "es"))
+          entry (entry->node-entry {:cid tx-cid :subjects subject-tokens})
+          ;; `back` walks newest-first, so a new entry goes at the FRONT of the
+          ;; head segment's walk-order vector. A full segment (or a legacy
+          ;; single-entry head, which is not a segment and is never rewritten)
+          ;; starts a fresh one pointing at the old head.
+          node (if (and head-entries (< (count head-entries) novelty-segment-size))
+                 (ipld/put-node! put! {"es" (into [entry] head-entries)
+                                       "rest" (get head "rest")})
+                 (ipld/put-node! put! {"es" [entry] "rest" back-link}))]
       {"novelty-front" (get state "novelty-front")
-       "novelty-back" (ipld/link (novelty-node-cid! put! tx-cid back-link subject-tokens))
+       "novelty-back" (ipld/link node)
        "novelty-count" (inc (get state "novelty-count" 0))}))))
 
 (defn- take-oldest-novelty
@@ -1247,7 +1323,7 @@
        (let [tokens (when blind-fn (mapv blind-fn subjects))
              tx-cid (put-tx-block! put! quads encrypt-fn)
              new-state (merge (dissoc state "novelty" "novelty-subject-index")
-                              (push-novelty! put! state tx-cid tokens)
+                              (push-novelty! put! get-fn state tx-cid tokens)
                               (append-novelty-index! put! get-fn state tx-cid tokens))]
          (cd/commit! put! get-fn new-state prev-chain-cid))
        :cljs
@@ -1257,7 +1333,7 @@
            (.then (fn [results]
                     (let [[tx-cid tokens] (vec results)
                           new-state (merge (dissoc state "novelty" "novelty-subject-index")
-                                           (push-novelty! put! state tx-cid tokens)
+                                           (push-novelty! put! get-fn state tx-cid tokens)
                                            (append-novelty-index! put! get-fn state tx-cid tokens))]
                       (cd/commit! put! get-fn new-state prev-chain-cid)))))))))
 
