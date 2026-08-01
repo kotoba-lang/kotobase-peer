@@ -64,6 +64,13 @@
   :h2h-neo4j {:extra-paths ["bench"]
               :extra-deps {org.neo4j/neo4j {:mvn/version "2025.03.0"}}
               :main-opts ["-m" "kotobase-peer.head-to-head-neo4j"]}
+  :ldbc-snb-bench {:extra-paths ["bench"]
+                   :extra-deps {org.neo4j/neo4j {:mvn/version "2025.03.0"}}
+                   :jvm-opts ["-Xmx12g"]
+                   :main-opts ["-m" "kotobase-peer.ldbc-snb-bench"]}
+  :dag-shape-bench {:extra-paths ["bench"]
+                    :jvm-opts ["-Xmx8g"]
+                    :main-opts ["-m" "kotobase-peer.dag-shape-bench"]}
   :view-bench {:extra-paths ["bench"]
                :main-opts ["-m" "kotobase-peer.materialized-view-bench"]}
   :view-delta-bench {:extra-paths ["bench"]
