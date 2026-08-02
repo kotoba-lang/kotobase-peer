@@ -11,7 +11,7 @@
  ;; representation (kotoba : kotobase = Clojure : Datomic, ADR-2607032500).
  :deps {;; formerly two deps here (kqe + quad-store) -- kqe merged into
         ;; arrangement (ADR-2607050700), so this is the one coordinate now.
-        io.github.kotoba-lang/arrangement {:git/sha "7a0a20022f3544d10c379fc41da7dbb1a552febc"}
+        io.github.kotoba-lang/arrangement {:git/sha "5519c5eb44c3a1840f56129235c7c57278c5a4e2"}
         io.github.kotoba-lang/chain {:git/sha "6da9ce3b69b5e591bdcf275519afa91b126a22a8"}
         io.github.kotoba-lang/datom      {:git/sha "d27a5833d59d909367956705f2ec931399c891ee"}
         ;; DIRECT dep as of ADR-2607120730's follow-up (hydrate-db-cached's
@@ -67,6 +67,10 @@
   :h2h-neo4j {:extra-paths ["bench"]
               :extra-deps {org.neo4j/neo4j {:mvn/version "2025.03.0"}}
               :main-opts ["-m" "kotobase-peer.head-to-head-neo4j"]}
+  :ic02-diag {:extra-paths ["bench"]
+              :extra-deps {org.neo4j/neo4j {:mvn/version "2025.03.0"}}
+              :jvm-opts ["-Xmx12g"]
+              :main-opts ["-m" "kotobase-peer.ic02-diag"]}
   :ic09-diag {:extra-paths ["bench"]
               ;; ldbc-snb-bench imports Neo4j classes at ns load; this
               ;; diagnostic only reuses its loader, but the ns still has to
