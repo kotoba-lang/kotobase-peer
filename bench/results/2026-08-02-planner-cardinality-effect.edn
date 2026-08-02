@@ -1,0 +1,44 @@
+{:schema 1
+ :receipt/type :planner-cardinality-effect
+ :date "2026-08-02"
+ :implementation "kotobase-peer.scan-instrument, both pins run back to back in the same window"
+ :adr "ADR-2608021000 §6-5 B-1 -- the planner counts instead of materialising"
+ :pins {:pre "arrangement 5519c5eb -- planner estimates with (count (query ...))"
+        :post "arrangement 68c2225d + kotobase-peer ce390168 -- planner estimates with cardinality"}
+
+ :measured-same-window
+ {:ic09-two-hop {:planning-ms {:pre 627.5 :post 176.9 :ratio 3.55}
+                 :executing-ms {:pre 1085.0 :post 1215.1 :ratio 0.89}
+                 :scans {:pre 885 :post 885}
+                 :rows-returned {:pre 70927 :post 70927}
+                 :planning-share-of-query {:pre 0.37 :post 0.13}}
+  :ic02 {:planning-ms {:pre 30.5 :post 15.4 :ratio 1.98}
+         :executing-ms {:pre 101.1 :post 78.3 :ratio 1.29}
+         :scans {:pre 1793 :post 1793}
+         :rows-returned {:pre 2702 :post 2702}}}
+
+ :result
+ "Planning is 3.55x faster on IC09 and 1.98x on IC02, and it fell from 37% of the query's time to 13%.
+
+  The plan itself is unchanged, and the receipt proves that rather than asserting it: scans (885 / 1,793) and rows returned (70,927 / 2,702) are IDENTICAL on both pins. Same estimates, same clause order, same strategy choices -- only the cost of arriving at them moved."
+
+ :execute-is-flat-and-that-is-the-point
+ "Execute went 1,085 -> 1,215 ms on IC09 (0.89x, slightly worse) and 101 -> 78 ms on IC02 (1.29x, better). Averaging to roughly nothing across two queries is what an unchanged execution path looks like measured twice. `query` did change shape -- it composes a transducer over `query-seq` now instead of filtering a materialised set -- so this is not a pure control, but the two queries disagreeing in direction says whatever it contributes is inside the noise here."
+
+ :method-note
+ "Both pins were measured back to back in one window, which is the fix recorded in 2026-08-02-scan-instrumentation.edn after comparing a fresh measurement against a remembered one produced a 7x error.
+
+  It mattered again immediately. The SAME pre-B1 code measured 1,153 ms of IC09 planning in the earlier session and 627 ms here -- the machine was 1.7x busier then. Quoting the earlier number against this one would have claimed 6.5x instead of 3.55x. The PROPORTION held across both sessions (37% of query time either way), which is why proportions and counts are the durable products and milliseconds are not."
+
+ :where-the-time-is-now
+ ["IC09: 177 ms planning, 1,215 ms execute. Planning is no longer the thing to look at."
+  "9% of execute is inside the store (from the previous receipt); the rest is the join's own bookkeeping -- grouping, hash index construction, unification, set building. That is the remaining target."
+  ":query-statistics is still unused. This change made the fallback path cheap; supplying real statistics would skip it entirely. Less urgent now that it is 13% rather than 37%."]
+
+ :caveats
+ ["Single run per pin, one start person. Counts are exact; milliseconds are same-window ratios only."
+  "The counter around scan* adds per-call overhead identically to both pins (scan counts are equal), so it does not bias this comparison."
+  "IC02's execute numbers are small (78-101 ms) and correspondingly noisier than IC09's."]
+
+ :raw-post {:schema 1, :start-person "17592186053137", :analyses [{:query :ic02, :planning {:ms 15.39675, :scans 0, :rows-returned 0, :scan-ms 0.0, :by-pattern-shape {}}, :executing {:ms 78.317375, :scans 1793, :rows-returned 2702, :scan-ms 55.696163, :by-pattern-shape {[true true false] 911, [false true true] 882}, :result-rows 910}, :scan-share-of-execute 0.711159726689001} {:query :ic09-two-hop, :planning {:ms 176.875125, :scans 0, :rows-returned 0, :scan-ms 0.0, :by-pattern-shape {}}, :executing {:ms 1215.073333, :scans 885, :rows-returned 70927, :scan-ms 141.6697, :by-pattern-shape {[true true false] 883, [false true false] 2}, :result-rows 6733}, :scan-share-of-execute 0.11659353896790689}], :adr "ADR-2608021000 -- close the 30x between the reimplemented strategies and the real engine", :caveats ["scan* is wrapped via with-redefs, so this is the real engine with a counter around one function -- nothing is reimplemented." "Counts and rows are load-invariant; the ms figures are not. Compare counts across runs, and treat times as within-run ratios." "Single run, one start person. A diagnosis, not a benchmark."], :arrangement-pin "see deps.edn", :receipt/type :scan-instrumentation, :reading "For each query, :planning and :executing each report how many times the engine called scan*, how many rows those calls returned, and how much of the wall time was inside them. :by-pattern-shape keys are [s-bound? p-bound? o-bound?] -- [false true false] is a broad scan of an attribute, [true true false] is a keyed seek. If execute time is not mostly scan time, the cost is in the join's own bookkeeping, not in the store.", :implementation "kotobase-peer.scan-instrument", :dataset {:subset-posts 3000, :quads 409877, :messages 7355}}
+ :raw-pre {:schema 1, :start-person "17592186053137", :analyses [{:query :ic02, :planning {:ms 30.462166, :scans 0, :rows-returned 0, :scan-ms 0.0, :by-pattern-shape {}}, :executing {:ms 101.063125, :scans 1793, :rows-returned 2702, :scan-ms 80.250118, :by-pattern-shape {[true true false] 911, [false true true] 882}, :result-rows 910}, :scan-share-of-execute 0.7940593366769532} {:query :ic09-two-hop, :planning {:ms 627.4725, :scans 0, :rows-returned 0, :scan-ms 0.0, :by-pattern-shape {}}, :executing {:ms 1084.996416, :scans 885, :rows-returned 70927, :scan-ms 109.155327, :by-pattern-shape {[true true false] 883, [false true false] 2}, :result-rows 6733}, :scan-share-of-execute 0.10060432033722036}], :adr "ADR-2608021000 -- close the 30x between the reimplemented strategies and the real engine", :caveats ["scan* is wrapped via with-redefs, so this is the real engine with a counter around one function -- nothing is reimplemented." "Counts and rows are load-invariant; the ms figures are not. Compare counts across runs, and treat times as within-run ratios." "Single run, one start person. A diagnosis, not a benchmark."], :arrangement-pin "see deps.edn", :receipt/type :scan-instrumentation, :reading "For each query, :planning and :executing each report how many times the engine called scan*, how many rows those calls returned, and how much of the wall time was inside them. :by-pattern-shape keys are [s-bound? p-bound? o-bound?] -- [false true false] is a broad scan of an attribute, [true true false] is a keyed seek. If execute time is not mostly scan time, the cost is in the join's own bookkeeping, not in the store.", :implementation "kotobase-peer.scan-instrument", :dataset {:subset-posts 3000, :quads 409877, :messages 7355}}}
