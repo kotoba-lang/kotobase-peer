@@ -671,9 +671,17 @@
                                {:id id
                                 :clause clause
                                 :vars (into #{} (filter datalog-var?) clause)
+                                ;; `kqe/cardinality`, not `(count (kqe/query
+                                ;; ...))`: the planner wants a NUMBER, and
+                                ;; building a set to count it made this the
+                                ;; single largest term in an LDBC IC09 query --
+                                ;; 361,246 rows hashed into a set and discarded,
+                                ;; 38% of the query's total time, on every call
+                                ;; (bench/results/2026-08-02-scan-instrumentation.edn).
+                                ;; Same `visible?`, same number; no set.
                                 :estimated-rows (if (some? supplied)
                                                   supplied
-                                                  (count (kqe/query db pattern visible?)))
+                                                  (kqe/cardinality db pattern visible?))
                                 :estimate-source (if (some? supplied)
                                                    :materialized-statistics
                                                    :visible-scan)}))
