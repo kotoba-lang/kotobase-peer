@@ -679,7 +679,19 @@
                                                    :visible-scan)}))
                            (range) where)
              plan (stats/plan-clause-order clauses)]
-         {:query (assoc query :where (mapv :clause plan))
+         {:query (assoc query
+                        :where (mapv :clause plan)
+                        ;; The same estimates that chose the order, handed to
+                        ;; the executor so it can also choose a STRATEGY per
+                        ;; clause: one broad scan plus a hash join when a
+                        ;; clause's relation is small relative to the number
+                        ;; of keyed scans a step would issue for it, keyed
+                        ;; scans otherwise (arrangement.datalog, ADR-2608021000
+                        ;; §6-4-1). These numbers were already computed and
+                        ;; then thrown away; the executor was left guessing at
+                        ;; something the planner had measured.
+                        :clause-cardinality
+                        (into {} (map (juxt :clause :estimated-rows)) plan))
           :plan plan
           :optimized? true})
        {:query query
