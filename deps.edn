@@ -67,6 +67,10 @@
   :h2h-neo4j {:extra-paths ["bench"]
               :extra-deps {org.neo4j/neo4j {:mvn/version "2025.03.0"}}
               :main-opts ["-m" "kotobase-peer.head-to-head-neo4j"]}
+  :scan-instrument {:extra-paths ["bench"]
+                    :extra-deps {org.neo4j/neo4j {:mvn/version "2025.03.0"}}
+                    :jvm-opts ["-Xmx12g"]
+                    :main-opts ["-m" "kotobase-peer.scan-instrument"]}
   :ic02-diag {:extra-paths ["bench"]
               :extra-deps {org.neo4j/neo4j {:mvn/version "2025.03.0"}}
               :jvm-opts ["-Xmx12g"]
