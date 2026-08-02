@@ -19,7 +19,7 @@
             [clojure.java.shell]
             [clojure.string]
             [ipld.core :as ipld]
-            [kotobase-peer.merkle-lsm :as lsm])
+            [merkle-lsm.core :as lsm])
   (:import [java.io File]))
 
 (defn- live-bytes

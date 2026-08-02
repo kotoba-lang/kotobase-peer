@@ -4,7 +4,7 @@
             [kotobase-peer.core :as peer]
             [kotobase-peer.datalog-materialization :as materialization]
             [kotobase-peer.materialized-view :as view]
-            [kotobase-peer.merkle-lsm :as lsm]))
+            [merkle-lsm.core :as lsm]))
 
 (def visible? (constantly true))
 

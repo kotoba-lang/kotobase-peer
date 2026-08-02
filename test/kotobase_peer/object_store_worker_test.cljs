@@ -4,7 +4,7 @@
             [goog.object :as gobj]
             [ipld.core :as ipld]
             [kotobase-peer.database-restore :as database-restore]
-            [kotobase-peer.merkle-lsm :as lsm]
+            [merkle-lsm.core :as lsm]
             [kotobase-peer.object-store.worker :as worker]
             [kotobase-peer.resumable-execution :as resumable]
             [kotobase-peer.retention :as retention]))
