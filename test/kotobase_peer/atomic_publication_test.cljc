@@ -3,7 +3,7 @@
             [ipld.core :as ipld]
             [kotobase-peer.atomic-publication :as publication]
             [kotobase-peer.materialized-view :as view]
-            [kotobase-peer.merkle-lsm :as lsm]))
+            [merkle-lsm.core :as lsm]))
 
 (def datoms
   [{:e "alice" :a "name" :v "Alice"}

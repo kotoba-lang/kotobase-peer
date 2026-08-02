@@ -25,6 +25,13 @@
         ;; kotobase-peer-atomic and kotobase-peer-main-test.
         io.github.kotoba-lang/sigv4 {:git/sha "9babf9f29b99f128059515e74b00b19ac9cc5436"}
         io.github.kotoba-lang/prolly-tree {:git/sha "e91eefcd21a4c5302868e519659433385a020961"}
+        ;; The write-optimised half of L4, extracted 2026-08-01 and consumed
+        ;; from here as of this pin (ADR-2607312100 D7, ADR-2608012800).
+        ;; `prolly-tree` above is the read-optimised half; the two are
+        ;; siblings, not alternatives. Until now the extraction existed only
+        ;; as a second copy -- the originals stayed in this repo's src/ and
+        ;; nothing consumed the new repo, so the two were free to diverge.
+        io.github.kotoba-lang/merkle-lsm {:git/sha "202c365c86b6ac0d5e9a3329f6f05d5a076878b5"}
         ;; the host-side implementation of the :cache/get//:cache/put effects
         ;; merkle-lsm has always declared and nothing has ever interpreted.
         io.github.kotoba-lang/block-cache {:git/sha "f4630b042c6cb365dff32a9ec7ed3d0e76205144"}}

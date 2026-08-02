@@ -24,7 +24,7 @@
   rows conserved. gate-10M: `-J-Xmx8g ... 10000000`."
   (:require [clojure.java.io :as io]
             [ipld.core :as ipld]
-            [kotobase-peer.merkle-lsm :as lsm]))
+            [merkle-lsm.core :as lsm]))
 
 (defn- elapsed-ms [f]
   (let [started (System/nanoTime) result (f)]

@@ -6,7 +6,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [kotobase-peer.cache :as kc]
             [kotobase-peer.core :as eng]
-            [kotobase-peer.merkle-lsm :as lsm]
+            [merkle-lsm.core :as lsm]
             [block.cache :as bc]
             [kotobase-peer.core-test :refer [test-blind-fn test-encrypt-fn test-decrypt-fn]]))
 

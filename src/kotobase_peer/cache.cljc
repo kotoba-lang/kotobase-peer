@@ -2,7 +2,7 @@
   "The host side of the block cache — the effects `merkle-lsm` has always
   declared and nothing has ever interpreted.
 
-  `kotobase-peer.merkle-lsm` emits `{:effect/type :cache/get :cid ...}` and
+  `merkle-lsm.core` emits `{:effect/type :cache/get :cid ...}` and
   `{:effect/type :cache/put ...}`. Grep the repo before this namespace existed
   and those two effect types appear exactly twice: at their own definitions.
   The design left a hole for a block cache and nobody filled it, so every read
