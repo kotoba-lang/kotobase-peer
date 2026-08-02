@@ -411,21 +411,44 @@
               (neo4j-rows tx cy-ic07 {"pid" p})
               (neo4j-rows tx cy-ic08 {"pid" p})
               (neo4j-rows tx cy-ic09 {"pid" p "maxDate" max-date})))
-        kb-times (reduce (fn [acc p]
-                           (-> acc
-                               (update :ic02 conj (:ms (elapsed-ms #(kb-ic02 db p max-date))))
-                               (update :ic07 conj (:ms (elapsed-ms #(kb-ic07 db p))))
-                               (update :ic08 conj (:ms (elapsed-ms #(kb-ic08 db p))))
-                               (update :ic09 conj (:ms (elapsed-ms #(kb-ic09 db p max-date))))))
-                         {:ic02 [] :ic07 [] :ic08 [] :ic09 []} starts)
-        neo-times (with-open [tx (.beginTx gdb)]
-                    (reduce (fn [acc p]
-                              (-> acc
-                                  (update :ic02 conj (:ms (elapsed-ms #(neo4j-rows tx cy-ic02 {"pid" p "maxDate" max-date}))))
-                                  (update :ic07 conj (:ms (elapsed-ms #(neo4j-rows tx cy-ic07 {"pid" p}))))
-                                  (update :ic08 conj (:ms (elapsed-ms #(neo4j-rows tx cy-ic08 {"pid" p}))))
-                                  (update :ic09 conj (:ms (elapsed-ms #(neo4j-rows tx cy-ic09 {"pid" p "maxDate" max-date}))))))
-                            {:ic02 [] :ic07 [] :ic08 [] :ic09 []} starts))]
+        ;; INTERLEAVED, one start person at a time, both engines before moving
+        ;; on. This used to run all 15 kotobase samples and THEN all 15 Neo4j
+        ;; samples, which meant the two halves saw different minutes of a shared
+        ;; machine -- and the kb/neo ratio was presented in every receipt as the
+        ;; load-invariant column precisely because both engines were supposed to
+        ;; be measured under the same conditions.
+        ;;
+        ;; They were not. Measured (bench/results/
+        ;; 2026-08-02-limit-pushdown-third-attempt.edn): across two runs of
+        ;; BYTE-IDENTICAL kotobase code, IC07's kotobase side went 6.4 -> 16.1 ms
+        ;; while its Neo4j side went 1.4 -> 1.2 ms, moving the ratio 4.7x ->
+        ;; 13.9x with nothing changed. That is the defect this fixes, and it
+        ;; invalidates 20-30% movements in every ratio measured before it.
+        both (with-open [tx (.beginTx gdb)]
+               (reduce
+                (fn [acc p]
+                  (-> acc
+                      (update-in [:kb :ic02] conj (:ms (elapsed-ms #(kb-ic02 db p max-date))))
+                      (update-in [:neo :ic02] conj (:ms (elapsed-ms #(neo4j-rows tx cy-ic02 {"pid" p "maxDate" max-date}))))
+                      (update-in [:kb :ic07] conj (:ms (elapsed-ms #(kb-ic07 db p))))
+                      (update-in [:neo :ic07] conj (:ms (elapsed-ms #(neo4j-rows tx cy-ic07 {"pid" p}))))
+                      (update-in [:kb :ic08] conj (:ms (elapsed-ms #(kb-ic08 db p))))
+                      (update-in [:neo :ic08] conj (:ms (elapsed-ms #(neo4j-rows tx cy-ic08 {"pid" p}))))
+                      (update-in [:kb :ic09] conj (:ms (elapsed-ms #(kb-ic09 db p max-date))))
+                      (update-in [:neo :ic09] conj (:ms (elapsed-ms #(neo4j-rows tx cy-ic09 {"pid" p "maxDate" max-date}))))))
+                {:kb {:ic02 [] :ic07 [] :ic08 [] :ic09 []}
+                 :neo {:ic02 [] :ic07 [] :ic08 [] :ic09 []}}
+                starts))
+        kb-times (:kb both)
+        neo-times (:neo both)
+        ;; The ratio taken PER SAMPLE and then summarised, not as a quotient of
+        ;; two independently-summarised numbers. A per-sample ratio cancels
+        ;; whatever the machine was doing during that pair; a quotient of
+        ;; medians does not.
+        paired-ratios (into {}
+                            (map (fn [k]
+                                   [k (stats (mapv / (get kb-times k) (get neo-times k)))]))
+                            [:ic02 :ic07 :ic08 :ic09])]
     (.shutdown dbms)
     (prn
      {:schema 1
@@ -447,6 +470,9 @@
                        :ic02 (stats (:ic02 neo-times)) :ic07 (stats (:ic07 neo-times))
                        :ic08 (stats (:ic08 neo-times)) :ic09 (stats (:ic09 neo-times))}
       :answers-agree agreement
+      :paired-ratio
+      (assoc paired-ratios
+             :note "kotobase-ms / neo4j-ms computed PER SAMPLE with the two engines run back to back, then summarised. This is the column to compare across runs; a quotient of two separately-summarised medians is not, which is what every receipt before 2026-08-02 used.")
       :start-persons {:n (count starts) :rule "highest knows-degree, sorted by id"}
       :caveats
       ["Subset of SF1, not full SF1 (~10.5M elements) -- the subset rule is stated above and is deterministic."
