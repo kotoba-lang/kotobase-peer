@@ -6,9 +6,9 @@
    - M5 statistics collection and join planning
 
    Pass sizes explicitly for release sweeps; defaults remain local-test scale."
-  (:require [merkle-lsm.core :as lsm]
+  (:require [kotobase-peer.statistics :as statistics]
             [merkle-lsm.compaction :as compaction]
-            [kotobase-peer.statistics :as statistics]))
+            [merkle-lsm.core :as lsm]))
 
 ;; ============================================================================
 ;; Utilities

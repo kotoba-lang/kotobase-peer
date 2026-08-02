@@ -135,8 +135,14 @@ fully materialized hot `db` (backfill/migration tooling, tests).
 
 ## Merkle-LSM migration (ADR-2607201600)
 
-`kotobase-peer.merkle-lsm` contains the pure M1 kernel and M2 shadow-flush
-vertical slice replacing full-snapshot folding:
+`merkle-lsm.core` — from the [`kotoba-lang/merkle-lsm`](https://github.com/kotoba-lang/merkle-lsm)
+dependency, and `kotobase-peer.merkle-lsm` in this repo until the copies here
+were deleted — contains the pure M1 kernel and M2 shadow-flush vertical slice
+replacing full-snapshot folding, with `merkle-lsm.compaction` (formerly
+`kotobase-peer.compaction`) the M4 policy over it. Their tests moved with them;
+what this repo still tests is the HOST side that interprets the effect
+descriptors they return (`kotobase-peer.cache`,
+`kotobase-peer.object-store.worker`):
 
 Large immutable runs are stored as a small run root plus logical-key-aligned
 data blocks (128 rows and 1 MiB encoded bytes by default). Both bounds are

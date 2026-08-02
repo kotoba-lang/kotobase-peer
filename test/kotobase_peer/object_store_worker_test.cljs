@@ -4,10 +4,10 @@
             [goog.object :as gobj]
             [ipld.core :as ipld]
             [kotobase-peer.database-restore :as database-restore]
-            [merkle-lsm.core :as lsm]
             [kotobase-peer.object-store.worker :as worker]
             [kotobase-peer.resumable-execution :as resumable]
-            [kotobase-peer.retention :as retention]))
+            [kotobase-peer.retention :as retention]
+            [merkle-lsm.core :as lsm]))
 
 (deftest immutable-object-and-block-namespaces-are-distinct
   (let [env #js {"MERKLE_S3_PREFIX" "test-prefix"}]

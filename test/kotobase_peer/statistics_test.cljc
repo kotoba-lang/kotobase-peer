@@ -1,7 +1,7 @@
 (ns kotobase-peer.statistics-test
   (:require [clojure.test :refer [deftest is testing]]
-            [merkle-lsm.core :as lsm]
-            [kotobase-peer.statistics :as statistics]))
+            [kotobase-peer.statistics :as statistics]
+            [merkle-lsm.core :as lsm]))
 
 ;; ============================================================================
 ;; M5 Statistics Tests

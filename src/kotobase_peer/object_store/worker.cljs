@@ -7,11 +7,11 @@
             [goog.object :as gobj]
             [ipld.core :as ipld]
             [kotobase-peer.atomic-publication :as publication]
-            [merkle-lsm.compaction :as compaction]
             [kotobase-peer.database-restore :as database-restore]
-            [merkle-lsm.core :as lsm]
             [kotobase-peer.resumable-execution :as resumable]
             [kotobase-peer.retention :as retention]
+            [merkle-lsm.compaction :as compaction]
+            [merkle-lsm.core :as lsm]
             [sigv4.crypto :as sigv4-crypto]
             [sigv4.request :as sigv4]))
 
