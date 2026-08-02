@@ -1,0 +1,35 @@
+{:schema 1, :caveats ["Subset of SF1, not full SF1 (~10.5M elements) -- the subset rule is stated above and is deterministic." "kotobase has no ORDER BY/LIMIT in its query language; the top-20 step runs in harness Clojure over the join's full result, while Neo4j does it inside Cypher. Both are timed to the same final answer and the answers are asserted equal." "kotobase stores knows in both directions (no undirected edge) and reifies likes (no edge properties); Neo4j uses a native undirected match and a relationship property." "kotobase's number is a hot in-memory db with no encryption and no persistence; the persisted path additionally pays hydration, which is measured in ADR-2607310900 and the dag-shape receipt, not here." "Neo4j embedded has no pure in-memory mode; its temp on-disk store is read through the page cache after warmup." "Single machine, single JVM, no concurrency. NamiDB's published numbers are on different hardware -- only the ratio against the shared Neo4j yardstick is comparable, and only loosely." "IC07/IC09 agreement compares result SETS (likers / message ids) rather than ordered rows: both queries can have creationDate ties at the LIMIT-20 boundary, where the two engines are free to pick different rows. IC02/IC08 are compared as ordered rows. A reported disagreement is reported, never relaxed after the fact."], :kotobase {:quads 409877, :build-ms 2407.204167, :note "hot db via eng/transact -- same db value the persisted path hydrates to; no AES-GCM/content-addressing in this number", :ic02 {:p50-ms 80.9205, :p95-ms 97.30925, :p99-ms 97.30925, :mean-ms 79.99630839999999, :samples 15}, :ic07 {:p50-ms 7.115834, :p95-ms 29.0975, :p99-ms 29.0975, :mean-ms 11.72505293333333, :samples 15}, :ic08 {:p50-ms 37.387625, :p95-ms 53.454792, :p99-ms 53.454792, :mean-ms 39.71663626666667, :samples 15}, :ic09 {:p50-ms 1815.774458, :p95-ms 2094.100708, :p99-ms 2094.100708, :mean-ms 1840.3841943999998, :samples 15}}, :receipt/type :ldbc-snb-interactive, :answers-agree {:ic02 true, :ic07 true, :ic08 true, :ic09 true}, :implementation "kotobase-peer.ldbc-snb-bench", :dataset {:name "LDBC SNB Interactive v1, SF1, Datagen v1.0.0, CsvComposite/LongDateFormatter", :source "https://repository.surfsara.nl/datasets/cwi/ldbc-snb-interactive-v1-datagen-v100", :subset-rule "all persons + all knows; 3000 most recent Posts + full transitive reply trees; hasCreator for included Messages; likes onto included Messages", :elements {:comments 4355, :reply-of 4355, :likes 809, :persons 9892, :total 210389, :messages 7355, :knows-edges 180623, :has-creator 7355, :posts 3000}, :load-ms 24694.250625}, :neo4j-embedded {:load-ms 15890.76125, :version "org.neo4j/neo4j 2025.03.0 embedded (community), temp on-disk store, pid UNIQUE constraints awaited online", :ic02 {:p50-ms 5.488292, :p95-ms 257.225583, :p99-ms 257.225583, :mean-ms 23.10855553333333, :samples 15}, :ic07 {:p50-ms 1.010167, :p95-ms 256.174459, :p99-ms 256.174459, :mean-ms 19.749861200000005, :samples 15}, :ic08 {:p50-ms 0.701833, :p95-ms 204.905917, :p99-ms 204.905917, :mean-ms 15.4544084, :samples 15}, :ic09 {:p50-ms 50.6975, :p95-ms 178.4665, :p99-ms 178.4665, :mean-ms 58.48783046666667, :samples 15}}, :start-persons {:n 15, :rule "highest knows-degree, sorted by id"}
+ :comparison-with
+ {:baseline "2026-08-01-ldbc-snb-interactive.edn -- identical dataset (210,389 elements, 409,877 quads), before join batching, hash join, and the planner hint"
+  :changes-since ["arrangement db55c493: one scan per DISTINCT PATTERN instead of per binding"
+                  "arrangement 7a0a2002: hash join when a clause relation is small relative to the keys reaching it"
+                  "kotobase-peer 6cf50d55: the planner hands its own :estimated-rows to the executor"]
+  :p50-ms
+  {:ic02 {:kotobase {:before 182.5 :after 80.9} :neo4j {:before 23.7 :after 5.5}
+          :ratio {:before 7.7 :after 14.7}}
+   :ic07 {:kotobase {:before 20.9 :after 7.1} :neo4j {:before 3.4 :after 1.0}
+          :ratio {:before 6.2 :after 7.0}}
+   :ic08 {:kotobase {:before 105.6 :after 37.4} :neo4j {:before 1.1 :after 0.7}
+          :ratio {:before 97.5 :after 53.3}}
+   :ic09 {:kotobase {:before 21008.1 :after 1815.8} :neo4j {:before 246.2 :after 50.7}
+          :ratio {:before 85.3 :after 35.8}}}
+  :read-the-ratio-not-the-absolute
+  "Neo4j is UNCHANGED code between these two runs and got 1.6-4.9x faster on its own, because the first run was on a host at load average ~190 and this one at ~30. Its absolute numbers are the host, not Neo4j. The kotobase/Neo4j ratio, measured interleaved in one JVM under the same conditions, is the load-invariant column and the only one worth comparing across runs."
+  :result
+  {:ic09 "85.3x -> 35.8x. The two-hop expansion is 2.4x closer to Neo4j."
+   :ic08 "97.5x -> 53.3x. 1.8x closer."
+   :ic07 "6.2x -> 7.0x. Flat, and at 7.1 vs 1.0 ms the absolutes are small enough that this is inside the noise."
+   :ic02 "7.7x -> 14.7x. WORSE. This is a regression introduced by these changes, not noise -- see below."}}
+ :regression
+ {:query :ic02
+  :what "kotobase improved 2.26x while Neo4j improved 4.31x on the same host improvement, so relative to the yardstick IC02 got about 1.9x worse."
+  :suspected-cause
+  "IC02 is [?person knows ?f] [?msg hasCreator ?f] [?msg date ?date]. Its hasCreator step sees ~882 distinct keys against 7,355 rows, which is above the 4x budget, so it never hash joins -- it only pays the group-by that batching added. When every binding substitutes to a DISTINCT pattern, that group-by builds a map with one entry per binding and buys nothing: the batching win is exactly the ratio of bindings to distinct patterns, and IC02 has none."
+  :suspected-fix
+  "In join-clause, when (count groups) equals (count bindings) there was nothing to dedup -- take the original per-binding path and skip building the map. Cheap to test: the answer must be unchanged by construction."
+  :status "NOT fixed in this receipt. Named, measured, and attributed rather than left for someone to rediscover."}
+ :still-open
+ ["IC09 at 35.8x and IC08 at 53.3x are better, not good. Neo4j answers IC08 in 0.7 ms."
+  "The [?f1 knows ?f2] cardinality probe still materializes 361,246 rows on every query to learn a number; :query-statistics would skip it."
+  "The limit is still applied to the finished projection, so a top-20 query still joins everything -- every one of these four queries is a most-recent-N."
+  "Still a 210,389-element subset, 40% of the scale NamiDB publishes against. A 540K run on this now-quiet machine is the one that would make the NamiDB comparison possible."]}
