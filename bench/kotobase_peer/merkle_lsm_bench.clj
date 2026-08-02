@@ -1,8 +1,8 @@
 (ns kotobase-peer.merkle-lsm-bench
   "Repeatable Merkle-LSM scale gate. Pass 1000 100000 10000000 explicitly for
   the ADR release sweep; defaults stay small enough for a local pre-push gate."
-  (:require [merkle-lsm.core :as lsm]
-            [kotobase-peer.performance-gate :as gate])
+  (:require [kotobase-peer.performance-gate :as gate]
+            [merkle-lsm.core :as lsm])
   (:import [java.lang.management ManagementFactory]
            [com.sun.management OperatingSystemMXBean]))
 

@@ -6,8 +6,8 @@
             [kotobase-peer.atomic-publication :as publication]
             [kotobase-peer.core :as peer]
             [kotobase-peer.materialized-view :as view]
-            [merkle-lsm.core :as lsm]
-            [kotobase-peer.statistics :as statistics]))
+            [kotobase-peer.statistics :as statistics]
+            [merkle-lsm.core :as lsm]))
 
 (def frontier-work-format "kotobase/join-frontier-work")
 (def frontier-work-version 1)
