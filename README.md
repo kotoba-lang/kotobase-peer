@@ -1,5 +1,15 @@
 # kotobase-peer
 
+> **Compatibility repository — feature frozen 2026-08-04.** This name uses
+> Datomic's embedded-library meaning of “peer”; it does not own Kotobase
+> network federation. The repository accumulated several unrelated
+> capabilities and is being retired by extraction, not renamed as a monolith.
+> New projection, federation, and background-lifecycle behavior belongs in
+> `kotobase-projection`, `kotobase-federation`, and `kotobase-maintenance`.
+> Database engine work belongs behind `kotobase-engine-contract`. Existing
+> public namespaces remain available for pinned consumers during migration;
+> see [`MIGRATION.md`](MIGRATION.md).
+
 **The kotobase peer library — Datomic's own term for the transact/q/pull
 library an application embeds — in real CLJC, verified on both JVM and
 ClojureScript.** Composes the already-landed Wave 1–3 primitives

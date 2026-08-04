@@ -34,7 +34,16 @@
         io.github.kotoba-lang/merkle-lsm {:git/sha "202c365c86b6ac0d5e9a3329f6f05d5a076878b5"}
         ;; the host-side implementation of the :cache/get//:cache/put effects
         ;; merkle-lsm has always declared and nothing has ever interpreted.
-        io.github.kotoba-lang/block-cache {:git/sha "f4630b042c6cb365dff32a9ec7ed3d0e76205144"}}
+        io.github.kotoba-lang/block-cache {:git/sha "f4630b042c6cb365dff32a9ec7ed3d0e76205144"}
+        ;; Extracted capability owners. Namespaces in this repository now
+        ;; delegate to these reviewed, published revisions for compatibility.
+        io.github.kotoba-lang/kotobase-projection
+        {:git/sha "b35b05376f009577ee1bd472e5e74c6defab07f6"}
+        io.github.kotoba-lang/kotobase-federation
+        {:git/sha "e175d7bb938f2d705dc06ed453e2e9759648d76b"}
+        io.github.kotoba-lang/kotobase-maintenance
+        {:git/sha "c47e6f3d94beb8550be17e7b503f10cab9e24ad9"}}
+
  :aliases
  {:test {:extra-paths ["test"]
          :extra-deps {io.github.cognitect-labs/test-runner
