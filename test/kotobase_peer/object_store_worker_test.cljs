@@ -3,6 +3,7 @@
             [clojure.string :as str]
             [goog.object :as gobj]
             [ipld.core :as ipld]
+            [kotobase.blockcodec.node :as bcn]
             [kotobase-peer.database-restore :as database-restore]
             [kotobase-peer.object-store.worker :as worker]
             [kotobase-peer.resumable-execution :as resumable]
@@ -2276,3 +2277,47 @@
              (is false (str "resumable execution rejected: " error "\n"
                             (.-stack error)))
              (done)))))))
+
+;; ---------------------------------------------------------------------------
+;; ADR-2608060500 phase 1: this worker can READ a compressed block
+;; ---------------------------------------------------------------------------
+;;
+;; `merkle-lsm` does not write them yet and must not until every reader can
+;; handle them; the failure mode measured in kotobase-engine-lsm was not an
+;; error but zero rows returned as success.
+;;
+;; `get-node!` is the single place this file needs the change — its callers
+;; inherit it, `lsm/linked-cids` walks need nothing (only link-free nodes are
+;; ever compressed, so a compressed block's link set is correctly empty), and
+;; the GC- and backup-inventory decoders read this worker's own formats.
+
+(defn- block-only-bucket
+  "A MERKLE_BUCKET that serves a fixed map of key -> Uint8Array."
+  [entries]
+  #js {:get (fn [key]
+              (js/Promise.resolve
+               (when-let [bytes (get entries key)]
+                 #js {:arrayBuffer (fn [] (js/Promise.resolve (.-buffer bytes)))})))})
+
+(deftest get-node-reads-a-compressed-block
+  (async done
+    (let [node {"format" "kotobase/merkle-run-block" "version" 1
+                "index" "eavt" "tenant" "t" "ordinal" 0 "count" 3
+                "rows" (mapv (fn [i]
+                               {"key" (str "eavt|1:t|24:entity-" i "|5:value|0000000000000001")
+                                "value" (str "row-" i "-lorem-ipsum")})
+                             (range 60))}
+          plain (ipld/encode node)
+          envelope (bcn/encode-node node)
+          cid (str (ipld/cid envelope))
+          env0 #js {}
+          env #js {"MERKLE_BUCKET"
+                   (block-only-bucket {(worker/block-key env0 cid) envelope})}]
+      (is (bcn/envelope? (ipld/decode envelope))
+          "the fixture must really be compressed, or this proves nothing")
+      (is (< (.-byteLength envelope) (.-byteLength plain)))
+      (-> (worker/get-node! env cid)
+          (.then (fn [decoded]
+                   (is (= node decoded) "the run block comes back intact")
+                   (done)))
+          (.catch (fn [e] (is false (str "get-node! threw: " e)) (done)))))))
