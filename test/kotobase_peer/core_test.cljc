@@ -6,7 +6,11 @@
             [chain.core :as cd]
             [arrangement.core :as qs]
             [kotobase-peer.core :as eng]
-            [kotobase-peer.transactor :as transactor])
+            [kotobase-peer.transactor :as transactor]
+            ;; :clj-only — every use is inside a `#?(:clj ...)` test below
+            ;; (the ADR-2608060500 pair), so a plain require would be dead
+            ;; weight on the ClojureScript side.
+            #?@(:clj [[kotobase.blockcodec.core :as bc]]))
   #?(:clj (:import [javax.crypto Cipher Mac]
                    [javax.crypto.spec SecretKeySpec GCMParameterSpec]
                    [java.util Base64])))
@@ -2913,3 +2917,70 @@
        (is (some? (eng/view-rows get-fn f1 "xs" everything test-decrypt-fn)))
        (is (nil? (eng/view-rows get-fn f2 "xs" everything test-decrypt-fn))
            "an explicit nil spec removes the view at the next fold"))))
+
+;; ── ADR-2608060500: the tx-block payload is compression-framed ──────────────
+;; Inside `encrypt-fn`, not under it. Below the AEAD the bytes are ciphertext,
+;; which deflates to ratio 1.003 — compressing there would spend CPU to store
+;; more. This payload is the one place a whole batch of quads is plaintext at
+;; once, and repeated subjects/predicates are why it pays.
+
+#?(:clj
+   (defn- repetitive-tx
+     "The shape a real transaction has: a few subjects, a few predicates, many
+      rows. Compressible for exactly the reason kotobase data is compressible."
+     [n]
+     (vec (for [i (range n)]
+            [(str "did:web:kotobase.net:entity:" (mod i 20))
+             (nth ["kind" "title" "createdAt" "author" "status"] (mod i 5))
+             (str "value-" i "-lorem-ipsum-dolor-sit-amet")]))))
+
+#?(:clj
+   (defn- stored-bytes [store]
+     (reduce + 0 (map count (vals @store)))))
+
+#?(:clj
+   (defn- unframing-encrypt-fn
+     "A writer from before this format: `unframe` undoes exactly what `frame`
+      did, so what reaches the AEAD is byte-for-byte what the old code sent.
+      Used to write legacy blocks through the public API without reaching
+      into a private var."
+     [plaintext]
+     (test-encrypt-fn (bc/platform-bytes (bc/unframe plaintext)))))
+
+#?(:clj
+   (deftest tx-block-payload-is-compression-framed
+     (let [tx (repetitive-tx 300)
+           new-store (mem-store)
+           old-store (mem-store)]
+       (eng/commit! (:put! new-store) (:get-fn new-store) tx nil test-encrypt-fn)
+       (eng/commit! (:put! old-store) (:get-fn old-store) tx nil unframing-encrypt-fn)
+       (let [new-bytes (stored-bytes (:store new-store))
+             old-bytes (stored-bytes (:store old-store))]
+         (is (< new-bytes (quot old-bytes 3))
+             (str "a framed transaction should be a fraction of an unframed one; "
+                  "got " new-bytes " vs " old-bytes))))))
+
+#?(:clj
+   (deftest legacy-tx-blocks-still-read
+     (testing "blocks written before the frame existed decode with no version
+               flag anywhere — `unframe` is the identity on them, which is what
+               let the read half of this change ship ahead of the write half"
+       (let [{:keys [put! get-fn]} (mem-store)
+             tx [["alice" "role" "admin"] ["alice" "name" "Alice"]
+                 ["bob" "role" "user"]]
+             legacy-cid (eng/commit! put! get-fn tx nil unframing-encrypt-fn)
+             hot (eng/hot-datoms get-fn legacy-cid (constantly true)
+                                 test-blind-fn test-decrypt-fn)]
+         (is (= 3 (count hot)) "legacy novelty reads")
+         (is (= #{"\"admin\"" "\"Alice\"" "\"user\""} (set (map :v_edn hot))))))
+     (testing "and a new-format transaction chains onto a legacy one, so one
+               chain can hold both without a migration"
+       (let [{:keys [put! get-fn]} (mem-store)
+             c0 (eng/commit! put! get-fn [["alice" "role" "admin"]] nil
+                             unframing-encrypt-fn)
+             c1 (eng/commit! put! get-fn [["bob" "role" "user"]] c0
+                             test-encrypt-fn)
+             hot (eng/hot-datoms get-fn c1 (constantly true)
+                                 test-blind-fn test-decrypt-fn)]
+         (is (= 2 (count hot)))
+         (is (= #{"\"admin\"" "\"user\""} (set (map :v_edn hot))))))))

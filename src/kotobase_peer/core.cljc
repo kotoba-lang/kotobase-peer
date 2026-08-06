@@ -46,6 +46,7 @@
             [clojure.string :as str]
             [ipld.core :as ipld]
             [ipld.value :as ipld-value]
+            [kotobase.blockcodec.core :as bc]
             [prolly-tree.core :as pt]
             [arrangement.core :as qs]
             [arrangement.query :as kqe]
@@ -1253,29 +1254,57 @@
   (cond-> {:s s :p p :o o}
     op (assoc :op (keyword op))))
 
+(defn- framed-quad-payload
+  "The bytes `put-tx-block!` hands to `encrypt-fn`: the dag-cbor of
+  `{\"quads\" [...]}`, run through `kotobase-block-codec`.
+
+  Compression has to happen HERE — inside the AEAD, not under it. The bytes
+  the store actually holds are ciphertext, and ciphertext measures at DEFLATE
+  ratio 1.003: a provider or backend that compressed them would spend CPU to
+  store more. This payload is the one place a whole batch of quads exists as
+  plaintext at once, which is also the only reason it compresses: subjects and
+  predicates repeat across a transaction. Measured 0.10-0.37 depending on
+  batch size (ADR-2608060500).
+
+  `bc/frame` is unary and pure, so this stays a function of the quads alone."
+  [quads]
+  (bc/platform-bytes (bc/frame (ipld/encode {"quads" (mapv quad->wire quads)}))))
+
+(defn- decode-quad-payload
+  "Inverse of `framed-quad-payload`. `bc/unframe` is the identity on bytes
+  written before the frame existed, so this reads old and new blocks with one
+  path and no version flag — which is what let the read half of this change
+  ship ahead of the write half."
+  [plaintext]
+  (mapv wire->quad (get (ipld/decode (bc/platform-bytes (bc/unframe plaintext)))
+                        "quads")))
+
 (defn- put-tx-block!
   "ADR-2607051000 (accepted 2026-07-06): the novelty tx block's whole quad
   payload is encrypted as one opaque ciphertext blob (`encrypt-fn`, REQUIRED,
   no silent default) -- `read-tx-block` is whole-block reads only, never a
   keyed/prefix seek, so there's no blind-index concern here, just AEAD.
   Synchronous on JVM, a `js/Promise` of the block CID on cljs (see the
-  platform-split note above)."
+  platform-split note above).
+
+  The payload is compression-framed before encryption (ADR-2608060500); see
+  `framed-quad-payload` for why the seam is on this side of `encrypt-fn`."
   [put! quads encrypt-fn]
-  #?(:clj (ipld/put-node! put! {"ct" (encrypt-fn (ipld/encode {"quads" (mapv quad->wire quads)}))})
-     :cljs (-> (encrypt-fn (ipld/encode {"quads" (mapv quad->wire quads)}))
+  #?(:clj (ipld/put-node! put! {"ct" (encrypt-fn (framed-quad-payload quads))})
+     :cljs (-> (encrypt-fn (framed-quad-payload quads))
                (.then (fn [ct] (ipld/put-node! put! {"ct" ct}))))))
 
 (defn- read-tx-block
   "Inverse of `put-tx-block!`: decrypt the block's `\"ct\"` ciphertext
-  (`decrypt-fn`, REQUIRED) back to the dag-cbor-encoded `{\"quads\" [...]}`
-  node, then decode it as before. Synchronous on JVM, a `js/Promise` of the
+  (`decrypt-fn`, REQUIRED), unframe it, and decode the dag-cbor
+  `{\"quads\" [...]}` node as before. Synchronous on JVM, a `js/Promise` of the
   quads on cljs."
   [get-fn tx-cid decrypt-fn]
   #?(:clj (let [{:strs [ct]} (ipld/get-node get-fn tx-cid)]
-            (mapv wire->quad (get (ipld/decode (decrypt-fn ct)) "quads")))
+            (decode-quad-payload (decrypt-fn ct)))
      :cljs (let [{:strs [ct]} (ipld/get-node get-fn tx-cid)]
              (-> (decrypt-fn ct)
-                 (.then (fn [pt] (mapv wire->quad (get (ipld/decode pt) "quads"))))))))
+                 (.then decode-quad-payload)))))
 
 #?(:cljs
    (defn- read-tx-block-async
@@ -1303,7 +1332,7 @@
          (.then ipld/decode)
          (.then (fn [{:strs [ct]}]
                   (-> (decrypt-fn ct)
-                      (.then (fn [pt] (mapv wire->quad (get (ipld/decode pt) "quads"))))))))))
+                      (.then decode-quad-payload)))))))
 
 (defn commit!
   "THE write path (ADR-2607032430 D1): append `tx-data` as one novelty tx

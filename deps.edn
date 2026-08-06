@@ -23,6 +23,12 @@
         ;; AWS SigV4 (ADR-2607254100). The object-store worker used to carry
         ;; its own copy of the signer, byte-identical to the one in
         ;; kotobase-peer-atomic and kotobase-peer-main-test.
+        ;; The compression frame that sits on the tx-block quad payload,
+        ;; INSIDE `encrypt-fn` (ADR-2608060500). A hard pin, not an injected
+        ;; codec: its output bytes are inside every CID it frames, so two
+        ;; writers on different pins would fork the block graph.
+        io.github.kotoba-lang/kotobase-block-codec
+        {:git/sha "a551e27f91aee2be5dd74a8a77165c92c6fb335f"}
         io.github.kotoba-lang/sigv4 {:git/sha "9babf9f29b99f128059515e74b00b19ac9cc5436"}
         io.github.kotoba-lang/prolly-tree {:git/sha "e91eefcd21a4c5302868e519659433385a020961"}
         ;; The write-optimised half of L4, extracted 2026-08-01 and consumed
