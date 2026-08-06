@@ -6,6 +6,7 @@
   (:require [clojure.string :as str]
             [goog.object :as gobj]
             [ipld.core :as ipld]
+            [kotobase.blockcodec.node :as bcn]
             [kotobase-peer.atomic-publication :as publication]
             [kotobase-peer.database-restore :as database-restore]
             [kotobase-peer.resumable-execution :as resumable]
@@ -183,9 +184,18 @@
        (js/Error. "No MERKLE_BUCKET or MERKLE_S3_* backend configured")))))
 
 (defn get-node!
-  "Fetch and DAG-CBOR decode an IPLD node."
+  "Fetch and DAG-CBOR decode an IPLD node.
+
+  `bcn/decode-node` rather than `ipld/decode` (ADR-2608060500 phase 1): it is
+  the identity on every block written so far, and it is what lets this worker
+  read a Merkle-LSM run block once `merkle-lsm` starts compressing them. This
+  one function is the only place in this file that needs it — the twenty-seven
+  callers below inherit it, the `lsm/linked-cids` walks need nothing (only
+  link-free nodes are ever compressed, so the link set through a compressed
+  block is correctly empty), and the GC- and backup-inventory decoders read
+  this worker's OWN node formats, which merkle-lsm does not produce."
   [e cid]
-  (-> (get-block! e cid) (.then ipld/decode)))
+  (-> (get-block! e cid) (.then bcn/decode-node)))
 
 (defn put-object!
   "Idempotently put a packed immutable object. Logical block CIDs and byte
