@@ -6,7 +6,25 @@
   changes class only after a hysteresis margin. Hosts persist the returned
   decision in the same immutable manifest epoch as the selected size.")
 
-(def size-classes [16384 32768 65536 131072])
+;; These are 17 bytes below 16 KiB / 32 KiB / 64 KiB / 128 KiB, and the 17 is
+;; load-bearing — do not "tidy" them back to round powers of two.
+;;
+;; A client-sealed block is padded to a bucket from
+;; `kotoba.lang.pqh.crypto/PAD-BUCKETS`, and `pick-bucket` must fit
+;; `len + 1 (ISO/IEC 7816-4 delimiter) + 16 (AEAD tag)`. A class sitting
+;; exactly ON a power of two therefore overflows by 17 bytes into the next
+;; bucket. Measured 2026-08-07 with the round values, every class was
+;; pathological:
+;;
+;;   16384 -> needs 16401 -> 65536 bucket   (+300% padding)
+;;   32768 -> needs 32785 -> 65536 bucket   (+100%)
+;;   65536 -> needs 65553 -> no bucket      (ciphertextBlob; inline padding bypassed)
+;;   131072 -> needs 131089 -> no bucket    (same)
+;;
+;; At 17 below, each class lands in its own bucket at 0.0-0.1% overhead.
+;; Enforced by the `block-sizing-pad-alignment-check` fleet gate
+;; (superproject ADR-2608070400 D6).
+(def size-classes [16367 32751 65519 131055])
 
 (def default-policy
   {:minimum-samples 3
