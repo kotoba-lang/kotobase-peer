@@ -465,7 +465,8 @@
                             {:attr p})))
           (when-let [vt (get-in effective-schema [p :value-type])]
             (validate-value-type! p vt o (get-in effective-schema [p :tuple-types])))
-          (when (= "identity" (get-in effective-schema [p :unique]))
+          (when (contains? #{"identity" "value"}
+                           (get-in effective-schema [p :unique]))
             (let [quad-o (->quad-value o)
                   existing (qs/by-predicate-value db p quad-o)]
               (when (and (seq existing) (not= existing #{s}))

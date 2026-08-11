@@ -593,6 +593,23 @@
       (is (= #{"a@x.com"}
              (get (eng/pull (eng/transact-with-schema db1 [{:s "alice" :p "email" :o "a@x.com"}] {}) "alice") "email"))))))
 
+(deftest transact-with-schema-unique-value-rejects-cross-entity-collision
+  (let [db0 (eng/install-schema (eng/empty-db)
+                                {"serial" {:db/valueType :string
+                                           :db/unique :value}})
+        db1 (eng/transact-with-schema db0
+                                      [{:s "first" :p "serial" :o "S-1"}]
+                                      {})]
+    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                          #"unique attribute violation"
+                          (eng/transact-with-schema
+                           db1 [{:s "second" :p "serial" :o "S-1"}] {})))
+    (is (= #{"S-1"}
+           (get (eng/pull (eng/transact-with-schema
+                           db1 [{:s "first" :p "serial" :o "S-1"}] {})
+                          "first")
+                "serial")))))
+
 ;; ── value-type extension: uuid/instant/keyword/symbol/bytes/tuple ──────────
 ;; (ADR-2607061200 follow-up)
 
