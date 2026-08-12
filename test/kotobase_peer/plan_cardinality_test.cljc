@@ -1,9 +1,9 @@
 (ns kotobase-peer.plan-cardinality-test
-  "ADR-2608021000 §6-4-1: the planner already measures each clause's
-  cardinality to choose an order, and used to throw those numbers away. It now
-  hands them to the executor, which uses them to choose a STRATEGY per clause
-  -- one broad scan plus a hash join when a clause's relation is small
-  relative to the number of keyed scans a step would issue for it.
+  "ADR-2608021000 §6-4-1: the planner estimates each clause's cardinality to
+  choose an order and hands the estimate to the executor, which uses it to
+  choose a STRATEGY per clause -- one broad scan plus a hash join when a
+  clause's relation is small relative to the number of keyed scans a step
+  would issue for it.
 
   What is asserted here is that the hint is emitted, is keyed the way the
   executor looks it up, and matches the estimates the plan itself used. That
@@ -33,6 +33,18 @@
       (is (= (into {} (map (juxt :clause :estimated-rows)) (:plan plan)) hint)))
     (is (= 30 (get hint '[?m "creator" ?p])))
     (is (= 5 (get hint '[?p "role" "author"])))))
+
+(deftest fallback-planning-does-not-enumerate-visible-rows
+  (let [visibility-calls (atom 0)
+        visible? (fn [_] (swap! visibility-calls inc) true)
+        plan (eng/datalog-query-plan
+              (db)
+              '{:find [?m] :where [[?m "creator" ?p] [?m "date" ?d]]}
+              visible?)]
+    (is (= [:index-upper-bound :index-upper-bound]
+           (mapv :estimate-source (:plan plan))))
+    (is (zero? @visibility-calls)
+        "a cost estimate must not run authorization once per candidate row")))
 
 (deftest an-unoptimized-plan-emits-no-hint
   ;; Queries with functions/negation keep source order and are not estimated,

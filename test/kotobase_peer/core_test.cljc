@@ -367,7 +367,7 @@
                :query-statistics {"visibility-scope" "tenant-a/public-v1"
                                   "clauses" [{"pattern" [nil "role" "admin"] "rows" 1}]}}
         plan (eng/datalog-query-plan (eng/empty-db) query (constantly true))]
-    (is (= :visible-scan (-> plan :plan first :estimate-source)))))
+    (is (= :index-upper-bound (-> plan :plan first :estimate-source)))))
 
 (deftest query-plan-falls-back-when-materialized-statistics-are-stale
   (let [query {:find '[?s] :where '[[?s "role" "admin"]]
@@ -378,7 +378,7 @@
                                   "clauses" [{"pattern" [nil "role" "admin"]
                                               "rows" 1}]}}
         plan (eng/datalog-query-plan (eng/empty-db) query (constantly true))]
-    (is (= :visible-scan (-> plan :plan first :estimate-source)))))
+    (is (= :index-upper-bound (-> plan :plan first :estimate-source)))))
 
 (deftest query-visible-is-required
   (let [db (eng/transact (eng/empty-db) [{:s "alice" :p "role" :o "admin"}])]

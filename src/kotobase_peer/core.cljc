@@ -646,9 +646,10 @@
 
 (defn datalog-query-plan
   "Compile a safe cost-ordered plan for a plain conjunctive Datalog query.
-   Positive triple clauses commute, so their visible cardinalities can drive
-   `plan-clause-order`. Queries containing negation, functions, rules, or `or`
-   retain source order because those forms have binding/safety semantics."
+   Positive triple clauses commute, so scoped materialized cardinalities or
+   conservative covering-index upper bounds can drive `plan-clause-order`.
+   Queries containing negation, functions, rules, or `or` retain source order
+   because those forms have binding/safety semantics."
   ([db query visible?] (datalog-query-plan db query visible? []))
   ([db query visible? inputs]
    (let [where (:where query)]
@@ -673,20 +674,21 @@
                                {:id id
                                 :clause clause
                                 :vars (into #{} (filter datalog-var?) clause)
-                                ;; `kqe/cardinality`, not `(count (kqe/query
-                                ;; ...))`: the planner wants a NUMBER, and
-                                ;; building a set to count it made this the
-                                ;; single largest term in an LDBC IC09 query --
-                                ;; 361,246 rows hashed into a set and discarded,
-                                ;; 38% of the query's total time, on every call
-                                ;; (bench/results/2026-08-02-scan-instrumentation.edn).
-                                ;; Same `visible?`, same number; no set.
+                                ;; The planner wants a cost HINT, not an exact
+                                ;; authorized count. Walking every visible row
+                                ;; of `[?f1 "knows" ?f2]` to learn that hint
+                                ;; consumed 38% of LDBC IC09 planning time.
+                                ;; `estimate-cardinality` sums covering-index
+                                ;; bucket sizes instead: it is an upper bound
+                                ;; when visibility hides rows, which can make a
+                                ;; strategy conservative but cannot change an
+                                ;; answer or reveal a row.
                                 :estimated-rows (if (some? supplied)
                                                   supplied
-                                                  (kqe/cardinality db pattern visible?))
+                                                  (kqe/estimate-cardinality db pattern))
                                 :estimate-source (if (some? supplied)
                                                    :materialized-statistics
-                                                   :visible-scan)}))
+                                                   :index-upper-bound)}))
                            (range) where)
              plan (stats/plan-clause-order clauses)]
          {:query (assoc query
