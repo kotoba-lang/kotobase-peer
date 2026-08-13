@@ -673,20 +673,38 @@
                                {:id id
                                 :clause clause
                                 :vars (into #{} (filter datalog-var?) clause)
-                                ;; `kqe/cardinality`, not `(count (kqe/query
-                                ;; ...))`: the planner wants a NUMBER, and
-                                ;; building a set to count it made this the
-                                ;; single largest term in an LDBC IC09 query --
-                                ;; 361,246 rows hashed into a set and discarded,
-                                ;; 38% of the query's total time, on every call
+                                ;; Three versions of this line, each measured:
+                                ;;
+                                ;; `(count (kqe/query ...))` hashed 361,246 rows
+                                ;; into a set and discarded it -- 38% of an LDBC
+                                ;; IC09 query, every call
                                 ;; (bench/results/2026-08-02-scan-instrumentation.edn).
-                                ;; Same `visible?`, same number; no set.
+                                ;;
+                                ;; `kqe/cardinality` removed the set but still
+                                ;; walks every candidate to apply `visible?`.
+                                ;; Measured 2026-08-13 on LDBC SF-0.1,
+                                ;; `[_ ":label" "Message"]` (286,744 rows):
+                                ;; 96.393 ms. In a harness with the same
+                                ;; fallback that made the PLAN cost 101 ms for a
+                                ;; query whose execution cost 2.3 ms.
+                                ;;
+                                ;; `kqe/estimate-cardinality` reads the covering
+                                ;; indexes directly: 0.0129 ms for the same
+                                ;; number, 7,470x. It ignores `visible?`, so
+                                ;; with authorization in play it is an UPPER
+                                ;; BOUND -- which is the safe direction in both
+                                ;; places this number is used. Ordering by an
+                                ;; overestimate can pick a worse order but never
+                                ;; a wrong answer, and the executor treats a
+                                ;; larger `:clause-cardinality` as a reason to
+                                ;; stay on the keyed path, which is already its
+                                ;; default when it has no hint at all.
                                 :estimated-rows (if (some? supplied)
                                                   supplied
-                                                  (kqe/cardinality db pattern visible?))
+                                                  (kqe/estimate-cardinality db pattern))
                                 :estimate-source (if (some? supplied)
                                                    :materialized-statistics
-                                                   :visible-scan)}))
+                                                   :index-estimate)}))
                            (range) where)
              plan (stats/plan-clause-order clauses)]
          {:query (assoc query
