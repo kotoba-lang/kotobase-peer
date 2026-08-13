@@ -1,0 +1,55 @@
+{:schema 1
+ :date "2026-08-14"
+ :receipt/type :negative-result
+ :status "NOT LANDED. The change is real, measurable, and makes IC02 slower."
+
+ :what-was-tried
+ "`datalog.core/unify-positional` walks `(map vector terms values)`, allocating a
+  lazy seq plus one pair vector per term on every matched row. Rewritten as an
+  indexed loop that allocates nothing per row."
+
+ :isolated-measurement
+ {:rows 361246 :shape "the LDBC hasCreator clause, [?m \"hasCreator\" ?f]"
+  :map-vector-ns-per-row 316.3
+  :indexed-loop-ns-per-row 100.5
+  :speedup "3.1x"
+  :equivalence "both forms asserted to return equal bindings over 1,000 rows"
+  :suite "datalog: 88 tests, 155 assertions, 0 failures with the rewrite in place"}
+
+ :end-to-end-ab
+ {:method "two passes, arms alternating, same JVM invocation per arm, host load 3.1-4.5"
+  :hasCreator-7355-rows {:before [9.571 9.920] :after [8.552 8.287] :mean-change "-13.6%"}
+  :knows-361246-rows    {:before [788.729 764.266] :after [694.809 683.331] :mean-change "-11.3%"}
+  :ic02-three-clauses   {:before [29.861 26.378] :after [31.397 31.099] :mean-change "+11.1%"}}
+
+ :why-not-landed
+ "Single-clause scans get ~12% faster and IC02 gets ~11% slower, consistently in
+  direction across both passes. IC02 is the query this line of work is trying to
+  improve. A change that helps a microbenchmark and hurts the target query is the
+  exact shape of the 2026-08-02 attempt that made IC02 monotonically worse across
+  three runs, and this repo already set its own standard for that case: an
+  unproven optimisation in a performance-critical path is surface without
+  payment (kotobase-protocols-worker 313e298)."
+
+ :what-is-now-known
+ ["`(map vector terms values)` really does cost ~216 ns a row -- 3.1x the indexed
+   form -- and that is 26% of the ~815 ns a row previously attributed to unify plus
+   result construction."
+  "That saving reaches a single-clause scan as ~12%, which is the expected dilution."
+  "It does NOT reach a three-clause join, and something in the join path more than
+   cancels it. Naming that something is the next question. It is not answered here,
+   and this receipt does not guess."]
+
+ :caveats
+ ["Two passes per arm. The direction is consistent in all three rows across both
+   passes; two passes is still not many, and the IC02 deltas were +5.1% and +17.9%."
+  "The rewrite is not on any branch that will be merged. It exists in a worktree and
+   the numbers above are what it produced."]
+
+ :the-pattern-this-continues
+ "Four hypotheses about IC02's per-row cost have now been measured: the quad map
+  (6%), the intermediate set (0.15%), `map vector` in unify (26% of the sub-term,
+  ~12% end-to-end on scans, negative on IC02). Three were too small to matter and
+  the fourth helps everything except the query it was meant to help. Measuring
+  before changing has now prevented one regression from landing; measuring before
+  BELIEVING would have prevented three receipts."}
