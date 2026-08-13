@@ -367,7 +367,7 @@
                :query-statistics {"visibility-scope" "tenant-a/public-v1"
                                   "clauses" [{"pattern" [nil "role" "admin"] "rows" 1}]}}
         plan (eng/datalog-query-plan (eng/empty-db) query (constantly true))]
-    (is (= :visible-scan (-> plan :plan first :estimate-source)))))
+    (is (= :index-estimate (-> plan :plan first :estimate-source)))))
 
 (deftest query-plan-falls-back-when-materialized-statistics-are-stale
   (let [query {:find '[?s] :where '[[?s "role" "admin"]]
@@ -378,7 +378,7 @@
                                   "clauses" [{"pattern" [nil "role" "admin"]
                                               "rows" 1}]}}
         plan (eng/datalog-query-plan (eng/empty-db) query (constantly true))]
-    (is (= :visible-scan (-> plan :plan first :estimate-source)))))
+    (is (= :index-estimate (-> plan :plan first :estimate-source)))))
 
 (deftest query-visible-is-required
   (let [db (eng/transact (eng/empty-db) [{:s "alice" :p "role" :o "admin"}])]
@@ -3001,3 +3001,20 @@
                                  test-blind-fn test-decrypt-fn)]
          (is (= 2 (count hot)))
          (is (= #{"\"admin\"" "\"user\""} (set (map :v_edn hot))))))))
+
+(deftest query-plan-fallback-does-not-scan-for-its-estimate
+  ;; The point of the 2026-08-13 change: with no materialized statistics the
+  ;; planner used to call `cardinality`, which walks every candidate applying
+  ;; `visible?`. Measured on LDBC SF-0.1, `[_ ":label" "Message"]` (286,744
+  ;; rows) cost 96.393 ms that way and 0.0129 ms read off the indexes.
+  ;;
+  ;; Asserted by counting `visible?` calls rather than by timing: a timing test
+  ;; would pass on a fast machine with the slow code.
+  (let [db (reduce (fn [d i] (eng/transact d [{:s (str "s" i) :p "role" :o "admin"}]))
+                   (eng/empty-db) (range 50))
+        calls (atom 0)
+        visible? (fn [_] (swap! calls inc) true)
+        plan (eng/datalog-query-plan db {:find '[?s] :where '[[?s "role" "admin"]]} visible?)]
+    (is (= :index-estimate (-> plan :plan first :estimate-source)))
+    (is (= 50 (:estimated-rows (-> plan :plan first))) "the estimate is still the right number")
+    (is (zero? @calls) "planning asked the indexes, not every candidate")))
