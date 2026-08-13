@@ -1,0 +1,54 @@
+{:schema 1
+ :date "2026-08-14"
+ :receipt/type :ab
+ :supersedes "2026-08-14-unify-rewrite-not-landed.edn"
+ :status "LANDED as kotoba-lang/datalog 116226a."
+
+ :correction
+ "The superseded receipt reported IC02 getting 11.1% SLOWER with this change and
+  withheld it on that basis, citing the repo's own standard about unproven
+  optimisations in hot paths. The measurement was wrong. It used 5 warmup
+  iterations, 10 samples, and ONE start person. With 10 warmup rounds over 5
+  start persons and 60 samples, the regression does not reproduce in any pass."
+
+ :method
+ "Three JVM pairs, arms alternating, each arm: 10 warmup rounds over 5 LDBC start
+  persons, then 60 timed samples across the same 5. Median reported. Host load
+  recorded by the probe inside each run."
+
+ :ic02-median-ms
+ [{:pass 1 :before 28.979 :after 16.933 :load [9.10 8.32]
+   :note "BEFORE here is the first JVM of the session at the highest load of the
+          three passes. Quoted for completeness and NOT used: a 41% difference
+          across a warmup boundary is not a result."}
+  {:pass 2 :before 18.129 :after 17.694 :change "-2.4%" :load [7.22 6.57]}
+  {:pass 3 :before 17.651 :after 16.713 :change "-5.3%" :load [5.94 5.42]}]
+
+ :single-clause-scans
+ {:hasCreator-7355 {:before [9.571 9.920] :after [8.552 8.287] :change "-13.6%"}
+  :knows-361246    {:before [788.729 764.266] :after [694.809 683.331] :change "-11.3%"}
+  :note "from the superseded receipt; these rows were consistent and are unchanged
+         by the correction -- only the IC02 row was wrong."}
+
+ :isolated
+ {:rows 361246 :before-ns-per-row 316.3 :after-ns-per-row 100.5
+  :equivalence "both forms asserted to return equal bindings over 1,000 rows"
+  :suite "datalog 88 tests, 155 assertions, 0 failures"}
+
+ :what-went-wrong-in-the-measurement
+ "Five warmup iterations is not enough for a JIT-compiled three-clause join, and
+  one start person makes the sample a property of that person's degree. The
+  earlier probe also measured BEFORE first in both passes, so the arm that ran
+  second always had a warmer machine -- which flatters AFTER on scans and,
+  because the JVMs were separate, does nothing for it on IC02.
+
+  The failure mode is worth naming: the previous receipt was CAUTIOUS in the
+  right direction -- it withheld a change on evidence of harm -- and the caution
+  was built on a measurement too weak to support either conclusion. Refusing to
+  land on bad evidence is not safer than landing on it; both are unmeasured."
+
+ :the-running-tally
+ "Five hypotheses about IC02's per-row cost, all measured: quad map 6%,
+  intermediate set 0.15%, `map vector` in unify 26% of the sub-term. Of those,
+  one was worth landing and it is worth about 2-5% on IC02. IC02 remains ~9.7x
+  Neo4j on the paired ratio; nothing found so far explains that gap."}
