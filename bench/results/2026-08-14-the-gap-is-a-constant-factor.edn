@@ -1,0 +1,66 @@
+{:schema 1
+ :date "2026-08-14"
+ :receipt/type :synthesis
+ :question "Six measurement receipts found per-row costs worth 0.15% to 6%. The gap to Neo4j is 9.7x. Where is it?"
+ :answer "In what a row costs, uniformly. Not in any one query's plan or strategy."
+
+ :the-evidence
+ {:paired-p50-ratio-vs-neo4j {:ic07 0.995 :ic08 1.855 :ic02 9.710 :ic09 8.641}
+  :rows-the-engine-materialises
+  {:ic02 2702  :note-ic02 "sum of bindings-out per step, 882 + 910 + 910 (ic02-diag)"
+   :ic09 230321 :note-ic09 "882 + 55,335 + 87,052 + 87,052 (ic02-diag's ic09-steps)"
+   :ic07 "small -- the likes relation is 809 rows"
+   :ic08 "small -- replyOf is 4,355 rows"}
+  :relation-sizes {:knows 361246 :hasCreator 7355 :message-creationDate 7355 :replyOf 4355 :like-message 809}}
+
+ :the-reading
+ "IC02 and IC09 differ by 85x in rows materialised and by almost nothing in
+  ratio: 9.710 against 8.641. Two row-dominated queries landing on the same
+  ratio is what a constant per-row factor looks like -- both engines pay per
+  row, and the quotient is the ratio of their per-row costs.
+
+  IC07 and IC08 sit near parity because they touch few rows, so per-query fixed
+  costs dominate and the per-row difference has nothing to multiply.
+
+  This also explains why six receipts of micro-measurement produced so little:
+  the quad map is 6%, the intermediate set 0.15%, `map vector` in unify 26% of
+  one sub-term. Removing all of them together cannot turn 9x into 1x, because
+  they are pieces of the same constant factor rather than a mistake sitting on
+  top of it."
+
+ :what-a-row-costs-here
+ {:index-read 0.4 :unit "ns/row, estimate-cardinality on knows"
+  :plus-quad-maps-and-visible 131.3
+  :plus-hashing-into-a-set 588.6
+  :plus-unify-and-projection 2105.1
+  :note "Each layer measured over the same 361,246-row relation on 2026-08-14.
+         A row costs about 2 microseconds to move through the engine and about
+         0.4 nanoseconds to find."}
+
+ :what-would-actually-move-it
+ "Not an optimisation. The per-row cost is the binding representation (a
+  persistent map extended by `assoc` per variable per row), the quad
+  materialisation ({:s :p :o} per candidate), and set semantics at every step.
+  Those are the engine's data model, and they are also what makes it portable,
+  immutable and content-addressable. Changing any of them is a design decision
+  with consequences well outside query latency, and this receipt does not make
+  one -- it says only that no amount of profiling inside the current
+  representation will find a 9x."
+
+ :what-this-does-not-claim
+ ["Not that the engine is badly built. IC07 at 0.995 against embedded Neo4j says
+   the plan, the index routing and the join are sound; what differs is the cost
+   of a row once found."
+  "Not that 9x is fixed. It says the remaining 9x is in the representation, so
+   the next experiment worth running is a representation experiment, not another
+   profile."
+  "Two of the four ratios (IC02, IC09) support the constant-factor reading; two
+   (IC07, IC08) are consistent with it but too small to test it. Four points is
+   four points."]
+
+ :the-honest-summary-of-six-iterations
+ "Measured: planner estimation (fixed, 7,470x on the probe, IC07 to parity),
+  unify allocation (landed, 2-5% on IC02), quad maps (6%, not worth it), the
+  intermediate set (0.15%, not worth it). Two receipts were wrong and corrected
+  in place. What was learned that survives is the shape of the remaining gap,
+  and that it is not reachable from here."}
