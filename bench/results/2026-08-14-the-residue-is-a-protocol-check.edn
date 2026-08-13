@@ -1,0 +1,63 @@
+{:schema 1
+ :date "2026-08-14"
+ :receipt/type :diagnosis
+ :follows "2026-08-14-external-decomposition-exhausted.edn"
+
+ :finding
+ "89% of LDBC IC02 is spent inside `datalog.core/scan*`, and almost all of that is
+  `(satisfies? datom.source/IPatternSource db)` -- a protocol check that returns
+  false on every call, costing 54x the index read it guards."
+
+ :measured
+ {:satisfies-ipatternsource-ns 11305
+  :dq-query-one-keyed-pattern-ns 210
+  :ratio "54x"
+  :host-load 2.92
+  :method "200,000 iterations after 3,000 warmup, one JVM"}
+
+ :inside-the-engine
+ {:method "temporary phase counters in datalog.core/join-clause, thrown away after the run"
+  :ic02-total-ms-per-query 28.905
+  :group-by-substitute-ms 0.544 :group-by-pct 1.9
+  :scan-ms 25.735 :scan-pct 89.0
+  :unify-and-build-ms 1.904 :unify-pct 6.6
+  :clause-invocations 180
+  :accounted-pct 97.5
+  :host-load 3.61}
+
+ :the-arithmetic
+ "IC02 issues one `scan*` per distinct substituted pattern: 1 for the first
+  clause, 882 for `hasCreator` over the friend set, and about 900 for
+  `message/creationDate`. Roughly 1,800 calls at 11.3 microseconds is 20 ms,
+  against 25.7 ms measured in `scan*`. The protocol check explains the phase."
+
+ :why-external-probing-could-not-find-it
+ "Every arm in the four preceding receipts read the index through
+  `arrangement.query/query` or through `:pos`/`:spo` directly. Neither goes
+  through `scan*`, so none of them paid the check. The residue was 10x and
+  invisible from outside for the same reason: it is not in the data path, it is
+  in the dispatch in front of it."
+
+ :three-refuted-hypotheses-in-hindsight
+ "Binding representation, generality, the read path -- each was measured and each
+  was small. They were all guesses about what the engine DOES with a row. The
+  cost was in a decision the engine re-makes before every scan, about what kind
+  of thing its database is. Nothing about the shape of the data or the join could
+  have suggested that."
+
+ :not-yet-fixed
+ "The obvious repair -- decide once per query instead of once per pattern -- is
+  not made here. `satisfies?` result depends on the db's type, so caching by
+  class is tempting and is wrong in the presence of a later `extend`; threading a
+  boolean from the query entry point is correct and touches every `scan*` call
+  site. That is a change to make carefully with the suite green, not at the end
+  of a measurement."
+
+ :caveats
+ ["The phase counters force `scan*`'s result into a vector to time it, which
+   changes allocation slightly. The 89% is therefore approximate; the 11.3
+   microsecond figure is not, and is measured independently."
+  "One query shape. IC09 and IC08 issue far more and far fewer scans respectively,
+   so the share will differ; the per-call cost will not."
+  "Measured on a materialized-map db, which is what does NOT satisfy the protocol.
+   A real IPatternSource would take the other branch and pay a different cost."]}
