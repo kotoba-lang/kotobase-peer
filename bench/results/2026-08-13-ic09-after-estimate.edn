@@ -1,0 +1,51 @@
+{:schema 1
+ :date "2026-08-13"
+ :receipt/type :ic09-diagnosis
+ :implementation "kotobase-peer.ic09-diag"
+ :start-person "17592186053137"
+ :dataset {:subset-posts 3000 :quads 409877 :knows-quads 361246 :messages 7355}
+
+ :what-changed
+ "`datalog-query-plan`'s fallback estimate is now `kqe/estimate-cardinality`
+  rather than `kqe/cardinality` (kotobase-peer ea13f73). `:estimate-source` in
+  the plan below reads `:index-estimate` where the 2026-08-02 receipt read
+  `:visible-scan`."
+
+ :ic09-two-hop
+ {:before {:plan-ms 977.293 :probe-total-ms 2051.737 :execute-ms 1580.064 :end-to-end-ms 2340.162}
+  :after  {:plan-ms 2.256   :probe-total-ms 208.616  :execute-ms 206.789  :end-to-end-ms 189.299}
+  :rows 6733
+  :source-before "2026-08-02-ic09-after-hash-join.edn"}
+
+ :ic09-one-hop
+ {:before {:plan-ms 29.072 :execute-ms 196.460 :end-to-end-ms 283.441}
+  :after  {:plan-ms 1.329  :execute-ms 38.096  :end-to-end-ms 36.352}
+  :rows 910}
+
+ :what-is-attributable
+ "`plan-ms`, 977.293 -> 2.256 on the two-hop query, is the line that changed.
+  The planner used to estimate `[?f1 \"knows\" ?f2]` by counting all 361,246
+  visible rows; it now reads the number off the covering indexes.
+
+  `execute-ms` also fell, 1580 -> 207, and that is NOT claimed for this change.
+  Execution does not consult the estimator except through `:clause-cardinality`,
+  whose values are unchanged here (the estimate equals the exact count when
+  `visible?` admits everything). Eleven days of arrangement and datalog changes
+  sit between the two runs, and host load differs. The A/B that isolates one
+  line is 2026-08-13-planner-estimate-ab.edn; this receipt is a breakdown, not
+  an attribution."
+
+ :the-receipt-predicted-this
+ "The 2026-08-02 diagnosis carries a `:reading` field that says: \"If the probes
+  dominate, the cost is planning, not joining, and the fix is to stop estimating
+  by full materialisation -- not to reorder anything.\" The probes did dominate,
+  at 2,051 ms against 1,580 ms of joining, and that is what was fixed. The
+  diagnosis was right eleven days before it was acted on."
+
+ :caveats
+ ["Single start person, single run per measurement -- a diagnosis, not a benchmark."
+  "Host load average ~4-7 during this run; the 2026-08-02 run does not record its own.
+   `plan-ms` fell 433x, which is far outside anything load explains, but the smaller
+   ratios here are not load-controlled."
+  "`probe-total-ms` is the diagnostic's OWN explicit probing, kept so the two runs stay
+   comparable. It is no longer what the planner pays."]}
