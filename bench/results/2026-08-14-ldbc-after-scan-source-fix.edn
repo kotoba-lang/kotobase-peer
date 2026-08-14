@@ -1,0 +1,39 @@
+{:schema 1
+ :date "2026-08-14"
+ :receipt/type :ldbc-snb-interactive
+ :implementation "kotobase-peer.ldbc-snb-bench, with kotoba-lang/datalog d1b177c"
+
+ :change
+ "`scan*` asked `(satisfies? IPatternSource db)` on every call -- once per
+  distinct substituted pattern, ~1,800 times per IC02. `q` now decides once and
+  binds it. Measured cost of the check: 11,305 ns against 210 ns for the index
+  read it guarded."
+
+ :paired-p50-ratio-kotobase-over-neo4j
+ {:ic02 {:before 9.710 :after 3.073}
+  :ic07 {:before 0.995 :after 0.838}
+  :ic08 {:before 1.855 :after 1.955}
+  :ic09 {:before 8.641 :after 7.382}
+  :before-source "2026-08-13-planner-estimate-ab.edn, arm A"}
+
+ :absolute-p50-ms
+ {:kotobase {:ic02 6.259 :ic07 0.449 :ic08 0.769 :ic09 137.388}
+  :neo4j-embedded {:ic02 2.203 :ic07 0.515 :ic08 0.449 :ic09 18.809}
+  :note "Interleaved per sample in one JVM. Absolutes move with host load; the
+         paired ratio is the column that survives."}
+
+ :reading
+ "IC02 falls from 9.7x to 3.1x. IC07 goes below 1.0 -- kotobase answers it faster
+  than embedded Neo4j. IC09 improves less (8.6 -> 7.4) because its two-hop step
+  substitutes to far fewer distinct patterns per binding than IC02's, so it was
+  paying the check proportionally less. IC08 is unchanged within noise.
+
+  The saving scales with the number of DISTINCT substituted patterns a query
+  scans, which is exactly what the diagnosis predicted and why a single-clause
+  query saw nothing."
+
+ :what-this-is-not
+ ["Not an LDBC score. Four Interactive Complex reads on a deterministic subset of
+   SF1, not the certified driver over the full workload with an auditor."
+  "Not a claim of parity overall. IC02 is still 3.1x and IC09 still 7.4x."
+  "Answers asserted equal to Neo4j's on all four queries, as the harness requires."]}
