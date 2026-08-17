@@ -2018,13 +2018,18 @@
              novelty-quads (mapcat #(read-tx-block get-fn % decrypt-fn) (novelty-cids get-fn state))]
          (reduce (fn [db q] (apply-quad db q ipld/link?)) base novelty-quads))
        :cljs
-       (-> (js/Promise.all
-            #js [(hydrate-db get-fn (indexed-cid state) blind-fn decrypt-fn)
-                 (pmap-async (fn [cid] (read-tx-block get-fn cid decrypt-fn)) (novelty-cids get-fn state))])
+       ;; Hoisted for the reason hot-datoms' own binding documents: a sync
+       ;; novelty walk started AFTER an async scan makes a block-miss
+       ;; trampoline re-fetch what the abandoned scan still has in flight.
+       ;; Same shape, fixed by inspection -- the measured 3.00x is hot-datoms'.
+       (let [novelty (novelty-cids get-fn state)]
+         (-> (js/Promise.all
+              #js [(hydrate-db get-fn (indexed-cid state) blind-fn decrypt-fn)
+                   (pmap-async (fn [cid] (read-tx-block get-fn cid decrypt-fn)) novelty)])
            (.then (fn [results]
                     (let [[base novelty-quads-per-cid] (vec results)
                           novelty-quads (apply concat novelty-quads-per-cid)]
-                      (reduce (fn [db q] (apply-quad db q ipld/link?)) base novelty-quads))))))))
+                      (reduce (fn [db q] (apply-quad db q ipld/link?)) base novelty-quads)))))))))
 
 (defn- delta->quad [{:keys [e a v op]}]
   {:s e :p a :o v :op op})
@@ -2197,8 +2202,12 @@
               novelty-quads (mapcat #(read-tx-block get-fn % decrypt-fn) (novelty-cids get-fn state))]
           (reduce (fn [db q] (apply-quad db q ipld/link?)) base novelty-quads))
         :cljs
-        (-> (js/Promise.all
-             #js [(hydrate-db-cached get-fn (indexed-cid state) blind-fn decrypt-fn cache-get cache-put! async-get-fn)
+        ;; Hoisted; see hot-datoms' `novelty` binding. A sync novelty walk
+        ;; started after an async scan makes the block-miss trampoline
+        ;; re-fetch. Same shape, fixed by inspection, not separately measured.
+        (let [novelty (novelty-cids get-fn state)]
+          (-> (js/Promise.all
+               #js [(hydrate-db-cached get-fn (indexed-cid state) blind-fn decrypt-fn cache-get cache-put! async-get-fn)
                   ;; Novelty goes through `read-tx-block-async` whenever an
                   ;; `async-get-fn` is available, for the same reason the snapshot
                   ;; half does -- and the reason `read-tx-block-async` was written
@@ -2216,11 +2225,11 @@
                                 (if async-get-fn
                                   (read-tx-block-async async-get-fn cid decrypt-fn)
                                   (read-tx-block get-fn cid decrypt-fn)))
-                              (novelty-cids get-fn state))])
-            (.then (fn [results]
-                     (let [[base novelty-quads-per-cid] (vec results)
-                           novelty-quads (apply concat novelty-quads-per-cid)]
-                       (reduce (fn [db q] (apply-quad db q ipld/link?)) base novelty-quads)))))))))
+                              novelty)])
+              (.then (fn [results]
+                       (let [[base novelty-quads-per-cid] (vec results)
+                             novelty-quads (apply concat novelty-quads-per-cid)]
+                         (reduce (fn [db q] (apply-quad db q ipld/link?)) base novelty-quads))))))))))
 
 (defn- newly-added-transactions
   "Walk `chain-cid`'s full history: for each commit whose OWN novelty list
@@ -2552,7 +2561,36 @@
       :cljs
       (if (nil? chain-cid)
         (js/Promise.resolve [])
-        (let [state (state-at get-fn chain-cid)]
+        (let [state (state-at get-fn chain-cid)
+              ;; HOISTED, and the hoist is the point. `novelty-cids` walks the
+              ;; novelty chain with the SYNCHRONOUS `get-fn`, so under a
+              ;; block-miss trampoline (the host's `with-blocks`) it throws,
+              ;; the host fetches one block, and the whole body re-runs. Left
+              ;; inside the `#js [...]` below it evaluated AFTER the snapshot
+              ;; scan had already been started -- and an abandoned scan is not
+              ;; cancelled. It keeps fetching, and a host cache that only
+              ;; populates on RESOLVE cannot serve the restarted copy the
+              ;; blocks the orphan still has in flight, so the same blocks are
+              ;; requested again, once per restart.
+              ;;
+              ;; Measured (root 90-docs/kotobase-performance/2026-08-17-fold-
+              ;; cost-at-production-shape.edn) on kotobase-protocols-v2's real
+              ;; blocks: ONE read transferred 34.15 MB where only 11.4 MB of
+              ;; distinct blocks exist -- 3.00x. The dose tracks novelty NODES,
+              ;; not entries: 0 nodes 1.00x, 1 node 2.00x, 4 nodes 3.00x.
+              ;; Hoisting takes duplicate gets to zero in both cases.
+              ;;
+              ;; `fold!` never had this: it resolves `state-at` and
+              ;; `novelty-cids` in its own `let` before any async work exists,
+              ;; which is why every fold measurement reports zero duplicates
+              ;; and every hydrate with novelty did not. This makes the read
+              ;; path do what the write path already did.
+              ;;
+              ;; Do not move it back into the array. Evaluation order is the
+              ;; whole behaviour here, and nothing about the code's shape
+              ;; announces that -- the version with the duplicates returned
+              ;; byte-identical answers.
+              novelty (novelty-cids get-fn state)]
           (-> (js/Promise.all
                #js [(if async-get-fn
                       (cold-datoms-async async-get-fn (indexed-cid state) opts visible? blind-fn decrypt-fn)
@@ -2561,7 +2599,7 @@
                                   (if async-get-fn
                                     (read-tx-block-async async-get-fn cid decrypt-fn)
                                     (read-tx-block get-fn cid decrypt-fn)))
-                                (novelty-cids get-fn state))])
+                                novelty)])
               ;; `vec`, NOT `js->clj`: every element `js/Promise.all` resolves here is
               ;; already realized ClojureScript data (a Link is an `ipld.core/Link`
               ;; defrecord, which is iterable) -- `js->clj` walks anything iterable and
@@ -2703,13 +2741,16 @@
        :cljs
        (if-not views-cid
          (js/Promise.resolve nil)
-         (-> (js/Promise.all
-              #js [(read-views-block get-fn views-cid decrypt-fn)
-                   (js/Promise.all (into-array (map #(read-tx-block get-fn % decrypt-fn)
-                                                    (novelty-cids get-fn state))))])
-             (.then (fn [^js pair]
-                      (finish (aget pair 0)
-                              (apply concat (array-seq (aget pair 1)))))))))))
+         ;; Hoisted; see hot-datoms' `novelty` binding. Same shape, fixed by
+         ;; inspection, not separately measured.
+         (let [novelty (novelty-cids get-fn state)]
+           (-> (js/Promise.all
+                #js [(read-views-block get-fn views-cid decrypt-fn)
+                     (js/Promise.all (into-array (map #(read-tx-block get-fn % decrypt-fn)
+                                                      novelty)))])
+               (.then (fn [^js pair]
+                        (finish (aget pair 0)
+                                (apply concat (array-seq (aget pair 1))))))))))))
 
 (defn fold!
   "Compact `chain-cid`'s novelty into a fresh indexed snapshot: hydrate the
