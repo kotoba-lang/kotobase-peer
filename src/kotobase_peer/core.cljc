@@ -1744,6 +1744,12 @@
   `visible?` is REQUIRED, same contract as `datoms`'s (ADR-2607050500): a
   post-filter over each candidate `{:e :a :v_edn :added}` row, applied BEFORE
   `:limit` is taken (so `:limit` caps what the caller actually receives).
+  `:limit` is ALSO pushed into `scan-prefix` so the tree walk stops after
+  that many ciphertexts — taking limit after a full scan is what made
+  `datoms` `:limit 1` cost O(database) CPU on kotobase.net (2026-08-17,
+  relay-bsky ~35s/500). A dropping `visible?` may therefore return fewer
+  than `:limit` rows rather than keep walking; the public Worker path
+  passes `(constantly true)`.
   Pass `(constantly true)` to see everything, as an explicit choice. See
   `hydrate-db`, below, for the one internal caller that deliberately must NOT
   narrow this.
@@ -1767,7 +1773,7 @@
              root-cid  (some-> (get-in snap ["index-roots" root]) ipld/link-cid)
              entries   (if (nil? root-cid)
                          []
-                         (pt/scan-prefix get-fn root-cid (or (components-prefix components blind-fn) "")))
+                         (pt/scan-prefix get-fn root-cid (or (components-prefix components blind-fn) "") limit))
              rows      (for [[_ ciphertext] entries
                              :let [[e a v] (->eav ((leaf-decoder snap) (decrypt-fn ciphertext)))]]
                          {:e e :a a :v_edn (v->edn v) :added true})
@@ -1784,7 +1790,7 @@
              (.then (fn [prefix]
                       (let [entries (if (nil? root-cid)
                                       []
-                                      (pt/scan-prefix get-fn root-cid (or prefix "")))]
+                                      (pt/scan-prefix get-fn root-cid (or prefix "") limit))]
                         (pmap-async (fn [[_ ciphertext]]
                                       (.then (decrypt-fn ciphertext) (leaf-decoder snap)))
                                     entries))))
@@ -1837,7 +1843,7 @@
                             (.then (fn [prefix]
                                      (if (nil? root-cid)
                                        []
-                                       (pt/scan-prefix-async async-get-fn root-cid (or prefix "")))))
+                                       (pt/scan-prefix-async async-get-fn root-cid (or prefix "") limit)))
                             (.then (fn [entries]
                                      (pmap-async (fn [[_ ciphertext]]
                                                    (.then (decrypt-fn ciphertext) decode))
