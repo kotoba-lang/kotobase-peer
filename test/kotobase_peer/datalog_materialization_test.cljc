@@ -112,12 +112,19 @@
           (recur (:next-work work) (into decoded (:bindings work))))
         (is (= bindings decoded))))))
 
+;; `:cljs js/Error`, not `cljs.core.ExceptionInfo`. Under nbb (SCI) the latter
+;; does not resolve as a symbol, and it fails in the ANALYSIS phase -- so this
+;; one file took the whole nbb tier down with it and all 17 test namespaces
+;; never ran. Six other test files in this repo already write `js/Error`; this
+;; was the outlier. The assertion loses nothing that matters: `ex-info` produces
+;; an Error in cljs, and `thrown-with-msg?` still discriminates on the regex.
+
 (deftest join-frontier-work-rejects-malformed-prefix-cursors
   (doseq [scan [{:clause-index 0 :index :unknown :after "x"}
                 {:clause-index 1 :index :avet :after "x"}
                 {:clause-index 0 :index :avet :after ""}]]
     (is (thrown-with-msg?
-         #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core.ExceptionInfo)
+         #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
          #"Invalid join frontier"
          (materialization/build-frontier-work-chain
           {:snapshot :after :remaining [0]
@@ -127,7 +134,7 @@
 
 (deftest join-frontier-single-oversized-binding-fails-closed
   (is (thrown-with-msg?
-       #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core.ExceptionInfo)
+       #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
        #"exceeds work byte budget"
        (materialization/build-frontier-work-chain
         {:snapshot :after :remaining [0]
