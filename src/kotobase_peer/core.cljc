@@ -1843,7 +1843,7 @@
                             (.then (fn [prefix]
                                      (if (nil? root-cid)
                                        []
-                                       (pt/scan-prefix-async async-get-fn root-cid (or prefix "") limit)))
+                                       (pt/scan-prefix-async async-get-fn root-cid (or prefix "") limit))))
                             (.then (fn [entries]
                                      (pmap-async (fn [[_ ciphertext]]
                                                    (.then (decrypt-fn ciphertext) decode))
