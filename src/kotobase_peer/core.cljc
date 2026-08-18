@@ -1293,10 +1293,37 @@
   "Inverse of `framed-quad-payload`. `bc/unframe` is the identity on bytes
   written before the frame existed, so this reads old and new blocks with one
   path and no version flag — which is what let the read half of this change
-  ship ahead of the write half."
+  ship ahead of the write half.
+
+  **A payload this cannot read throws. It does not return no quads.**
+
+  Those two answers used to be the same value. `get` returns nil for a node
+  that is not a `{\"quads\" [...]}` map at all, and `mapv` over nil is `[]` —
+  so a transaction the reader could not decode contributed exactly what an
+  empty transaction contributes, with no error anywhere above it. Measured in
+  production on 2026-08-18 (superproject ADR-2608182100): a deployment reading
+  blocks written by a build whose frame it did not have listed **one object out
+  of four** and returned HTTP 200. The three it could not decode were intact in
+  the store the whole time; nothing said so.
+
+  An empty transaction is still readable and still legal: it encodes
+  `{\"quads\" []}`, `get` finds the key, and the result is `[]`. The
+  distinction this makes is between *no quads* and *no answer*, which is the
+  only distinction that could have surfaced that incident."
   [plaintext]
-  (mapv wire->quad (get (ipld/decode (bc/platform-bytes (bc/unframe plaintext)))
-                        "quads")))
+  (let [node (ipld/decode (bc/platform-bytes (bc/unframe plaintext)))
+        quads (when (map? node) (get node "quads"))]
+    (when-not (sequential? quads)
+      (throw (ex-info "tx block payload is not a quad node"
+                      {:kotobase-peer/error :undecodable-tx-payload
+                       :node-type (cond (map? node) :map-without-quads
+                                        (number? node) :number
+                                        (string? node) :string
+                                        (sequential? node) :sequence
+                                        :else :other)
+                       :quads-type (cond (nil? quads) :absent
+                                         :else :not-sequential)})))
+    (mapv wire->quad quads)))
 
 (defn- put-tx-block!
   "ADR-2607051000 (accepted 2026-07-06): the novelty tx block's whole quad

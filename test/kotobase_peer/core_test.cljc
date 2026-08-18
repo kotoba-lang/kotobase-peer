@@ -3002,6 +3002,54 @@
          (is (= 2 (count hot)))
          (is (= #{"\"admin\"" "\"user\""} (set (map :v_edn hot))))))))
 
+#?(:clj
+   (defn- payload-replacing-encrypt-fn
+     "A writer whose block the reader cannot make sense of. `node` stands in for
+      whatever the payload decodes to when the reader and the writer disagree
+      about the format — in the 2026-08-18 production incident it was the
+      integer 1, the leading byte of a compression frame the reader did not
+      have, read as a bare CBOR integer."
+     [node]
+     (fn [_plaintext] (test-encrypt-fn (ipld/encode node)))))
+
+#?(:clj
+   (deftest an-unreadable-tx-block-throws-instead-of-reading-empty
+     (testing "no quads and no answer used to be the same value"
+       (let [{:keys [put! get-fn]} (mem-store)
+             cid (eng/commit! put! get-fn [["alice" "role" "admin"]] nil
+                              (payload-replacing-encrypt-fn {"not-quads" []}))]
+         (is (thrown? clojure.lang.ExceptionInfo
+                      (eng/hot-datoms get-fn cid (constantly true)
+                                      test-blind-fn test-decrypt-fn)))
+         (is (= :undecodable-tx-payload
+                (try (eng/hot-datoms get-fn cid (constantly true)
+                                     test-blind-fn test-decrypt-fn)
+                     nil
+                     (catch clojure.lang.ExceptionInfo e
+                       (:kotobase-peer/error (ex-data e)))))
+             "and it says which failure it was, not just that something failed")))
+     (testing "a payload that is not a node at all is also loud — though this one
+               never reaches the check above, because `unframe` refuses it first:
+               the dag-cbor of the integer 1 is the single byte 0x01, which IS
+               the frame tag, so the codec tries to inflate zero bytes and
+               throws. Both answers are acceptable; silence is not."
+       (let [{:keys [put! get-fn]} (mem-store)
+             cid (eng/commit! put! get-fn [["alice" "role" "admin"]] nil
+                              (payload-replacing-encrypt-fn 1))]
+         (is (thrown? Exception
+                      (eng/hot-datoms get-fn cid (constantly true)
+                                      test-blind-fn test-decrypt-fn)))))))
+
+#?(:clj
+   (deftest a-transaction-with-no-quads-still-reads-as-empty
+     (testing "the distinction is between no quads and no answer — an empty
+               transaction is readable, legal, and must not throw"
+       (let [{:keys [put! get-fn]} (mem-store)
+             cid (eng/commit! put! get-fn [["alice" "role" "admin"]] nil
+                              (payload-replacing-encrypt-fn {"quads" []}))]
+         (is (= [] (eng/hot-datoms get-fn cid (constantly true)
+                                   test-blind-fn test-decrypt-fn)))))))
+
 (deftest query-plan-fallback-does-not-scan-for-its-estimate
   ;; The point of the 2026-08-13 change: with no materialized statistics the
   ;; planner used to call `cardinality`, which walks every candidate applying
