@@ -44,7 +44,7 @@
         ;; Extracted capability owners. Namespaces in this repository now
         ;; delegate to these reviewed, published revisions for compatibility.
         io.github.kotoba-lang/kotobase-projection
-        {:git/sha "ce8efd339a92783a8146fc5f64309a7e481cc0f4"}
+        {:git/sha "b945b840076132acf236a430868dc6fd15a890d7"}
         io.github.kotoba-lang/kotobase-federation
         {:git/sha "e175d7bb938f2d705dc06ed453e2e9759648d76b"}
         io.github.kotoba-lang/kotobase-maintenance
