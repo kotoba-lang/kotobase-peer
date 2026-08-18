@@ -11,9 +11,9 @@
  ;; representation (kotoba : kotobase = Clojure : Datomic, ADR-2607032500).
  :deps {;; formerly two deps here (kqe + quad-store) -- kqe merged into
         ;; arrangement (ADR-2607050700), so this is the one coordinate now.
-        io.github.kotoba-lang/arrangement {:git/sha "eb7ea6c12064bed0db4266f3f94dd36b69e24450"}
-        io.github.kotoba-lang/chain {:git/sha "6da9ce3b69b5e591bdcf275519afa91b126a22a8"}
-        io.github.kotoba-lang/datom      {:git/sha "d27a5833d59d909367956705f2ec931399c891ee"}
+        io.github.kotoba-lang/arrangement {:git/sha "d1ef17edf4ac870b1e792bce9e6fe98e9eb96f7f"}
+        io.github.kotoba-lang/chain {:git/sha "5545426442ddacc919836fe2e17936684529895b"}
+        io.github.kotoba-lang/datom      {:git/sha "3a45462b3b6da018e24c65d12f8f3d3250a0c38e"}
         ;; DIRECT dep as of ADR-2607120730's follow-up (hydrate-db-cached's
         ;; cold-datoms-async calling prolly-tree.core/scan-prefix-async
         ;; directly) -- previously only came in transitively via
@@ -28,23 +28,23 @@
         ;; codec: its output bytes are inside every CID it frames, so two
         ;; writers on different pins would fork the block graph.
         io.github.kotoba-lang/kotobase-block-codec
-        {:git/sha "f03bcef355975067060af55e23e9c8bbfb0bc362"}
-        io.github.kotoba-lang/sigv4 {:git/sha "9babf9f29b99f128059515e74b00b19ac9cc5436"}
-        io.github.kotoba-lang/prolly-tree {:git/sha "da30b75dd6a75d41b3e1875737efc909eefe450c"}
+        {:git/sha "56fd411eb6bfd9f28089599f8b2c60f03d840bc1"}
+        io.github.kotoba-lang/sigv4 {:git/sha "ffc2845d63a1b80a6258ed871150c96ab1a11855"}
+        io.github.kotoba-lang/prolly-tree {:git/sha "644753aec57e12c9588786d46751b1503a5fd6f0"}
         ;; The write-optimised half of L4, extracted 2026-08-01 and consumed
         ;; from here as of this pin (ADR-2607312100 D7, ADR-2608012800).
         ;; `prolly-tree` above is the read-optimised half; the two are
         ;; siblings, not alternatives. Until now the extraction existed only
         ;; as a second copy -- the originals stayed in this repo's src/ and
         ;; nothing consumed the new repo, so the two were free to diverge.
-        io.github.kotoba-lang/merkle-lsm {:git/sha "202c365c86b6ac0d5e9a3329f6f05d5a076878b5"}
+        io.github.kotoba-lang/merkle-lsm {:git/sha "a9430538f97e06d6a4312af123fa49c675d6a479"}
         ;; the host-side implementation of the :cache/get//:cache/put effects
         ;; merkle-lsm has always declared and nothing has ever interpreted.
-        io.github.kotoba-lang/block-cache {:git/sha "f4630b042c6cb365dff32a9ec7ed3d0e76205144"}
+        io.github.kotoba-lang/block-cache {:git/sha "d871dbc73d924e86767cf82a3d6e50d7b4e8eb3d"}
         ;; Extracted capability owners. Namespaces in this repository now
         ;; delegate to these reviewed, published revisions for compatibility.
         io.github.kotoba-lang/kotobase-projection
-        {:git/sha "b35b05376f009577ee1bd472e5e74c6defab07f6"}
+        {:git/sha "ce8efd339a92783a8146fc5f64309a7e481cc0f4"}
         io.github.kotoba-lang/kotobase-federation
         {:git/sha "e175d7bb938f2d705dc06ed453e2e9759648d76b"}
         io.github.kotoba-lang/kotobase-maintenance
