@@ -49,3 +49,15 @@
   (let [d (db)
         query '{:find [?m] :where [[?m "creator" ?p] [?p "role" "author"]]}]
     (is (= 30 (count (eng/query d query everything))))))
+
+(deftest fallback-planning-does-not-enumerate-visible-rows
+  (let [visibility-calls (atom 0)
+        visible? (fn [_] (swap! visibility-calls inc) true)
+        plan (eng/datalog-query-plan
+              (db)
+              '{:find [?m] :where [[?m "creator" ?p] [?m "date" ?d]]}
+              visible?)]
+    (is (= [:index-estimate :index-estimate]
+           (mapv :estimate-source (:plan plan))))
+    (is (zero? @visibility-calls)
+        "a cost estimate must not run authorization once per candidate row")))
