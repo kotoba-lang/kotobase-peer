@@ -41,21 +41,62 @@
        [store f]
        (let [fetch1 (fetch1-fn store)
              sync-get (sync-get-fn store)]
-         (letfn [(retry [e]
-                   (if-let [cid (:cid (ex-data e))]
+         (letfn [(miss-cid [e]
+                   ;; Read the CAUSE CHAIN, not the outermost `ex-data`. When a
+                   ;; throw crosses an async continuation, nbb/SCI wraps it in
+                   ;; its own error (`{:type :sci/error …}`) and puts the
+                   ;; original under `:cause`, so a one-link read loses the
+                   ;; `:cid` that selects the retry -- and the miss surfaces as
+                   ;; a generic rejection instead. Root ADR-2608190100.
+                   (loop [e e n 0]
+                     (cond (nil? e) nil
+                           (> n 8) nil
+                           (:cid (ex-data e)) (:cid (ex-data e))
+                           :else (recur (ex-cause e) (inc n)))))
+                 (retry [e]
+                   (if-let [cid (miss-cid e)]
                      (-> (fetch1 cid)
                          (.then (fn [bytes]
                                   (swap! (:cache store) assoc cid bytes)
                                   (step))))
                      (js/Promise.reject e)))
                  (step []
-                   (try (-> (js/Promise.resolve (f sync-get)) (.catch retry))
+                   ;; `(.catch retry)` -- the sibling passed BY NAME -- is never
+                   ;; invoked under nbb/SCI, silently. Measured 2026-08-19 in
+                   ;; kotobase-server and reproduced in four lines; the wrapper
+                   ;; is correct on every runtime. Root ADR-2608190100.
+                   (try (-> (js/Promise.resolve (f sync-get)) (.catch (fn [e] (retry e))))
                         (catch :default e (retry e))))]
            (step))))
 
      (def ^:private blind #(js/Promise.resolve (pr-str %)))
      (def ^:private decrypt #(js/Promise.resolve %))
      (def ^:private encrypt #(js/Promise.resolve %))
+
+     (deftest the-trampoline-retries-a-miss-thrown-inside-a-continuation
+       ;; The namespace docstring says the defect it exists for is a miss that
+       ;; arrives in ASYNC context. Measured 2026-08-19 under nbb, the test
+       ;; below never takes that path: instrumenting both arms showed the sync
+       ;; catch firing twice and the promise `.catch` firing zero times, so the
+       ;; two-quad fixture proves the sync half only. This drives the async arm
+       ;; directly -- the miss is thrown inside a `.then` continuation, which is
+       ;; the only arm `(.catch …)` can serve.
+       (async done
+         (let [store (new-store)
+               _ ((put-fn store) "cid-async" "bytes")
+               fired (atom 0)]
+           (-> (with-blocks store
+                 (fn [get-fn]
+                   (-> (js/Promise.resolve nil)
+                       (.then (fn [_] (swap! fired inc) (get-fn "cid-async"))))))
+               (.then (fn [v]
+                        (is (= "bytes" v) "the async miss was fetched and the read retried")
+                        (is (= 2 @fired) "f ran twice: once to miss, once after the fetch")
+                        (done)))
+               (.catch (fn [e]
+                         (is false (str "async miss was not retried: "
+                                        (or (some-> e .-message) e)))
+                         (done)))))))
 
      (deftest hydrate-chain-cached-reads-back-over-an-async-store
        (async done
