@@ -157,12 +157,12 @@
                      {:item item}))))
 
 (defn- retract-entity*
-  "Retract every quad whose subject is `s` from the hot db (spo lookup —
+  "Retract every quad whose subject is `s` from the hot db (`:eavt` lookup —
   O(|entity|), ADR-2607071610 :retract-entity)."
   [db s ref?]
   (reduce-kv (fn [db p os]
                (reduce (fn [db o] (qs/retract-quad db {:s s :p p :o o} ref?)) db os))
-             db (get-in db [:spo s] {})))
+             db (get-in db [:eavt s] {})))
 
 (defn- apply-quad
   "Apply one :op-tagged quad to the hot db (ADR-2607071610). Missing :op =
@@ -359,7 +359,7 @@
                   (when (or vt card uniq tuple-types-str)
                     [ent {:value-type vt :cardinality (or card "many") :unique uniq
                           :tuple-types (some-> tuple-types-str (str/split #","))}]))))
-        (:spo db)))
+        (:eavt db)))
 
 (defn- validate-value-type!
   "`value-type` -> the check run against the ORIGINAL value `v` (before
@@ -582,16 +582,16 @@
            :eavt (cond
                    (and c0 c1) (for [v (get (qs/entity-attrs db c0) c1 #{})] [c0 c1 v])
                    c0          (for [[a vs] (qs/entity-attrs db c0), v vs]   [c0 a v])
-                   :else       (for [[e pm] (:spo db), [a vs] pm, v vs]      [e a v]))
+                   :else       (for [[e pm] (:eavt db), [a vs] pm, v vs]      [e a v]))
            ;; AEVT — key order [a e v]
            :aevt (cond
                    c0    (for [[e vs] (qs/by-predicate db c0), v vs]   [e c0 v])
-                   :else (for [[a em] (:pso db), [e vs] em, v vs]      [e a v]))
+                   :else (for [[a em] (:aevt db), [e vs] em, v vs]      [e a v]))
            ;; AVET — key order [a v e]; [a v] is arrangement's point lookup
            :avet (cond
                    (and c0 c1) (for [e (qs/by-predicate-value db c0 c1)] [e c0 c1])
                    c0          (for [[e vs] (qs/by-predicate db c0), v vs] [e c0 v])
-                   :else       (for [[a em] (:pso db), [e vs] em, v vs]    [e a v]))
+                   :else       (for [[a em] (:aevt db), [e vs] em, v vs]    [e a v]))
            ;; VAET — key order [v a e]; [v a] is arrangement's point lookup
            ;; (`refs-to`, reverse-reference). Populated ONLY for quads whose
            ;; value was asserted as a truthy `ref?` (`transact`'s own default:
@@ -603,7 +603,7 @@
            :vaet (cond
                    (and c0 c1) (for [e (get (qs/refs-to db c0) c1 #{})] [e c1 c0])
                    c0          (for [[a es] (qs/refs-to db c0), e es]   [e a c0])
-                   :else       (for [[o pm] (:ocp db), [a es] pm, e es] [e a o])))
+                   :else       (for [[o pm] (:vaet db), [a es] pm, e es] [e a o])))
          rows (for [[e a v] triples] {:e e :a a :v_edn (v->edn v) :added true})
          rows (filter visible? rows)
          rows (cond->> rows limit (take limit))]
@@ -1684,6 +1684,14 @@
 ;; be decrypted to recover the real triple (the key is one-way, unrecoverable).
 
 ;; index → snapshot key + how its [k1 k2 v] maps back to a datom {:e :a :v}
+;;
+;; The cold path has always spoken :eavt/:aevt/:avet/:vaet on the outside and
+;; the spo/pso/pos/ocp wire names on the inside. As of 2026-08-20 the HOT path
+;; speaks the same four names (datalog a43dc1cf, arrangement a5d68dc8), so this
+;; table is no longer a translation between two layers -- it is the same
+;; keyword-to-wire-name mapping arrangement.core/index-names holds, for the
+;; read direction. The wire names stay put: they are hashed into the commit
+;; CID (see arrangement.core's ns docstring).
 (def ^:private index-spec
   {:eavt {:root "spo" :->eav (fn [[s p o]] [s p o])}   ; spo: [s p o]
    :aevt {:root "pso" :->eav (fn [[p s o]] [s p o])}   ; pso: [p s o]
@@ -1885,7 +1893,7 @@
 
 (defn hydrate-db
   "Rebuild the full hot 4-index `db` from a persisted snapshot. Reads ONE
-  index tree (spo) in full and re-asserts every quad, so the reconstructed
+  index tree (the spo root, i.e. `:eavt`) in full and re-asserts every quad, so the reconstructed
   db is ~1× graph size. This is `fold!`'s internal starting point (hydrate
   the last-indexed snapshot, then re-assert novelty on top) — an O(graph_shard)
   operation, now paid once per fold instead of once per write. get-fn:
@@ -2359,8 +2367,8 @@
                     (reduce (fn [db q] (apply-quad db q ipld/link?)) (qs/empty-db)
                             (apply concat quads-per-cid))))))))
 
-(defn- spo->quads [db]
-  (for [[e attrs] (:spo db), [a vs] attrs, v vs] {:s e :p a :o v}))
+(defn- eavt->quads [db]
+  (for [[e attrs] (:eavt db), [a vs] attrs, v vs] {:s e :p a :o v}))
 
 ;; ── ADR-2607071610 Phase 2: history actually preserves retracted facts ──────
 ;; `history` (below) has ALWAYS documented "a datom retracted later still
@@ -2395,7 +2403,7 @@
        :retract
        [(qs/retract-quad cur q ref?) (qs/assert-quad audit q ref?)]
        :retract-entity
-       (let [prior (get-in cur [:spo s] {})
+       (let [prior (get-in cur [:eavt s] {})
              audit' (reduce (fn [a [p vs]]
                               (reduce (fn [a v] (qs/assert-quad a {:s s :p p :o v} ref?)) a vs))
                             audit prior)]
@@ -2445,7 +2453,7 @@
            quads (mapcat #(read-tx-block get-fn % decrypt-fn) tx-cids)
            [_ audit-db] (audit-replay quads ipld/link?)
            snap-db (hydrate-db get-fn (latest-snapshot-cid get-fn chain-cid) blind-fn decrypt-fn)]
-       (reduce qs/assert-quad snap-db (spo->quads audit-db)))
+       (reduce qs/assert-quad snap-db (eavt->quads audit-db)))
      :cljs
      (let [tx-cids (newly-added-tx-cids get-fn chain-cid -1)]
        (-> (js/Promise.all
@@ -2455,7 +2463,7 @@
                     (let [[quads-per-cid snap-db] (vec results)
                           quads (apply concat quads-per-cid)
                           [_ audit-db] (audit-replay quads ipld/link?)]
-                      (reduce qs/assert-quad snap-db (spo->quads audit-db)))))))))
+                      (reduce qs/assert-quad snap-db (eavt->quads audit-db)))))))))
 
 (defn history-datoms
   "Datomic `(d/datoms (d/history db) ...)`-shaped rows `{:e :a :v_edn
@@ -2501,7 +2509,7 @@
                   [(qs/retract-quad cur q ipld/link?)
                    (cond-> rows (want? s) (conj (row s p o false)))]
                   :retract-entity
-                  (let [prior (get-in cur [:spo s] {})
+                  (let [prior (get-in cur [:eavt s] {})
                         new-rows (when (want? s)
                                    (for [[p vs] prior v vs] (row s p v false)))]
                     [(retract-entity* cur s ipld/link?)
