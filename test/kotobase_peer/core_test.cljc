@@ -945,9 +945,9 @@
            slice (eng/hydrate-transaction-slice
                   get-fn c1 [[:db/add "entity-42" "role" "admin"]]
                   test-blind-fn test-decrypt-fn)]
-       (is (= #{"entity-42"} (set (keys (:spo slice))))
+       (is (= #{"entity-42"} (set (keys (:eavt slice))))
            "snapshot prefix and novelty replay exclude unrelated subjects")
-       (is (= #{"admin"} (get-in slice [:spo "entity-42" "role"])))
+       (is (= #{"admin"} (get-in slice [:eavt "entity-42" "role"])))
        (is (empty? (:effective-deltas
                     (eng/transact-effective slice
                                             [[:db/add "entity-42" "role" "admin"]])))))))
@@ -976,7 +976,7 @@
            slice (eng/hydrate-transaction-slice
                   counted-get head [["entity-7" "role" "user"]]
                   test-blind-fn counting-decrypt)]
-       (is (= #{"user"} (get-in slice [:spo "entity-7" "role"])))
+       (is (= #{"user"} (get-in slice [:eavt "entity-7" "role"])))
        (is (= 1 @decrypts)
            "20 novelty entries are classified by blind token; only the matching tx ciphertext is opened")
        (is (<= @reads 6)
@@ -1007,7 +1007,7 @@
                   test-blind-fn
                   (fn [ciphertext] (swap! decrypts inc) (test-decrypt-fn ciphertext)))]
        (is (= 15 (eng/novelty-size get-fn folded)))
-       (is (= #{"user"} (get-in slice [:spo "entity-10" "role"])))
+       (is (= #{"user"} (get-in slice [:eavt "entity-10" "role"])))
        (is (= 1 @decrypts) "only the matching remaining novelty ciphertext is opened")
        (is (<= @reads 7) "remaining entries are rebuilt into one verified metadata segment"))))
 
@@ -1557,7 +1557,7 @@
   ;; caller actually sending it (kotobase-client's own `datoms` docstring
   ;; has always documented :vaet as a valid index) got an unhandled-case
   ;; exception instead of rows or a graceful error. Confirmed 2026-07-08,
-  ;; fixed by wiring the already-existing `:ocp` index (arrangement's own
+  ;; fixed by wiring the already-existing `:vaet` index (arrangement's own
   ;; VAET-equivalent, populated for ref-valued quads -- see `refs`/`refs-to`).
   (let [db (eng/transact (eng/empty-db)
                           [{:s "alice" :p "knows" :o bob-link}
