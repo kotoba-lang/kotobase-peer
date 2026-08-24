@@ -502,6 +502,35 @@
                       (map? (:block entry))))
                remainder)))
 
+(defn- ->wire
+  "`v` as IPLD Data Model values: keyword keys and keyword values become their
+   names, recursively.
+
+   `ipld/encode` refuses a map whose keys are not strings -- `ipld: Data Model
+   map keys must be strings`, from `ipld.data-model` -- and the Data Model has
+   no keyword type at all, so a keyword VALUE cannot survive either. Three
+   sites in this file built ordinary Clojure maps with `select-keys` and handed
+   them straight to `ipld/encode`, and every one of them threw rather than
+   answering.
+
+   Not a ClojureScript defect even though only ClojureScript tests reach it:
+   measured 2026-08-25, `ipld/encode` rejects `{:cid \"x\"}` on the JVM too.
+   The JVM suite is green because this repository's `.cljc` tests never reach
+   these lines, and its two `.cljs` tests -- the only ones that do -- were
+   discovered by no runner (`run-nbb-tests.cljs` finds `_test.cljc` only).
+
+   One helper rather than three hand-rewritten maps, because the mistake is the
+   same one three times: a Clojure map is not a Data Model map."
+  [v]
+  (cond
+    (map? v) (reduce-kv (fn [m k x]
+                          (assoc m (if (keyword? k) (name k) k) (->wire x)))
+                        {} v)
+    (vector? v) (mapv ->wire v)
+    (seq? v) (mapv ->wire v)
+    (keyword? v) (name v)
+    :else v))
+
 (defn- bounded-block-remainder [loaded cursor max-bytes]
   (if (or (nil? cursor) (not (pos-int? max-bytes)))
     []
@@ -509,7 +538,7 @@
      (fn [entries {:keys [descriptor] :as entry}]
        (if (pos? (compare (get descriptor "logical-max") cursor))
          (let [candidate (conj entries (select-keys entry [:cid :block]))]
-           (if (<= (.-byteLength (ipld/encode candidate)) max-bytes)
+           (if (<= (.-byteLength (ipld/encode (->wire candidate))) max-bytes)
              candidate
              entries))
          entries))
@@ -806,7 +835,7 @@
                    (nat-int? remainder-max-bytes)
                    (valid-block-remainder? block-remainder)
                    (or (zero? remainder-max-bytes)
-                       (<= (.-byteLength (ipld/encode block-remainder))
+                       (<= (.-byteLength (ipld/encode (->wire block-remainder)))
                            remainder-max-bytes))
                    (or (nil? after) (string? after))
                    (or (nil? head-cid)
@@ -2582,7 +2611,7 @@
          (mapv #(select-keys % [:key :etag :deadline-at :status :workload])
                ingress-roots)}]
     {:root-cids root-cids
-     :root-token (str (ipld/cid (ipld/encode stable)))
+     :root-token (str (ipld/cid (ipld/encode (->wire stable))))
      :cutoff (- now-ms grace-ms)}))
 
 (defn- read-reachability-links! [e cid]
