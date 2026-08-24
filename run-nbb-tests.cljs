@@ -42,7 +42,7 @@
   (-> p
       (str/replace #"\\" "/")
       (str/replace #"^test/" "")
-      (str/replace #"\.cljc?$" "")
+      (str/replace #"\.clj[sc]$" "")
       (str/replace "_" "-")
       (str/replace "/" ".")))
 
@@ -53,7 +53,14 @@
                     p (.join path dir name)]
                 (cond
                   (.isDirectory ent) (find-test-files p)
-                  (str/ends-with? name "_test.cljc") [p]
+                  ;; `.cljs` too, and that is the point rather than a
+                  ;; convenience. A `.cljs` test cannot run on the JVM, so a
+                  ;; runner that discovers only `_test.cljc` leaves it running
+                  ;; NOWHERE. Measured 2026-08-25: this repository's two
+                  ;; `.cljs` suites were in that state, and running them turned
+                  ;; up three real `ipld/encode` sites that always threw.
+                  (or (str/ends-with? name "_test.cljc")
+                      (str/ends-with? name "_test.cljs")) [p]
                   :else [])))
             (array-seq entries))))
 
