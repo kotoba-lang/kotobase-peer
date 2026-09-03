@@ -1158,6 +1158,60 @@
   [get-fn state]
   (mapv :cid (novelty-entries get-fn state)))
 
+(defn- prune-novelty-cids
+  "Subject-index prune for COMPONENT-scoped novelty reads (hot-datoms).
+
+  The novelty-subject-index carries, per tx-block, the exact subject tokens
+  that block asserts (written at commit time from the tx's own subjects via
+  blind-fn). A scan whose `:components` name specific subjects can therefore
+  SKIP every block whose subject list does not intersect the scan's subject
+  tokens -- without fetching or decrypting it. This is EXACT metadata, not a
+  heuristic: a block absent from the prune-kept set cannot contain a quad
+  with those subjects. Fallbacks preserve today's semantics bit-for-bit:
+  legacy states (no subject index), incomplete directories, or nil/blank
+  subject tokens return the full `novelty-cids` list unchanged.
+
+  Why this exists (measured 2026-09-03, hyakka production deadlock): every
+  Client API write runs a policy scan (hot-datoms, components
+  [policy-entity]) over snapshot+novelty. With the subject index unexploited,
+  that scan decrypted the ENTIRE novelty backlog per write attempt; once the
+  tenant graph's novelty outgrew the Worker CPU budget, every transact 502'd,
+  and since auto-fold only schedules after a SUCCESSFUL write, nothing could
+  ever shrink the backlog -- a self-reinforcing write outage. Skipping
+  unrelated blocks by exact subject metadata bounds the policy scan to the
+  blocks that can actually matter, without changing which rows any scan can
+  return."
+  [get-fn state {:keys [components]} blind-fn]
+  (let [cids (novelty-cids get-fn state)]
+    (if-not (and (seq components)
+                 (some-> (get state "novelty-subject-index") ipld/link-cid))
+      cids
+      (let [entries (indexed-novelty-entries get-fn state)
+            indexed? (and (seq entries) (every? (comp seq :subjects) entries))]
+        (if-not indexed?
+          cids
+          ;; components are stored value strings; the index tokens are the
+          ;; WRITE path's blind-fn(subject) encodings. Resolve the scan's
+          ;; subject tokens through the same blind-fn so the two encodings are
+          ;; comparable. Blind-fn is async on cljs (the whole hot-datoms body
+          ;; is async there), sync on JVM.
+          #?(:clj
+             (let [wanted (into #{} (map (fn [c] (blind-fn (str c)))) components)]
+               (mapv :cid
+                     (filter (fn [{:keys [subjects]}]
+                               (some wanted subjects))
+                             entries)))
+             :cljs
+             (-> (js/Promise.all
+                  (clj->js (map (fn [c] (blind-fn (str c))) components)))
+                 (.then (fn [tokens]
+                          (let [wanted (into #{} (map str) (js->clj tokens))]
+                            (mapv :cid
+                                  (filter (fn [{:keys [subjects]}]
+                                            (some wanted subjects))
+                                          entries))))))))))))
+
+
 (defn- newest-novelty-cid
   "The single most-recently-pushed tx-cid, or nil if novelty is empty. O(1)
   for a non-legacy state (peeks novelty-back's head node) -- never walks the
@@ -2585,7 +2639,8 @@
         []
         (let [state (state-at get-fn chain-cid)
               snap-rows (cold-datoms get-fn (indexed-cid state) opts visible? blind-fn decrypt-fn)
-              novelty-quads (mapcat #(read-tx-block get-fn % decrypt-fn) (novelty-cids get-fn state))
+              novelty-quads (mapcat #(read-tx-block get-fn % decrypt-fn)
+                                    (prune-novelty-cids get-fn state opts blind-fn))
               ;; ADR-2607071610: novelty retractions must also cancel rows the
               ;; INDEXED snapshot contributed (asserted before the last fold)
               snap-rows (remove-retracted (retraction-filters novelty-quads) snap-rows)
@@ -2625,29 +2680,36 @@
               ;; whole behaviour here, and nothing about the code's shape
               ;; announces that -- the version with the duplicates returned
               ;; byte-identical answers.
-              novelty (novelty-cids get-fn state)]
-          (-> (js/Promise.all
-               #js [(if async-get-fn
-                      (cold-datoms-async async-get-fn (indexed-cid state) opts visible? blind-fn decrypt-fn)
-                      (cold-datoms get-fn (indexed-cid state) opts visible? blind-fn decrypt-fn))
-                    (pmap-async (fn [cid]
-                                  (if async-get-fn
-                                    (read-tx-block-async async-get-fn cid decrypt-fn)
-                                    (read-tx-block get-fn cid decrypt-fn)))
-                                novelty)])
-              ;; `vec`, NOT `js->clj`: every element `js/Promise.all` resolves here is
-              ;; already realized ClojureScript data (a Link is an `ipld.core/Link`
-              ;; defrecord, which is iterable) -- `js->clj` walks anything iterable and
-              ;; would shred a Link back down into a bare `([:cid ...])` seq, silently
-              ;; losing its type (confirmed regression, ADR-2607051000 follow-up).
-              (.then (fn [results]
-                       (let [[snap-rows novelty-quads-per-cid] (vec results)
-                             novelty-quads (apply concat novelty-quads-per-cid)
-                             snap-rows (remove-retracted (retraction-filters novelty-quads) snap-rows)
-                             novelty-rows (datoms (reduce (fn [db q] (apply-quad db q ipld/link?))
-                                                          (qs/empty-db) novelty-quads)
-                                                  opts visible?)]
-                         (vec (concat snap-rows novelty-rows)))))))))))
+              ;; The prune itself is async on cljs (blind-fn may be): resolve
+              ;; it as a SECOND arm of Promise.all (the block reads then depend
+              ;; on it), keeping the hoisted evaluation order (state resolved
+              ;; before any fetch starts).
+              state state]
+          (-> (js/Promise.resolve (prune-novelty-cids get-fn state opts blind-fn))
+              (.then (fn [novelty]
+                (-> (js/Promise.all
+                     #js [(if async-get-fn
+                            (cold-datoms-async async-get-fn (indexed-cid state) opts visible? blind-fn decrypt-fn)
+                            (cold-datoms get-fn (indexed-cid state) opts visible? blind-fn decrypt-fn))
+                          (pmap-async (fn [cid]
+                                        (if async-get-fn
+                                          (read-tx-block-async async-get-fn cid decrypt-fn)
+                                          (read-tx-block get-fn cid decrypt-fn)))
+                                      novelty)])
+                  ;; `vec`, NOT `js->clj`: every element `js/Promise.all` resolves here is
+                  ;; already realized ClojureScript data (a Link is an `ipld.core/Link`
+                  ;; defrecord, which is iterable) -- `js->clj` walks anything iterable and
+                  ;; would shred a Link back down into a bare `([:cid ...])` seq, silently
+                  ;; losing its type (confirmed regression, ADR-2607051000 follow-up).
+                   (.then (fn [results]
+                            (let [[snap-rows novelty-quads-per-cid] (vec results)
+                                  novelty-quads (apply concat novelty-quads-per-cid)
+                                  snap-rows (remove-retracted (retraction-filters novelty-quads) snap-rows)
+                                  novelty-rows (datoms (reduce (fn [db q] (apply-quad db q ipld/link?))
+                                                               (qs/empty-db) novelty-quads)
+                                                       opts visible?)]
+                              (vec (concat snap-rows novelty-rows))))))))))))))
+
 
 ;; ── materialized views (RisingWave-style IVM on IPLD, ADR-2607166600) ───────
 ;; A view is a named, declaratively-specified projection of the graph's
