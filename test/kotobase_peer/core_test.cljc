@@ -783,6 +783,58 @@
 
 ;; ── D1: novelty-log write path (ADR-2607032430) ─────────────────────────────
 
+;; ── subject-index prune for component-scoped novelty reads (2026-09-03) ──────
+;; The prune must be exact: a block whose subject list does not contain the
+;; scan's blind-toked subject can NEVER contribute rows, and a block that can
+;; MUST be kept. Round-trip against commit!'s own index writing.
+
+#?(:clj
+   (deftest hot-datoms-prunes-novelty-by-subject-index
+     (let [{:keys [put! get-fn]} (mem-store)
+           c0 (eng/commit! put! get-fn [{:s "alice" :p "role" :o "admin"}]
+                           nil test-encrypt-fn test-blind-fn)
+           c1 (eng/commit! put! get-fn [{:s "bob" :p "role" :o "user"}]
+                           c0 test-encrypt-fn test-blind-fn)
+           c2 (eng/commit! put! get-fn [{:s "carol" :p "role" :o "guest"}]
+                           c1 test-encrypt-fn test-blind-fn)
+           alice-token (test-blind-fn (str "alice"))
+           ;; Count block reads through a wrapping get-fn: a scan for alice's
+           ;; subject must not even FETCH the bob/carol blocks.
+           gets (atom 0)
+           counted-get (fn [cid] (swap! gets inc) (get-fn cid))
+           rows (eng/hot-datoms counted-get c2
+                                {:index :eavt :components ["alice"]}
+                                (constantly true) test-blind-fn test-decrypt-fn)]
+       (is (= [{:e "alice" :a "role" :v_edn "\"admin\"" :added true}] rows)
+           "pruned scan returns the same rows a full scan would")
+       (is (< @gets 6)
+           "subject-index prune skipped unrelated blocks (full scan would fetch
+            every novelty block + index nodes)"))))
+
+#?(:clj
+   (deftest hot-datoms-prune-returns-full-list-without-index
+     (let [{:keys [put! get-fn]} (mem-store)
+           ;; blind-fn nil at write time -> no subject index -> conservative
+           ;; fallback must return the same rows as today.
+           c0 (eng/commit! put! get-fn [{:s "alice" :p "role" :o "admin"}] nil test-encrypt-fn)
+           rows (eng/hot-datoms get-fn c0
+                                {:index :eavt :components ["alice"]}
+                                (constantly true) test-blind-fn test-decrypt-fn)]
+       (is (= [{:e "alice" :a "role" :v_edn "\"admin\"" :added true}] rows)))))
+
+#?(:clj
+   (deftest hot-datoms-prune-finds-a-late-block-whose-subject-matches
+     (let [{:keys [put! get-fn]} (mem-store)
+           c0 (eng/commit! put! get-fn [{:s "bob" :p "role" :o "user"}]
+                           nil test-encrypt-fn test-blind-fn)
+           c1 (eng/commit! put! get-fn [{:s "alice" :p "role" :o "admin"}]
+                           c0 test-encrypt-fn test-blind-fn)
+           rows (eng/hot-datoms get-fn c1
+                                {:index :eavt :components ["alice"]}
+                                (constantly true) test-blind-fn test-decrypt-fn)]
+       (is (= [{:e "alice" :a "role" :v_edn "\"admin\"" :added true}] rows)
+           "the matching block is the NEWEST novelty entry -- prune keeps it"))))
+
 #?(:clj
    (deftest commit-bang-appends-novelty-without-touching-snapshot
      (testing "commit! on a fresh chain writes ONLY novelty -- nothing folded yet"
