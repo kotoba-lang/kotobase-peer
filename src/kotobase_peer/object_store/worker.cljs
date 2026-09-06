@@ -6,6 +6,7 @@
   (:require [clojure.string :as str]
             [goog.object :as gobj]
             [ipld.core :as ipld]
+            [multiformats.core :as mf]
             [kotobase.blockcodec.node :as bcn]
             [kotobase-peer.atomic-publication :as publication]
             [kotobase-peer.database-restore :as database-restore]
@@ -2267,6 +2268,37 @@
     (js/Promise.reject
      (js/Error. "Resumable execution currently requires an R2 binding"))))
 
+(defn- verify-reachability-bytes!
+  "Verify BYTES against CID using the codec CID declares. Returns true when
+  that codec is DAG-CBOR, i.e. when the block may be decoded for links.
+
+  Both reachability walkers used to recompute `ipld/cid`, which is DAG-CBOR
+  unconditionally. That was right only while every object in the store was
+  DAG-CBOR. `kotobase.projection` now addresses concatenated packs and
+  ciphertext as raw CIDv1 (0x55), because they are opaque bytes and a codec
+  must describe the bytes it names -- and a raw block's correct bytes
+  recompute to a DIFFERENT string under DAG-CBOR (`bafkrei...` against
+  `bafyrei...`, same digest, different prefix). So a correct store read as a
+  corrupt one: the walk rejected with a CID mismatch, which sends whoever
+  reads it looking for corruption that is not there.
+
+  `ipld/cid-codec` exists for exactly this, and its docstring says so. The
+  surrounding code already knew packs were opaque -- it declines to DECODE
+  them -- but it still ADDRESSED them as DAG-CBOR, so the half that changed
+  was the half nothing here was checking.
+
+  A raw block contributes no links: raw is bytes, and bytes have no IPLD
+  links. That is why it is safe to verify it and traverse no further, rather
+  than skipping it (which would drop it from the reachable set) or failing."
+  [cid bytes]
+  (let [codec (ipld/cid-codec cid)
+        raw? (= codec mf/codec-raw)
+        actual (str (if raw? (mf/cidv1-raw bytes) (ipld/cid bytes)))]
+    (when-not (= cid actual)
+      (throw (ex-info "Reachability object CID mismatch"
+                      {:cid cid :actual actual :codec codec})))
+    (not raw?)))
+
 (defn reachable-cids!
   "Walk decoded block links from ROOT-CID and return a Promise<set<CID>>.
   Materialized packs live under objects/, are CID-verified opaque leaves, and
@@ -2278,13 +2310,10 @@
               (-> (.arrayBuffer stored)
                   (.then #(js/Uint8Array. %))))
             (verified-links [cid bytes decode?]
-              (when-not (= cid (str (ipld/cid bytes)))
-                (throw
-                 (ex-info "Reachability object CID mismatch"
-                          {:cid cid})))
-              (if decode?
-                (lsm/linked-cids (ipld/decode bytes))
-                []))
+              (let [dag-cbor? (verify-reachability-bytes! cid bytes)]
+                (if (and decode? dag-cbor?)
+                  (lsm/linked-cids (ipld/decode bytes))
+                  [])))
             (read-links [cid]
               (-> (.get bucket (block-key e cid))
                   (.then
@@ -2621,9 +2650,10 @@
                      (.then #(js/Uint8Array. %))))
         verified
         (fn [bytes decode?]
-          (when-not (= cid (str (ipld/cid bytes)))
-            (throw (ex-info "Reachability object CID mismatch" {:cid cid})))
-          (if decode? (lsm/linked-cids (ipld/decode bytes)) []))]
+          (let [dag-cbor? (verify-reachability-bytes! cid bytes)]
+            (if (and decode? dag-cbor?)
+              (lsm/linked-cids (ipld/decode bytes))
+              [])))]
     (-> (.get bucket (block-key e cid))
         (.then
          (fn [block]

@@ -43,8 +43,16 @@
         io.github.kotoba-lang/block-cache {:git/sha "d871dbc73d924e86767cf82a3d6e50d7b4e8eb3d"}
         ;; Extracted capability owners. Namespaces in this repository now
         ;; delegate to these reviewed, published revisions for compatibility.
+        ;; Advanced to the merged raw-CID fix (ADR-2609060000 rollout item 1).
+        ;; `kotobase.projection` addresses concatenated packs and ciphertext as
+        ;; raw CIDv1 from that commit on; its migration note required auditing
+        ;; consumers that assume every CID is DAG-CBOR before adopting it, and
+        ;; the reachability walkers in object-store/worker were one -- they
+        ;; recomputed `ipld/cid` unconditionally. Advance and audit are one
+        ;; change on purpose: either alone leaves the store readable only by
+        ;; accident.
         io.github.kotoba-lang/kotobase-projection
-        {:git/sha "b945b840076132acf236a430868dc6fd15a890d7"}
+        {:git/sha "0455eb88860361f7ace9e5144525de3d49a0aada"}
         io.github.kotoba-lang/kotobase-federation
         {:git/sha "e175d7bb938f2d705dc06ed453e2e9759648d76b"}
         io.github.kotoba-lang/kotobase-maintenance
