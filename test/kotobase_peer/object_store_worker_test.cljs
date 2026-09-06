@@ -8,7 +8,8 @@
             [kotobase-peer.object-store.worker :as worker]
             [kotobase-peer.resumable-execution :as resumable]
             [kotobase-peer.retention :as retention]
-            [merkle-lsm.core :as lsm]))
+            [merkle-lsm.core :as lsm]
+            [multiformats.core :as mf]))
 
 (deftest immutable-object-and-block-namespaces-are-distinct
   (let [env #js {"MERKLE_S3_PREFIX" "test-prefix"}]
@@ -48,6 +49,80 @@
              (is false
                  (str "opaque reachability rejected: " error))
              (done)))))))
+
+(deftest reachability-verifies-raw-cid-objects-against-their-own-codec
+  ;; The test above proves an opaque object is not DECODED as DAG-CBOR. It
+  ;; addresses that object with `ipld/cid`, so it never covered the other
+  ;; half: how the object is VERIFIED. `kotobase.projection` now writes
+  ;; concatenated packs and ciphertext as raw CIDv1, and a raw block's
+  ;; correct bytes recompute to a different string under DAG-CBOR -- same
+  ;; digest, `bafkrei...` against `bafyrei...`. Recomputing DAG-CBOR
+  ;; unconditionally therefore reads a correct store as a corrupt one.
+  (async done
+    (let [object-bytes (ipld/encode {"opaque-pack" true})
+          object-cid (str (mf/cidv1-raw object-bytes))
+          root-bytes (ipld/encode {"pack" (ipld/link object-cid)})
+          root-cid (str (ipld/cid root-bytes))
+          values {(str "opaque/blocks/" root-cid) root-bytes
+                  (str "opaque/objects/" object-cid) object-bytes}
+          bucket
+          #js {:get
+               (fn [key]
+                 (js/Promise.resolve
+                  (when-let [bytes (get values key)]
+                    #js {:arrayBuffer
+                         (fn []
+                           (js/Promise.resolve
+                            (.slice (.-buffer bytes)
+                                    (.-byteOffset bytes)
+                                    (+ (.-byteOffset bytes)
+                                       (.-byteLength bytes)))))})))}
+          env #js {"MERKLE_BUCKET" bucket
+                   "MERKLE_S3_PREFIX" "opaque"}]
+      (is (str/starts-with? object-cid "bafkrei")
+          "the fixture must actually be raw-addressed, or it proves nothing")
+      (-> (worker/reachable-cids! env root-cid)
+          (.then
+           (fn [reachable]
+             (is (= #{root-cid object-cid} reachable)
+                 "a raw pack is reachable, verified, and traversed no further")
+             (done)))
+          (.catch
+           (fn [error]
+             (is false
+                 (str "raw-CID reachability rejected: " error))
+             (done)))))))
+
+(deftest reachability-still-rejects-bytes-that-do-not-match-a-raw-cid
+  ;; Codec-awareness must not become codec-blindness: a raw CID whose bytes
+  ;; are wrong has to keep failing closed.
+  (async done
+    (let [real (ipld/encode {"opaque-pack" true})
+          other (ipld/encode {"different" true})
+          object-cid (str (mf/cidv1-raw real))
+          root-bytes (ipld/encode {"pack" (ipld/link object-cid)})
+          root-cid (str (ipld/cid root-bytes))
+          values {(str "opaque/blocks/" root-cid) root-bytes
+                  (str "opaque/objects/" object-cid) other}
+          bucket
+          #js {:get
+               (fn [key]
+                 (js/Promise.resolve
+                  (when-let [bytes (get values key)]
+                    #js {:arrayBuffer
+                         (fn []
+                           (js/Promise.resolve
+                            (.slice (.-buffer bytes)
+                                    (.-byteOffset bytes)
+                                    (+ (.-byteOffset bytes)
+                                       (.-byteLength bytes)))))})))}
+          env #js {"MERKLE_BUCKET" bucket
+                   "MERKLE_S3_PREFIX" "opaque"}]
+      (-> (worker/reachable-cids! env root-cid)
+          (.then (fn [reachable]
+                   (is false (str "substituted raw bytes accepted: " reachable))
+                   (done)))
+          (.catch (fn [_] (is true) (done)))))))
 
 (deftest entity-readers-apply-mvcc-and-tombstones-across-manifests
   (async done
