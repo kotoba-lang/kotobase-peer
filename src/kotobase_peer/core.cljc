@@ -43,7 +43,7 @@
 (ns kotobase-peer.core
   (:require #?(:clj  [clojure.edn :as edn]
                :cljs [cljs.reader :as edn])   ; both expose read-string over EDN
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [ipld.core :as ipld]
             [ipld.value :as ipld-value]
             [kotobase.blockcodec.core :as bc]

@@ -36,7 +36,7 @@
 
   Usage: clojure -M:dag-shape-bench [docs] [novelty-tx]"
   (:require [kotobase-peer.core :as eng]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [ipld.core :as ipld]
             [prolly-tree.core :as pt])
   (:import [javax.crypto Cipher Mac]

@@ -17,7 +17,7 @@
     clojure -M:chunk-bench 50000 200000"
   (:require [clojure.java.io :as io]
             [clojure.java.shell]
-            [clojure.string]
+            [kotoba.lang.text]
             [ipld.core :as ipld]
             [merkle-lsm.core :as lsm])
   (:import [java.io File]))
