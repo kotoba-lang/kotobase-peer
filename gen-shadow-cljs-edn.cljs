@@ -9,7 +9,7 @@
 ;; nbb port of the babashka original (ADR-2607173000, bb binary retired as
 ;; the fleet task/script host). Standalone -- no dependency on the
 ;; superproject's scripts/nbb_compat shim.
-(require '[clojure.string :as str])
+(require '[kotoba.lang.text :as str])
 
 (def fs (js/require "node:fs"))
 (def cp-mod (js/require "node:child_process"))

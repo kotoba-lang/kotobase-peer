@@ -1,6 +1,6 @@
 (ns kotobase-peer.object-store-worker-test
   (:require [cljs.test :refer [deftest is async]]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [goog.object :as gobj]
             [ipld.core :as ipld]
             [kotobase.blockcodec.node :as bcn]

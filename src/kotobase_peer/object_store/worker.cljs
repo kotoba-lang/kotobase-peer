@@ -3,7 +3,7 @@
   the S3-compatible HTTP API with SigV4. Mutable head publication stays a
   separate operation because an immutable CAS block and compare-and-swap are
   different consistency contracts."
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [goog.object :as gobj]
             [ipld.core :as ipld]
             [multiformats.core :as mf]

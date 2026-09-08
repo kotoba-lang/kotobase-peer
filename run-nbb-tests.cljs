@@ -24,7 +24,7 @@
 ;; computed at runtime, so generating a static-require entry file and
 ;; invoking nbb on it as a separate process is the same necessary workaround
 ;; here as it was in bb, not a leftover of the old host.
-(require '[clojure.string :as str])
+(require '[kotoba.lang.text :as str])
 
 (def fs (js/require "node:fs"))
 (def path (js/require "node:path"))
