@@ -24,7 +24,7 @@
   ratio is 1 pays for grouping and collects nothing.
 
   Usage: clojure -M:ic02-diag <ldbc-dynamic-dir> [posts]"
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [kotobase-peer.core :as eng]
             [kotobase-peer.ldbc-snb-bench :as ldbc]
             [arrangement.query :as kqe]))

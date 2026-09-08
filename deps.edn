@@ -9,7 +9,12 @@
  ;; datom (datom-clj): the canonical datom model — entity tx-map ↔ [e a v]
  ;; datom.core/eavt. The kotobase datom DATABASE consuming kotoba's shared datom
  ;; representation (kotoba : kotobase = Clojure : Datomic, ADR-2607032500).
- :deps {;; formerly two deps here (kqe + quad-store) -- kqe merged into
+ :deps {
+        ;; kotoba.lang.text, not clojure.string. Pinned as an explicit floor:
+        ;; tools.deps takes the NEWEST sha it is shown, so without a floor here
+        ;; this repo silently rides whatever a sibling happens to name.
+        io.github.kotoba-lang/text {:git/sha "73bdb13ae7a3d004b44bca08be03a3191157a38f"}
+       ;; formerly two deps here (kqe + quad-store) -- kqe merged into
         ;; arrangement (ADR-2607050700), so this is the one coordinate now.
         io.github.kotoba-lang/arrangement {:git/sha "9c9f45d4cd043873cd5c5ea65fa3af8a8ead5e6d"}
         io.github.kotoba-lang/chain {:git/sha "fa099efdcafddf7b82d479aca8ff12c845be24e2"}

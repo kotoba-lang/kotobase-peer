@@ -4,7 +4,7 @@
   Values in this namespace are immutable data.  Encoding a run or manifest
   returns the bytes/CID plus declarative effects; it never performs storage or
   head mutation itself."
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [ipld.core :as ipld]))
 
 (def format-version 1)

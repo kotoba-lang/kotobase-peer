@@ -24,7 +24,7 @@
   checked rather than assumed a second time.
 
   Usage: clojure -M:ic09-diag <ldbc-dynamic-dir> [posts]"
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [kotobase-peer.core :as eng]
             [kotobase-peer.ldbc-snb-bench :as ldbc]
             [arrangement.query :as kqe]

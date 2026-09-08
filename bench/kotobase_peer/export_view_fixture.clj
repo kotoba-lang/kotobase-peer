@@ -1,5 +1,5 @@
 (ns kotobase-peer.export-view-fixture
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [kotobase-peer.materialized-view :as view])
   (:import [java.nio.file Files Paths OpenOption]
            [java.util Base64]

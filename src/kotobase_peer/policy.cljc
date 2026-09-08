@@ -22,7 +22,7 @@
   everywhere, this ns just decides the fn from (policy × viewer caps)."
   (:require #?(:clj [clojure.edn :as edn]
                :cljs [cljs.reader :as edn])
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [ipld.core :as ipld]))
 
 (def policy-entity "kotobase.policy/read")

@@ -46,7 +46,7 @@
 
   Usage: clojure -M:ldbc-snb-bench <ldbc-dynamic-dir> [posts] [samples]"
   (:require [kotobase-peer.core :as eng]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [clojure.java.io :as io])
   (:import [org.neo4j.dbms.api DatabaseManagementServiceBuilder]
            [org.neo4j.graphdb Label]
