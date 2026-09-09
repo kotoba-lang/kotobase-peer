@@ -129,6 +129,75 @@
                                  (or (some-> error .-message) error)))
                   (done)))))))))
 
+     ;; ── the silent-partial read, reproduced without a network ────────────────
+     ;;
+     ;; root ADR-2608170300 measured a 25-commit workload on testnet and got
+     ;; ROWS 17 where the production control got 25 -- with the pack gate OFF,
+     ;; so the loss is not about packing. Its verdict: no pack read number can
+     ;; be trusted until this is fixed.
+     ;;
+     ;; That measurement needed a deployment and an authenticated write. This
+     ;; does not: 25 commits chained through `prev-chain-cid` and read back
+     ;; through the same trampoline the Worker shell uses is the same shape, in
+     ;; memory. If the loss is in the read path it belongs here.
+     ;;
+     ;; Asserted as a COUNT and then as the missing subjects, because "17 rows"
+     ;; and "the wrong 17 rows" are different defects and a set-equality alone
+     ;; would not say which. A read that answers 17 of 25 without erroring is
+     ;; data loss wearing a success, which is the class this repository treats
+     ;; as the most dangerous.
+     (deftest twenty-five-chained-commits-all-read-back
+       (async done
+         (let [store (new-store)
+               fetch1 (fetch1-fn store)
+               n 25
+               subjects (mapv #(str "s" %) (range n))]
+           (-> (reduce
+                (fn [p i]
+                  (.then p (fn [prev]
+                             (with-blocks store
+                               (fn [get-fn]
+                                 (peer/commit! (put-fn store) get-fn
+                                               [[(nth subjects i) "kind" "row"]]
+                                               prev encrypt))))))
+                (js/Promise.resolve nil)
+                (range n))
+               (.then
+                (fn [head]
+                  (is (string? head) "the 25th commit returns a chain CID")
+                  ;; Cold read: nothing pre-warmed, exactly as a fresh isolate.
+                  (reset! (:cache store) {})
+                  (with-blocks store
+                    (fn [get-fn]
+                      (peer/hydrate-chain-cached
+                       get-fn head blind decrypt nil nil fetch1)))))
+               (.then
+                (fn [db]
+                  (let [rows (peer/q db [nil "kind" "row"] (constantly true))
+                        ;; `:s`. `peer/q`'s docstring says it returns a set of
+                        ;; `{:s :p :o}` quads -- not `{:e :a :v}`, and not
+                        ;; vectors. Two earlier versions of this line guessed
+                        ;; `first` and then `:e`, and BOTH reported all 25
+                        ;; subjects missing while the COUNT assertion passed.
+                        ;; A harness that extracts the wrong key produces
+                        ;; exactly the failure this test exists to catch, so the
+                        ;; shape was read out of the source rather than guessed
+                        ;; a third time.
+                        seen (set (map :s rows))
+                        missing (remove seen subjects)]
+                    (is (= n (count rows))
+                        (str "all " n " committed rows read back, got " (count rows)))
+                    (is (empty? missing)
+                        (str "no subject silently dropped; missing " (pr-str (vec missing))))
+                    (done))))
+               (.catch
+                (fn [error]
+                  ;; A rejection is a DIFFERENT defect from a short answer, and
+                  ;; saying so is the point: this test exists to tell them apart.
+                  (is false (str "read rejected rather than answering short: "
+                                 (or (some-> error .-message) error)))
+                  (done)))))))
+
 #?(:clj
    ;; Placeholder so the JVM runner sees a well-formed namespace. The behaviour
    ;; under test does not exist on this platform.
