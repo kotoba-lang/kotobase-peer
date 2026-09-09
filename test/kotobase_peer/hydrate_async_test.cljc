@@ -127,7 +127,7 @@
                 (fn [error]
                   (is false (str "read rejected: "
                                  (or (some-> error .-message) error)))
-                  (done)))))))))
+                  (done)))))))
 
      ;; ── the silent-partial read, reproduced without a network ────────────────
      ;;
@@ -196,7 +196,7 @@
                   ;; saying so is the point: this test exists to tell them apart.
                   (is false (str "read rejected rather than answering short: "
                                  (or (some-> error .-message) error)))
-                  (done)))))))
+                  (done)))))))))
 
 #?(:clj
    ;; Placeholder so the JVM runner sees a well-formed namespace. The behaviour
