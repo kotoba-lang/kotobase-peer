@@ -9,17 +9,30 @@
 ;; nbb port of the babashka original (ADR-2607173000, bb binary retired as
 ;; the fleet task/script host). Standalone -- no dependency on the
 ;; superproject's scripts/nbb_compat shim.
-(require '[kotoba.lang.text :as str])
-
+;;
+;; ## Why the string calls here are JS interop and not `kotoba.lang.text`
+;;
+;; npm invokes this as bare `nbb gen-shadow-cljs-edn.cljs`, with NO classpath --
+;; because THIS SCRIPT is what computes the classpath. So it cannot require a
+;; library to do it: the bootstrap is circular. Measured 2026-09-09, requiring
+;; `kotoba.lang.text` here made `npm run test:cljs` and `npm run build:view-e2e`
+;; die with `Could not find namespace: kotoba.lang.text` before the build began,
+;; and `clojure.string` would fail the same way for the same reason -- the
+;; retirement of `clojure.string` is not what broke this, having any require at
+;; all is.
+;;
+;; The three operations are trim / split / blank? over one classpath string, so
+;; interop costs nothing in clarity. Anything that needs a real text library
+;; belongs in a namespace that runs WITH the classpath this script produces.
 (def fs (js/require "node:fs"))
 (def cp-mod (js/require "node:child_process"))
 
 (def cp
-  (str/trim (.toString (.execSync cp-mod "clojure -Spath") "utf8")))
+  (.trim (.toString (.execSync cp-mod "clojure -Spath") "utf8")))
 
 (def dirs
-  (->> (str/split cp #":")
-       (remove str/blank?)
+  (->> (.split cp ":")
+       (remove #(= "" (.trim %)))
        (filter #(try (.isDirectory (.statSync fs %)) (catch :default _ false)))))
 
 (.writeFileSync fs "shadow-cljs.edn"
