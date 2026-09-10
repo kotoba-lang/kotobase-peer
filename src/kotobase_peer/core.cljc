@@ -1083,6 +1083,40 @@
         (recur (some-> (get node "rest") ipld/link-cid)
                (into acc (node-entries node)))))))
 
+#?(:cljs
+   (defn- walk-novelty-entries-async
+     "Like `walk-novelty-entries`, but for `async-get-fn` -- the same direct,
+     Promise-returning fetch `read-tx-block-async` and `cold-datoms-async`
+     already use, bypassing a synchronous block-miss trampoline.
+
+     This is the half of that fix that was missing. `read-tx-block-async`'s
+     own docstring records why the cold-snapshot half was not enough: a
+     Worker's whole `h/handle` call is ONE `with-blocks` retry loop, so any
+     miss anywhere restarts the entire invocation, and it names
+     `yoro-social-v2` as the graph that stayed CPU-exceeded until the
+     novelty tx-block READS moved too. The novelty STRUCTURE walk -- this
+     function, reached from `novelty-entries` / `novelty-cids` /
+     `take-oldest-novelty` -- kept taking only `get-fn`, so walking a chain
+     of S segments still cost O(S^2) restarts and put `with-blocks` back on
+     the critical path it had just been removed from.
+
+     Measured 2026-09-10 on that same graph (root ADR-2609100100): a bounded
+     fold cost 34.9s / 34.1s / 35.7s at `max-novelty` 1 / 2 / 4 -- moving the
+     bound 4x moved the time 2%, because the bound never covered this walk.
+
+     The walk is inherently sequential (a segment's successor CID lives
+     inside the segment), so this does not make it concurrent; it makes each
+     step one direct fetch instead of a restart of everything before it."
+     [async-get-fn head-cid]
+     (letfn [(step [cid acc]
+               (if (nil? cid)
+                 (js/Promise.resolve acc)
+                 (-> (ipld/get-node-async async-get-fn cid)
+                     (.then (fn [node]
+                              (step (some-> (get node "rest") ipld/link-cid)
+                                    (into acc (node-entries node))))))))]
+       (step head-cid []))))
+
 (defn- build-novelty-chain!
   "Builds a new cons-chain from `cids` (a vector, in the order you want when
   WALKING the result head-to-tail) and returns a Link to its head, or nil if
@@ -1157,6 +1191,28 @@
   alternative when only a prefix is needed."
   [get-fn state]
   (mapv :cid (novelty-entries get-fn state)))
+
+#?(:cljs
+   (defn- novelty-entries-async
+     "`novelty-entries` over `async-get-fn`. Front and back are two separate
+     chains, so their walks are independent and run concurrently; each walk
+     is still sequential within itself."
+     [async-get-fn state]
+     (if (legacy-novelty-state? state)
+       (js/Promise.resolve
+        (mapv (fn [link] {:cid (ipld/link-cid link) :subjects nil}) (get state "novelty" [])))
+       (-> (js/Promise.all
+            #js [(walk-novelty-entries-async async-get-fn (some-> (get state "novelty-front") ipld/link-cid))
+                 (walk-novelty-entries-async async-get-fn (some-> (get state "novelty-back") ipld/link-cid))])
+           (.then (fn [^js pair]
+                    (into (aget pair 0) (rseq (aget pair 1)))))))))
+
+#?(:cljs
+   (defn- novelty-cids-async
+     "`novelty-cids` over `async-get-fn`."
+     [async-get-fn state]
+     (-> (novelty-entries-async async-get-fn state)
+         (.then (fn [entries] (mapv :cid entries))))))
 
 (defn- prune-novelty-cids
   "Subject-index prune for COMPONENT-scoped novelty reads (hot-datoms).
@@ -1317,6 +1373,56 @@
          "novelty-back" nil
          "novelty-count" (- total k)
          :remaining-entries (subvec combined k)}))))
+
+#?(:cljs
+   (defn- take-oldest-novelty-async
+     "`take-oldest-novelty` over `async-get-fn`: identical result shape and
+     identical amortization story. The only difference is that every
+     structure fetch is direct instead of restarting a `with-blocks` retry
+     loop -- see `walk-novelty-entries-async` for why that is the whole
+     cost on a Worker.
+
+     The `back` walk is still paid in branch A purely to produce
+     `:remaining-entries`, which exists only so `fold!` can rebuild the
+     remaining subject index. That is an O(remaining) term the `max-novelty`
+     bound does NOT cover, and it is why draining a backlog in slices of k
+     is O(N^2/k) rather than O(N). Making it async removes the quadratic
+     restart factor; it does not make the bound cover it. Left as a separate
+     change so this one stays a pure sync->async transposition with the same
+     observable result (root ADR-2609100100)."
+     [put! async-get-fn state n]
+     (let [legacy? (legacy-novelty-state? state)
+           back-cid (when-not legacy? (some-> (get state "novelty-back") ipld/link-cid))
+           walk-back (fn [] (if legacy?
+                              (js/Promise.resolve [])
+                              (walk-novelty-entries-async async-get-fn back-cid)))
+           front-p (if legacy?
+                     (js/Promise.resolve
+                      (mapv (fn [link] {:cid (ipld/link-cid link) :subjects nil})
+                            (get state "novelty" [])))
+                     (walk-novelty-entries-async
+                      async-get-fn (some-> (get state "novelty-front") ipld/link-cid)))]
+       (-> front-p
+           (.then
+            (fn [front]
+              (if (>= (count front) n)
+                (-> (walk-back)
+                    (.then (fn [back]
+                             {:taken (mapv :cid (subvec front 0 n))
+                              "novelty-front" (build-novelty-chain! put! (subvec front n))
+                              "novelty-back" (if legacy? nil (get state "novelty-back"))
+                              "novelty-count" (- (if legacy? (count front) (get state "novelty-count" 0)) n)
+                              :remaining-entries (into (subvec front n) (rseq back))})))
+                (-> (walk-back)
+                    (.then (fn [back]
+                             (let [combined (into front (vec (rseq back)))
+                                   k (min n (count combined))
+                                   total (if legacy? (count front) (get state "novelty-count" 0))]
+                               {:taken (mapv :cid (subvec combined 0 k))
+                                "novelty-front" (build-novelty-chain! put! (subvec combined k))
+                                "novelty-back" nil
+                                "novelty-count" (- total k)
+                                :remaining-entries (subvec combined k)})))))))))))
 
 (defn- quad->wire [{:keys [s p o op]}]
   ;; "op" appears only on non-assert quads — asserts (and every pre-
@@ -2941,16 +3047,27 @@
   ([put! get-fn chain-cid ref? max-novelty blind-fn encrypt-fn decrypt-fn cache-get cache-put! async-get-fn views]
    (let [state (state-at get-fn chain-cid)
          bounded? (some? max-novelty)
-         take-result (when bounded? (take-oldest-novelty put! get-fn state max-novelty))
-         to-fold-cids (if bounded? (:taken take-result) (novelty-cids get-fn state))
-         remaining-index (when bounded?
-                           (build-novelty-index! put! (:remaining-entries take-result)))
-         new-novelty-state (if bounded?
-                             (cond-> (dissoc take-result :taken :remaining-entries)
-                               remaining-index (assoc "novelty-subject-index" remaining-index))
-                             {"novelty-front" nil "novelty-back" nil "novelty-count" 0})]
+         ;; The novelty STRUCTURE walk used to run here, synchronously, on
+         ;; both platforms -- outside the reader conditional and therefore
+         ;; outside every async path this fn already had. On a Worker that
+         ;; put `with-blocks` back on the critical path that `read-tx-block-
+         ;; async` / `cold-datoms-async` had just removed it from, and it is
+         ;; the term `max-novelty` never covered (root ADR-2609100100:
+         ;; 34.9s / 34.1s / 35.7s at bound 1 / 2 / 4 on yoro-social-v2).
+         ;; The :clj branch keeps the synchronous walk; :cljs takes the
+         ;; direct-fetch one whenever `async-get-fn` is supplied.
+         finish-novelty-state
+         (fn [take-result]
+           (if bounded?
+             (let [remaining-index (build-novelty-index! put! (:remaining-entries take-result))]
+               (cond-> (dissoc take-result :taken :remaining-entries)
+                 remaining-index (assoc "novelty-subject-index" remaining-index)))
+             {"novelty-front" nil "novelty-back" nil "novelty-count" 0}))]
      #?(:clj
-        (let [novelty-quads (mapcat #(read-tx-block get-fn % decrypt-fn) to-fold-cids)
+        (let [take-result (when bounded? (take-oldest-novelty put! get-fn state max-novelty))
+              to-fold-cids (if bounded? (:taken take-result) (novelty-cids get-fn state))
+              new-novelty-state (finish-novelty-state take-result)
+              novelty-quads (mapcat #(read-tx-block get-fn % decrypt-fn) to-fold-cids)
               db (reduce (fn [db q] (apply-quad db q ref?))
                          (hydrate-db-cached get-fn (indexed-cid state) blind-fn decrypt-fn cache-get cache-put!)
                          novelty-quads)
@@ -2960,26 +3077,41 @@
                           views-link (assoc "views" views-link))]
           (cd/commit! put! get-fn new-state chain-cid))
         :cljs
-        (-> (js/Promise.all
-             #js [(pmap-async (fn [cid]
-                                 (if async-get-fn
-                                   (read-tx-block-async async-get-fn cid decrypt-fn)
-                                   (read-tx-block get-fn cid decrypt-fn)))
-                               to-fold-cids)
-                  (hydrate-db-cached get-fn (indexed-cid state) blind-fn decrypt-fn cache-get cache-put! async-get-fn)])
-            (.then (fn [results]
-                     (let [[novelty-quads-per-cid hydrated-db] (vec results)
-                           novelty-quads (apply concat novelty-quads-per-cid)
-                           db (reduce (fn [db q] (apply-quad db q ref?)) hydrated-db novelty-quads)]
-                       (js/Promise.all
-                        #js [(qs/commit! put! db nil qs/current-schema-version blind-fn encrypt-fn)
-                             (materialize-views! put! get-fn state db views encrypt-fn decrypt-fn)]))))
-            (.then (fn [^js pair]
-                     (let [new-snap-cid (aget pair 0)
-                           views-link (aget pair 1)
-                           new-state (cond-> (merge {"indexed" (ipld/link new-snap-cid)} new-novelty-state)
-                                       views-link (assoc "views" views-link))]
-                       (cd/commit! put! get-fn new-state chain-cid)))))))))
+        (-> (js/Promise.resolve
+             (cond
+               (and bounded? async-get-fn) (take-oldest-novelty-async put! async-get-fn state max-novelty)
+               bounded?                    (take-oldest-novelty put! get-fn state max-novelty)
+               :else                       nil))
+            (.then
+             (fn [take-result]
+               (-> (js/Promise.resolve
+                    (cond
+                      bounded?     (:taken take-result)
+                      async-get-fn (novelty-cids-async async-get-fn state)
+                      :else        (novelty-cids get-fn state)))
+                   (.then
+                    (fn [to-fold-cids]
+                      (let [new-novelty-state (finish-novelty-state take-result)]
+                        (-> (js/Promise.all
+                             #js [(pmap-async (fn [cid]
+                                                (if async-get-fn
+                                                  (read-tx-block-async async-get-fn cid decrypt-fn)
+                                                  (read-tx-block get-fn cid decrypt-fn)))
+                                              to-fold-cids)
+                                  (hydrate-db-cached get-fn (indexed-cid state) blind-fn decrypt-fn cache-get cache-put! async-get-fn)])
+                            (.then (fn [results]
+                                     (let [[novelty-quads-per-cid hydrated-db] (vec results)
+                                           novelty-quads (apply concat novelty-quads-per-cid)
+                                           db (reduce (fn [db q] (apply-quad db q ref?)) hydrated-db novelty-quads)]
+                                       (js/Promise.all
+                                        #js [(qs/commit! put! db nil qs/current-schema-version blind-fn encrypt-fn)
+                                             (materialize-views! put! get-fn state db views encrypt-fn decrypt-fn)]))))
+                            (.then (fn [^js pair]
+                                     (let [new-snap-cid (aget pair 0)
+                                           views-link (aget pair 1)
+                                           new-state (cond-> (merge {"indexed" (ipld/link new-snap-cid)} new-novelty-state)
+                                                       views-link (assoc "views" views-link))]
+                                       (cd/commit! put! get-fn new-state chain-cid))))))))))))))))
 
 (defn fold-serialized-if-needed!
   "CAS-safe scheduler primitive: fold only when the actual head's novelty is
