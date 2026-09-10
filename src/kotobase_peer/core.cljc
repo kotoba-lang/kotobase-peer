@@ -65,6 +65,21 @@
                          :actual-cid actual})))
       (ipld/decode bytes))))
 
+#?(:cljs
+   (defn- verified-node-async
+     "`verified-node` over a Promise-returning direct fetch. Same CID
+     recomputation, same mismatch throw; only the fetch differs."
+     [async-get-fn expected-cid]
+     (-> (async-get-fn expected-cid)
+         (.then (fn [bytes]
+                  (when bytes
+                    (let [actual (ipld/cid bytes)]
+                      (when-not (= expected-cid actual)
+                        (throw (ex-info "kotobase-peer: block CID mismatch"
+                                        {:type :ipld/cid-mismatch :expected-cid expected-cid
+                                         :actual-cid actual})))
+                      (ipld/decode bytes))))))))
+
 ;; ── platform split for the crypto-touching functions below (ADR-2607051000
 ;; Worker addendum): `blind-fn`/`encrypt-fn`/`decrypt-fn` are synchronous on
 ;; JVM, `js/Promise`-returning on cljs (Web Crypto's `crypto.subtle` has no
@@ -1170,6 +1185,26 @@
           (recur (some-> (get segment "rest") ipld/link-cid)
                  (conj segments segment)))))))
 
+#?(:cljs
+   (defn- indexed-novelty-entries-async
+     "`indexed-novelty-entries` over `async-get-fn` -- see
+     `walk-novelty-entries-async` for why the synchronous form is O(S^2) on a
+     Worker."
+     [async-get-fn state]
+     (if-let [root (some-> (get state "novelty-subject-index") ipld/link-cid)]
+       (letfn [(step [cid segments]
+                 (if-not cid
+                   (js/Promise.resolve
+                    (->> segments rseq (mapcat #(get % "entries"))
+                         (mapv (fn [{:strs [e subjects]}]
+                                 {:cid (ipld/link-cid e) :subjects subjects}))))
+                   (-> (verified-node-async async-get-fn cid)
+                       (.then (fn [segment]
+                                (step (some-> (get segment "rest") ipld/link-cid)
+                                      (conj segments segment)))))))]
+         (step root []))
+       (js/Promise.resolve nil))))
+
 (defn- build-novelty-index!
   "Rebuild the bounded subject directory for chronological ENTRIES. Returns a
    Link to the newest segment, or nil when empty/incomplete."
@@ -1267,6 +1302,40 @@
                                             (some wanted subjects))
                                           entries))))))))))))
 
+
+#?(:cljs
+   (defn- prune-novelty-cids-async
+     "`prune-novelty-cids` over `async-get-fn`, with one behavioural
+     difference that is a strict improvement and worth naming: the sync form
+     computes the FULL `novelty-cids` walk FIRST and only then decides whether
+     the subject index made it unnecessary. Here that walk is deferred, so a
+     component-scoped scan the index can answer never pays it at all.
+
+     The 2026-09-03 prune bounded how much novelty a component-scoped scan
+     DECRYPTS. It did not bound how much of the novelty STRUCTURE that scan
+     WALKS: `novelty-cids` ran unconditionally, on `get-fn`, which on a Worker
+     is the host's `with-blocks` trampoline -- one miss restarts the whole
+     `hot-datoms` body, so walking S novelty nodes costs O(S^2). The hoisting
+     comment in `hot-datoms` measures the same effect from the other side
+     (3.00x duplicate transfer at 4 novelty nodes) and mitigates the duplicate
+     FETCHES; it cannot remove the restarts. Root ADR-2609100100."
+     [async-get-fn state {:keys [components]} blind-fn]
+     (let [indexed-root (some-> (get state "novelty-subject-index") ipld/link-cid)
+           full (fn [] (novelty-cids-async async-get-fn state))]
+       (if-not (and (seq components) indexed-root)
+         (full)
+         (-> (indexed-novelty-entries-async async-get-fn state)
+             (.then (fn [entries]
+                      (if-not (and (seq entries) (every? (comp seq :subjects) entries))
+                        (full)
+                        (-> (js/Promise.all
+                             (clj->js (map (fn [c] (blind-fn (str c))) components)))
+                            (.then (fn [tokens]
+                                     (let [wanted (into #{} (map str) (js->clj tokens))]
+                                       (mapv :cid
+                                             (filter (fn [{:keys [subjects]}]
+                                                       (some wanted subjects))
+                                                     entries))))))))))))))
 
 (defn- newest-novelty-cid
   "The single most-recently-pushed tx-cid, or nil if novelty is empty. O(1)
@@ -2791,7 +2860,9 @@
               ;; on it), keeping the hoisted evaluation order (state resolved
               ;; before any fetch starts).
               state state]
-          (-> (js/Promise.resolve (prune-novelty-cids get-fn state opts blind-fn))
+          (-> (js/Promise.resolve (if async-get-fn
+                                    (prune-novelty-cids-async async-get-fn state opts blind-fn)
+                                    (prune-novelty-cids get-fn state opts blind-fn)))
               (.then (fn [novelty]
                 (-> (js/Promise.all
                      #js [(if async-get-fn

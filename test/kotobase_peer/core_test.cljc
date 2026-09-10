@@ -811,6 +811,54 @@
            "subject-index prune skipped unrelated blocks (full scan would fetch
             every novelty block + index nodes)"))))
 
+#?(:cljs
+   (deftest hot-datoms-async-prunes-novelty-by-subject-index
+     ;; Root ADR-2609100100. `hot-datoms`' async arity routed its SNAPSHOT scan
+     ;; and its tx-block READS through `async-get-fn`, but `prune-novelty-cids`
+     ;; -- which decides WHICH tx blocks to read -- still walked the novelty
+     ;; structure with the synchronous `get-fn`, i.e. on the host's
+     ;; `with-blocks` trampoline, where one miss restarts the whole body.
+     ;;
+     ;; The cljs mirror of `hot-datoms-prunes-novelty-by-subject-index`. It is
+     ;; here because breaking the async prune's INDEXED branch (making it keep
+     ;; nothing) left all 255 tests green: the pre-existing async hot-datoms
+     ;; test passes no `:components`, so it only ever drove the unindexed
+     ;; fallback. This drives the indexed branch -- the one the 2026-09-03
+     ;; write-outage fix depends on -- and asserts pruning by comparison
+     ;; rather than by a magic fetch count.
+     (async done
+       (let [{:keys [put! get-fn]} (mem-store)
+             gets (atom 0)
+             async-get-fn (fn [cid] (swap! gets inc) (js/Promise.resolve (get-fn cid)))
+             everything (constantly true)]
+         (-> (eng/commit! put! get-fn [{:s "alice" :p "role" :o "admin"}] nil test-encrypt-fn test-blind-fn)
+             (.then (fn [c0] (eng/commit! put! get-fn [{:s "bob" :p "role" :o "user"}] c0 test-encrypt-fn test-blind-fn)))
+             (.then (fn [c1] (eng/commit! put! get-fn [{:s "carol" :p "role" :o "guest"}] c1 test-encrypt-fn test-blind-fn)))
+             (.then (fn [c2]
+                      (reset! gets 0)
+                      (-> (eng/hot-datoms get-fn c2 {:index :eavt :components ["alice"]}
+                                          everything test-blind-fn test-decrypt-fn async-get-fn)
+                          (.then (fn [pruned-rows]
+                                   (let [pruned-gets @gets]
+                                     (reset! gets 0)
+                                     (-> (eng/hot-datoms get-fn c2 nil everything test-blind-fn
+                                                         test-decrypt-fn async-get-fn)
+                                         (.then (fn [all-rows]
+                                                  {:pruned-rows pruned-rows :pruned-gets pruned-gets
+                                                   :all-rows all-rows :full-gets @gets})))))))))
+             (.then (fn [{:keys [pruned-rows pruned-gets all-rows full-gets]}]
+                      (is (= [{:e "alice" :a "role" :v_edn "\"admin\"" :added true}] pruned-rows)
+                          "the async pruned scan returns exactly what the sync pruned scan returns")
+                      (is (= 3 (count all-rows))
+                          "the unpruned async scan still sees all three novelty writes")
+                      (is (pos? pruned-gets) "the async fetch path really was exercised")
+                      (is (< pruned-gets full-gets)
+                          "the subject index pruned: the component-scoped scan fetched strictly fewer blocks than the full scan")
+                      (done)))
+             (.catch (fn [e]
+                       (is false (str "async pruned scan rejected: " e))
+                       (done))))))))
+
 #?(:clj
    (deftest hot-datoms-prune-returns-full-list-without-index
      (let [{:keys [put! get-fn]} (mem-store)
