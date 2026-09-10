@@ -1474,6 +1474,57 @@
                       (set (eng/hot-datoms get-fn folded-3 everything test-blind-fn test-decrypt-fn)))
                    "final state is X asserted (the chronologically newest write wins) -- NOT retracted, which is what a newest-first (incorrect) fold order would have produced"))))))))
 
+#?(:cljs
+   (deftest bounded-fold-via-async-get-fn-matches-the-sync-bounded-path
+     ;; Root ADR-2609100100. `fold!`'s async path existed but its NOVELTY
+     ;; STRUCTURE walk did not: `take-oldest-novelty` ran outside the
+     ;; platform split, synchronously, on `get-fn`. On a Worker that is the
+     ;; `with-blocks` trampoline, so walking S segments cost O(S^2) restarts
+     ;; -- the term `max-novelty` never covered, measured at 34.9s / 34.1s /
+     ;; 35.7s for bound 1 / 2 / 4 on the same graph.
+     ;;
+     ;; The pre-existing async fold test passes `max-novelty` = nil, so it
+     ;; exercises the UNBOUNDED path only and stayed green either way. This
+     ;; one drives the bounded path through `async-get-fn` and asserts the
+     ;; same property the sync bounded test asserts: assert X, retract X,
+     ;; assert X, drained one entry at a time across the front-exhaustion
+     ;; boundary, must end with X ASSERTED. A `take-oldest-novelty-async`
+     ;; that reversed order (or took from the wrong end) ends with X
+     ;; retracted, so this fails for the reason it names.
+     (async done
+       (let [{:keys [put! get-fn]} (mem-store)
+             async-get-fn (fn [cid] (js/Promise.resolve (get-fn cid)))
+             everything (constantly true)
+             fold-1 (fn [chain]
+                      (eng/fold! put! get-fn chain ipld/link? 1
+                                 test-blind-fn test-encrypt-fn test-decrypt-fn
+                                 nil nil async-get-fn))]
+         (-> (eng/commit! put! get-fn [{:s "x" :p "flag" :o "on"}] nil test-encrypt-fn)
+             (.then (fn [c0] (eng/commit! put! get-fn [[:db/retract "x" "flag" "on"]] c0 test-encrypt-fn)))
+             (.then (fn [c1] (eng/commit! put! get-fn [{:s "x" :p "flag" :o "on"}] c1 test-encrypt-fn)))
+             (.then (fn [c2]
+                      (is (= 3 (eng/novelty-size get-fn c2)) "three unfolded writes to drain")
+                      (fold-1 c2)))
+             (.then (fn [f1]
+                      (is (= 2 (eng/novelty-size get-fn f1))
+                          "bounded async fold #1 (n=1) drains exactly the oldest entry")
+                      (fold-1 f1)))
+             (.then (fn [f2]
+                      (is (= 1 (eng/novelty-size get-fn f2))
+                          "bounded async fold #2 (n=1) drains the next oldest")
+                      (fold-1 f2)))
+             (.then (fn [f3]
+                      (is (= 0 (eng/novelty-size get-fn f3))
+                          "bounded async fold #3 (n=1) drains the last entry")
+                      (eng/hot-datoms get-fn f3 everything test-blind-fn test-decrypt-fn)))
+             (.then (fn [rows]
+                      (is (= #{{:e "x" :a "flag" :v_edn "\"on\"" :added true}} (set rows))
+                          "chronological order survived the async bounded drain: X asserted, not retracted")
+                      (done)))
+             (.catch (fn [e]
+                       (is false (str "bounded async fold rejected: " e))
+                       (done))))))))
+
 #?(:clj
    (deftest push-after-take-oldest-refreshes-front-and-stays-chronologically-correct
         (testing "push (commit!) interleaved with a bounded take that exhausts
