@@ -232,6 +232,39 @@
         (is (not (none {:e "e" :a ":internal.note/text"})))
         (is (none {:e "e" :a ":yoro.post/text"}))))))
 
+;; The wire form. Every value a transaction carries arrives as a string BLOB
+;; (the caller pr-strs the value, the tx layer stores that string, `v_edn` is
+;; the pr-str OF that string), so `levelled-rows` above -- built with ONE
+;; pr-str -- is a shape no real transaction produces. Measured 2026-09-10
+;; through kotobase-server's `transact`, the only route a remote client has to
+;; install a policy at all. The failure this pins was SILENT: one read-string
+;; over a blob returns a String, `map?` says false, the level is dropped, the
+;; prefix falls back to `:restricted`, and a correctly-cleared viewer is
+;; refused with no error raised anywhere.
+(def ^:private levelled-rows-over-the-wire
+  [{:e "kotobase.policy/read" :a ":kotobase.policy/protected-prefixes"
+    :v_edn (pr-str (pr-str [":internal." ":dm." ":secret."])) :added true}
+   {:e "kotobase.policy/read" :a ":kotobase.policy/prefix-levels"
+    :v_edn (pr-str (pr-str {":internal." :internal
+                            ":dm." :confidential
+                            ":secret." :restricted}))
+    :added true}])
+
+(deftest prefix-levels-survive-the-wire-encoding
+  (testing "a doubly-encoded level map parses exactly like a singly-encoded one"
+    (is (= (:prefix-levels (policy/policy-of levelled-rows))
+           (:prefix-levels (policy/policy-of levelled-rows-over-the-wire)))))
+  (testing "and the clearance it grants actually reaches its own level"
+    (let [p (policy/policy-of levelled-rows-over-the-wire)
+          confidential (policy/visible-for p (clearance-caps :confidential))]
+      (is (confidential {:e "e" :a ":dm.message/text"})
+          "confidential clearance reaches a :confidential prefix")
+      (is (not (confidential {:e "e" :a ":secret.key/blob"}))
+          "and no higher")
+      (is ((policy/visible-for p [policy/read-protected-capability])
+           {:e "e" :a ":secret.key/blob"})
+          "the legacy grant is still top clearance"))))
+
 (deftest unknown-labels-round-in-opposite-directions
   (testing "an unknown ATTRIBUTE level coerces UP -- only top clearance reads it"
     (let [rows [{:e "kotobase.policy/read" :a ":kotobase.policy/protected-prefixes"

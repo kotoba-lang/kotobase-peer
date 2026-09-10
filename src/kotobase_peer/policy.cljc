@@ -129,8 +129,27 @@
                      (try
                        (some-> (get attrs k) edn/read-string)
                        (catch #?(:clj Exception :cljs :default) _ nil)))
+        ;; Same tolerance `read-vec` has, for the same reason. Every value a
+        ;; transaction carries over the wire arrives as a string BLOB -- the
+        ;; caller pr-strs the map, the tx layer stores that string, and
+        ;; `v_edn` is the pr-str OF that string. One `edn/read-string` on a
+        ;; blob hands back a String, `map?` says false, and the level is
+        ;; dropped in silence: the prefix falls back to `:restricted` and a
+        ;; correctly-cleared viewer is refused with no error anywhere.
+        ;;
+        ;; Measured 2026-09-10 through kotobase-server's `transact`, which is
+        ;; the only way a REMOTE client can install a policy at all:
+        ;;   :kotobase.policy/prefix-levels => "\"{\\\":dm.\\\" :confidential}\""
+        ;; The tests here built rows by hand with a single `pr-str`, so they
+        ;; pinned a shape the wire never produces and stayed green.
+        read-map (fn [k]
+                   (try
+                     (some-> (get attrs k)
+                             edn/read-string
+                             (as-> v (if (string? v) (edn/read-string v) v)))
+                     (catch #?(:clj Exception :cljs :default) _ nil)))
         prefixes (read-vec ":kotobase.policy/protected-prefixes")
-        prefix-levels (read-value ":kotobase.policy/prefix-levels")
+        prefix-levels (read-map ":kotobase.policy/prefix-levels")
         prefix-levels (when (and (map? prefix-levels)
                                  (every? string? (keys prefix-levels))
                                  (every? keyword? (vals prefix-levels)))
