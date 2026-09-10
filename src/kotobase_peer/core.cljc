@@ -188,6 +188,37 @@
     :retract        (qs/retract-quad db q ref?)
     :retract-entity (retract-entity* db (:s q) ref?)))
 
+(defn- apply-quads
+  "Apply `quads` in order, batching consecutive ASSERTS through the bulk
+   accumulator and falling back to one persistent step per retract.
+
+   Same reason as `hydrate-db-cached`'s `build` (root ADR-2609100100): a
+   persistent assert allocates a fresh db across four indexes, so a run of K
+   asserts leaves K-1 of them as garbage, and this path runs where memory is
+   the binding constraint -- the folds that die sit near the 128 MB isolate
+   ceiling while the requests that answer use a tenth of it.
+
+   Order is preserved exactly, which is the property that matters: novelty is
+   chronological, and `bounded-fold-across-front-exhaustion-preserves-
+   chronological-retraction-order` is the test that says why. A run is flushed
+   before any retract, so assert-then-retract-then-assert of the same quad ends
+   asserted, as it did before.
+
+   Retracts stay one at a time. `retract-quad` and `:retract-entity` have no
+   bulk form, and inventing one here would be a second implementation of
+   semantics that already has one."
+  [db quads ref?]
+  (let [flush (fn [db run]
+                (if (seq run)
+                  (qs/persist-db (qs/assert-quads! (qs/mutable-db db) run ref?))
+                  db))]
+    (loop [db db, qs (seq quads), run []]
+      (if-let [q (first qs)]
+        (if (= :assert (or (:op q) :assert))
+          (recur db (next qs) (conj run q))
+          (recur (apply-quad (flush db run) q ref?) (next qs) []))
+        (flush db run)))))
+
 (defn- asserted? [db {:keys [s p o]}]
   (contains? (get (qs/entity-attrs db s) p #{}) o))
 
@@ -3164,9 +3195,8 @@
               to-fold-cids (if bounded? (:taken take-result) (novelty-cids get-fn state))
               new-novelty-state (finish-novelty-state take-result)
               novelty-quads (mapcat #(read-tx-block get-fn % decrypt-fn) to-fold-cids)
-              db (reduce (fn [db q] (apply-quad db q ref?))
-                         (hydrate-db-cached get-fn (indexed-cid state) blind-fn decrypt-fn cache-get cache-put!)
-                         novelty-quads)
+              db (apply-quads (hydrate-db-cached get-fn (indexed-cid state) blind-fn decrypt-fn cache-get cache-put!)
+                              novelty-quads ref?)
               new-snap-cid (qs/commit! put! db nil qs/current-schema-version blind-fn encrypt-fn)
               views-link (materialize-views! put! get-fn state db views encrypt-fn decrypt-fn)
               new-state (cond-> (merge {"indexed" (ipld/link new-snap-cid)} new-novelty-state)
@@ -3198,7 +3228,7 @@
                             (.then (fn [results]
                                      (let [[novelty-quads-per-cid hydrated-db] (vec results)
                                            novelty-quads (apply concat novelty-quads-per-cid)
-                                           db (reduce (fn [db q] (apply-quad db q ref?)) hydrated-db novelty-quads)]
+                                           db (apply-quads hydrated-db novelty-quads ref?)]
                                        (js/Promise.all
                                         #js [(qs/commit! put! db nil qs/current-schema-version blind-fn encrypt-fn)
                                              (materialize-views! put! get-fn state db views encrypt-fn decrypt-fn)]))))
