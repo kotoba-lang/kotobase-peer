@@ -1,6 +1,7 @@
 (ns kotobase-peer.policy-test
   (:require #?(:clj [clojure.test :refer [deftest is testing]]
                :cljs [cljs.test :refer [deftest is testing] :include-macros true])
+            [kotoba.security.information-flow :as flow]
             [kotobase-peer.policy :as policy]))
 
 (def ^:private policy-rows
@@ -177,3 +178,108 @@
     (is (= :write/quota-exceeded
            (-> (policy/write-decision pol context [allowed allowed] :private)
                :denials last :reason)))))
+
+;; ------------------------------------------- ADR-2607280100 Step 2 (D3)
+;; Four-level clearance. The prefix LIST still says what is protected; a
+;; level says how much. Every test below states which direction it pins.
+
+(def ^:private levelled-rows
+  [{:e "kotobase.policy/read" :a ":kotobase.policy/protected-prefixes"
+    :v_edn (pr-str (pr-str [":internal." ":dm." ":secret."])) :added true}
+   {:e "kotobase.policy/read" :a ":kotobase.policy/prefix-levels"
+    :v_edn (pr-str {":internal." :internal
+                    ":dm." :confidential
+                    ":secret." :restricted})
+    :added true}])
+
+(defn- clearance-caps [label]
+  [(str policy/read-classified-capability-prefix (name label))])
+
+(deftest policy-parses-prefix-levels
+  (let [p (policy/policy-of levelled-rows)]
+    (is (= [":internal." ":dm." ":secret."] (:protected-prefixes p)))
+    (is (= {":internal." :internal ":dm." :confidential ":secret." :restricted}
+           (:prefix-levels p)))
+    (is (= #{} (:unknown-levels p))
+        "every level in this policy is one the lattice ranks")))
+
+(deftest a-prefix-with-no-level-is-restricted
+  (testing "the binary rule is the top case of the levelled one, not a branch beside it"
+    (let [p (policy/policy-of policy-rows)
+          confidential (policy/visible-for p (clearance-caps :confidential))]
+      (is (nil? (:prefix-levels p)))
+      (is (not (confidential {:e "m1" :a ":dm.message/text"}))
+          "confidential clearance does not reach an unlevelled prefix")
+      (is (confidential {:e "p1" :a ":yoro.post/text"})))))
+
+(deftest clearance-reaches-its-own-level-and-no-higher
+  (let [p (policy/policy-of levelled-rows)
+        internal (policy/visible-for p (clearance-caps :internal))
+        confidential (policy/visible-for p (clearance-caps :confidential))
+        restricted (policy/visible-for p (clearance-caps :restricted))]
+    (testing "the boundary: clearance == level is visible"
+      (is (internal {:e "e" :a ":internal.note/text"}))
+      (is (confidential {:e "e" :a ":dm.message/text"}))
+      (is (restricted {:e "e" :a ":secret.key/blob"})))
+    (testing "one level above the clearance is not"
+      (is (not (internal {:e "e" :a ":dm.message/text"})))
+      (is (not (confidential {:e "e" :a ":secret.key/blob"}))))
+    (testing "below it is"
+      (is (confidential {:e "e" :a ":internal.note/text"}))
+      (is (restricted {:e "e" :a ":dm.message/text"})))
+    (testing "no clearance reaches nothing protected, and everything else"
+      (let [none (policy/visible-for p [])]
+        (is (not (none {:e "e" :a ":internal.note/text"})))
+        (is (none {:e "e" :a ":yoro.post/text"}))))))
+
+(deftest unknown-labels-round-in-opposite-directions
+  (testing "an unknown ATTRIBUTE level coerces UP -- only top clearance reads it"
+    (let [rows [{:e "kotobase.policy/read" :a ":kotobase.policy/protected-prefixes"
+                 :v_edn (pr-str (pr-str [":odd."])) :added true}
+                {:e "kotobase.policy/read" :a ":kotobase.policy/prefix-levels"
+                 :v_edn (pr-str {":odd." :not-a-real-label}) :added true}]
+          p (policy/policy-of rows)]
+      (is (= #{:not-a-real-label} (:unknown-levels p))
+          "reported, not only coerced -- a silent safe answer accumulates")
+      (is (not ((policy/visible-for p (clearance-caps :confidential))
+                {:e "e" :a ":odd.thing/x"})))
+      (is ((policy/visible-for p [policy/read-protected-capability])
+           {:e "e" :a ":odd.thing/x"}))))
+  (testing "an unknown SUBJECT clearance coerces DOWN -- it grants nothing"
+    (let [p (policy/policy-of levelled-rows)
+          bogus (policy/visible-for p [(str policy/read-classified-capability-prefix
+                                            "administrator")])]
+      (is (not (bogus {:e "e" :a ":internal.note/text"}))
+          "coercing a subject's unknown label up would be escalation by typo")
+      (is (bogus {:e "e" :a ":yoro.post/text"}))))
+  (testing "the two roundings are genuinely opposite, on the same label"
+    (is (zero? (policy/clearance-rank
+                [(str policy/read-classified-capability-prefix "nonsense")])))))
+
+(deftest overlapping-prefixes-take-the-higher-level
+  (let [rows [{:e "kotobase.policy/read" :a ":kotobase.policy/protected-prefixes"
+               :v_edn (pr-str (pr-str [":dm." ":dm.secret."])) :added true}
+              {:e "kotobase.policy/read" :a ":kotobase.policy/prefix-levels"
+               :v_edn (pr-str {":dm." :internal ":dm.secret." :restricted})
+               :added true}]
+        p (policy/policy-of rows)
+        internal (policy/visible-for p (clearance-caps :internal))]
+    (is (internal {:e "e" :a ":dm.chat/text"})
+        "matches only the :internal prefix")
+    (is (not (internal {:e "e" :a ":dm.secret.key/blob"}))
+        "matches both; the higher of the two decides, so the lower cannot be used as a door")))
+
+(deftest legacy-capability-still-means-top-clearance
+  (let [p (policy/policy-of levelled-rows)
+        legacy (policy/visible-for p [policy/read-protected-capability])]
+    (is (legacy {:e "e" :a ":secret.key/blob"}))
+    (is (= (apply max (vals flow/ranks))
+           (policy/clearance-rank [policy/read-protected-capability])))))
+
+(deftest owner-and-policy-rows-are-unaffected-by-levels
+  (let [p (policy/policy-of levelled-rows)
+        visible? (policy/visible-for p [] ["m1"])]
+    (is (visible? {:e "m1" :a ":secret.key/blob"})
+        "owner-based disclosure (Phase 3c) is orthogonal to clearance")
+    (is (visible? {:e "kotobase.policy/read" :a ":kotobase.policy/prefix-levels"})
+        "the policy stays inspectable -- redaction, not stealth")))

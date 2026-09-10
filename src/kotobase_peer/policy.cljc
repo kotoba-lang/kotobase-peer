@@ -12,9 +12,24 @@
     {:db/id \"kotobase.policy/read\"
      :kotobase.policy/protected-prefixes \"[\\\":dm.\\\" \\\":secret.\\\"]\"}
   Rows whose :a starts with ANY protected prefix are visible only to a
-  viewer whose verified CACAO carries `read-protected-capability` in its
-  resources. A graph with NO policy entity is fully public — exactly
-  today's behavior, so rollout is zero-regression by construction.
+  viewer with sufficient CLEARANCE. A graph with NO policy entity is fully
+  public — exactly today's behavior, so rollout is zero-regression by
+  construction.
+
+  Clearance has four levels, not two (ADR-2607280100 D3). A policy may add
+
+    :kotobase.policy/prefix-levels \"{\\\":dm.\\\" :confidential}\"
+
+  which says how protected each prefix is; the prefix LIST still says what
+  is protected. A prefix with no level is `:restricted`, which is what the
+  binary rule already meant — so the old behaviour is the top case of the
+  new rule rather than a branch beside it, and every pre-existing policy
+  keeps its exact meaning without being rewritten.
+
+  The labels are `kotoba.security.information-flow`'s. There is one
+  classification lattice in this workspace (ADR-2607280100 D1, after two
+  copies of it were found), and this namespace deliberately does not keep a
+  local four-entry map that would be free to drift from it.
 
   `visible-for` returns the row post-filter every read producer in
   kotobase-peer already threads (datoms / cold-datoms / hot-datoms / q /
@@ -23,6 +38,7 @@
   (:require #?(:clj [clojure.edn :as edn]
                :cljs [cljs.reader :as edn])
             [kotoba.lang.text :as str]
+            [kotoba.security.information-flow :as flow]
             [ipld.core :as ipld]))
 
 (def policy-entity "kotobase.policy/read")
@@ -32,6 +48,53 @@
 (def decrypt-capability "kotoba://can/datom:decrypt")
 (def transact-capability "kotoba://can/datom:transact")
 (def policy-admin-capability "kotoba://can/datom:policy-admin")
+
+;; ---------------------------------------------------------------- clearance
+;; ADR-2607280100 Step 2 (D3). The prefix list stays the list of PROTECTED
+;; prefixes; a level only says how protected. A prefix with no level is
+;; `:restricted`, which is what the binary rule already meant, so the old
+;; behaviour is the top case of the new one rather than a branch beside it.
+
+(def read-classified-capability-prefix
+  "A per-level read capability: this prefix plus a lattice label, e.g.
+  `kotoba://can/datom:read-classified/confidential`. The label is
+  `kotoba.security.information-flow`'s -- there is one lattice
+  (ADR-2607280100 D1) and this namespace does not get a second one."
+  "kotoba://can/datom:read-classified/")
+
+(def ^:private top-rank (apply max (vals flow/ranks)))
+
+(defn- object-rank
+  "The rank an ATTRIBUTE's declared level earns. Unknown or missing coerces
+  UP, to the top, exactly as `flow/join` does: on the object side the safe
+  reading of a label nobody can rank is the most protected one."
+  [label]
+  (if-let [canonical (flow/canonical label)]
+    (get flow/ranks canonical)
+    top-rank))
+
+(defn clearance-rank
+  "The viewer's clearance rank, from verified capability strings.
+
+  Unknown labels coerce DOWN here -- an unrecognised capability grants
+  nothing. This is the OPPOSITE rounding to `object-rank`, and deliberately
+  so: both directions are the fail-closed one for their own side, and a
+  single shared rule would have to be wrong on one of them. Coercing a
+  subject's unknown label up is privilege escalation by typo.
+
+  `read-protected-capability` is the legacy grant and means top clearance,
+  which is what it already meant when the rule was binary."
+  [caps]
+  (let [caps (set caps)]
+    (if (contains? caps read-protected-capability)
+      top-rank
+      (reduce (fn [best cap]
+                (if (str/starts-with? (or cap "") read-classified-capability-prefix)
+                  (let [label (keyword (subs cap (count read-classified-capability-prefix)))]
+                    (max best (get flow/ranks (or (flow/canonical label) :public) 0)))
+                  best))
+              0
+              caps))))
 
 (defn policy-cid
   "Stable content identity of the normalized policy decision input."
@@ -67,6 +130,11 @@
                        (some-> (get attrs k) edn/read-string)
                        (catch #?(:clj Exception :cljs :default) _ nil)))
         prefixes (read-vec ":kotobase.policy/protected-prefixes")
+        prefix-levels (read-value ":kotobase.policy/prefix-levels")
+        prefix-levels (when (and (map? prefix-levels)
+                                 (every? string? (keys prefix-levels))
+                                 (every? keyword? (vals prefix-levels)))
+                        prefix-levels)
         owner-attrs (read-vec ":kotobase.policy/owner-attrs")
         write-prefixes (read-vec ":kotobase.policy/write-prefixes")
         write-entity-prefixes (read-vec ":kotobase.policy/write-entity-prefixes")
@@ -76,6 +144,16 @@
     (when (and (sequential? prefixes) (seq prefixes)
                (every? string? prefixes))
       (cond-> {:protected-prefixes (vec prefixes)}
+        ;; A level per protected prefix (ADR-2607280100 D3). Supplementary:
+        ;; a prefix is protected because it is in the LIST, and a level only
+        ;; says how much. Two sources of truth for \"is this protected\" is how
+        ;; a prefix drops out of one of them.
+        (seq prefix-levels)
+        (assoc :prefix-levels prefix-levels
+               ;; Recorded rather than only coerced. flow/unknown-labels
+               ;; exists because a silent safe answer accumulates -- that ns
+               ;; says so about this exact lattice.
+               :unknown-levels (flow/unknown-labels (vals prefix-levels)))
         (contains? #{:public :private :sealed}
                    (read-value ":kotobase.policy/security-mode"))
         (assoc :security-mode (read-value ":kotobase.policy/security-mode"))
@@ -104,19 +182,33 @@
 (defn visible-for
   "(policy × viewer capability strings) → the `visible?` row fn.
   nil policy → (constantly true): a policy-less graph stays fully public.
-  With a policy, rows under a protected prefix require
-  `read-protected-capability` among the viewer's VERIFIED CACAO
-  resources; everything else stays visible. The policy entity's own rows
-  are always visible (a viewer may inspect what is being withheld —
-  redaction, not stealth)."
+
+  With a policy, a row under a protected prefix is visible when the viewer's
+  clearance rank is at least the prefix's level rank — `(>= viewer level)`,
+  so clearance reaches its OWN level and no higher. A prefix with no
+  declared level is `:restricted`, and `read-protected-capability` is top
+  clearance, which together reproduce the binary rule exactly.
+
+  Where two prefixes both match an attribute, the HIGHER decides: otherwise
+  a broad low-level prefix would be a door into everything beneath it.
+
+  The policy entity's own rows are always visible (a viewer may inspect what
+  is being withheld — redaction, not stealth), and owner-based disclosure
+  (Phase 3c) is orthogonal to clearance."
   ([policy caps] (visible-for policy caps nil))
   ([policy caps owned-entities]
    (if (nil? policy)
      (constantly true)
      (let [prefixes (:protected-prefixes policy)
-           allowed? (contains? (set caps) read-protected-capability)
+           levels (:prefix-levels policy)
+           viewer-rank (clearance-rank caps)
+           ;; Precomputed once, not per row: a read filter runs on every row
+           ;; a producer emits.
+           ranked (mapv (fn [p] [p (object-rank (get levels p))]) prefixes)
            owned (set owned-entities)]
-       (if allowed?
+       (if (>= viewer-rank top-rank)
+         ;; Top clearance clears every rank, so this is the same answer the
+         ;; general branch gives -- kept because it is the common case.
          (constantly true)
          ;; rows arrive in TWO shapes depending on the producer: datoms/
          ;; hot-datoms/view-rows emit {:e :a :v_edn}, arrangement.query (q)
@@ -127,7 +219,16 @@
                  attr (or (:a row) (:p row))]
              (or (= ent policy-entity)
                  (contains? owned ent)       ; owner-based disclosure (Phase 3c)
-                 (not (some #(str/starts-with? (or attr "") %) prefixes))))))))))
+                 ;; The highest rank among EVERY matching prefix, so an
+                 ;; overlapping pair cannot be used to read at the lower of
+                 ;; the two. nil = matched nothing = not protected.
+                 (let [required (reduce (fn [best [p r]]
+                                          (if (str/starts-with? (or attr "") p)
+                                            (max (or best 0) r)
+                                            best))
+                                        nil
+                                        ranked)]
+                   (or (nil? required) (>= viewer-rank required)))))))))))
 
 (defn visible-for-mode
   "Fail-closed visibility entry point for network services. MODE is the graph's
