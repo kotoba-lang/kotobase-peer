@@ -1523,6 +1523,39 @@
                    "final state is X asserted (the chronologically newest write wins) -- NOT retracted, which is what a newest-first (incorrect) fold order would have produced"))))))))
 
 #?(:cljs
+   (deftest fold-batches-assert-runs-without-reordering-them
+     ;; Root ADR-2609100100. The fold applied novelty one PERSISTENT assert at a
+     ;; time, each allocating a fresh db across four indexes, on the path where
+     ;; memory -- not CPU -- is what runs out. `apply-quads` batches consecutive
+     ;; asserts through the bulk accumulator; the property that must survive is
+     ;; ORDER.
+     ;;
+     ;; The sequence has to END on the retract. An earlier version of this test
+     ;; used assert X / retract X / assert X and went GREEN against a version
+     ;; that never flushed the run before a retract: the retract lands on a db
+     ;; that does not have X yet, no-ops, and the batched asserts put X back --
+     ;; the same answer for the wrong reason. Ending on the retract separates
+     ;; them: correct leaves X retracted, unflushed leaves X asserted.
+     (async done
+       (let [{:keys [put! get-fn]} (mem-store)
+             async-get-fn (fn [cid] (js/Promise.resolve (get-fn cid)))
+             everything (constantly true)]
+         (-> (eng/commit! put! get-fn [{:s "x" :p "flag" :o "on"}] nil test-encrypt-fn)
+             (.then (fn [c0] (eng/commit! put! get-fn [{:s "y" :p "flag" :o "on"}] c0 test-encrypt-fn)))
+             (.then (fn [c1] (eng/commit! put! get-fn [[:db/retract "x" "flag" "on"]] c1 test-encrypt-fn)))
+             (.then (fn [c2]
+                      (eng/fold! put! get-fn c2 ipld/link? nil test-blind-fn test-encrypt-fn
+                                 test-decrypt-fn nil nil async-get-fn)))
+             (.then (fn [folded]
+                      (is (= 0 (eng/novelty-size get-fn folded)) "everything folded")
+                      (eng/hot-datoms get-fn folded everything test-blind-fn test-decrypt-fn)))
+             (.then (fn [rows]
+                      (is (= #{{:e "y" :a "flag" :v_edn "\"on\"" :added true}} (set rows))
+                          "X stays RETRACTED: the assert run was flushed before the retract")
+                      (done)))
+             (.catch (fn [e] (is false (str "batched fold rejected: " e)) (done))))))))
+
+#?(:cljs
    (deftest bounded-fold-via-async-get-fn-matches-the-sync-bounded-path
      ;; Root ADR-2609100100. `fold!`'s async path existed but its NOVELTY
      ;; STRUCTURE walk did not: `take-oldest-novelty` ran outside the
