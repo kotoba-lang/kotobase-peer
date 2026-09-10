@@ -1523,6 +1523,70 @@
                    "final state is X asserted (the chronologically newest write wins) -- NOT retracted, which is what a newest-first (incorrect) fold order would have produced"))))))))
 
 #?(:cljs
+   (deftest cold-scan-limit-truncates-the-scan-before-visibility-filters-it
+     ;; Pins what `limit` and `visible?` do TOGETHER in `cold-datoms-async`,
+     ;; because nothing did and the obvious reading is wrong.
+     ;;
+     ;; Reading the source, `limit` looks like it counts VISIBLE rows: the row
+     ;; pipeline is `for` -> `filter visible?` -> `take limit`, filter before
+     ;; take. It does not. `limit` is ALSO passed to `scan-prefix-async`
+     ;; upstream, and that truncation happens first, so the filter runs over an
+     ;; already-shortened scan and the answer can be shorter than `limit` even
+     ;; when more visible rows exist.
+     ;;
+     ;; The test derives the scan ORDER at runtime instead of assuming it. Rows
+     ;; come back ordered by BLINDED key, not by plaintext subject -- measured
+     ;; 2026-09-10, where a b c d came back as b d c a under the suite's
+     ;; blind-fn. An earlier version of this test hard-coded plaintext order,
+     ;; passed for that reason against a deliberately broken limit, and sent me
+     ;; looking for a bug in the wrong place (root ADR-2609100100).
+     ;;
+     ;; The discriminating case: make ONLY the last row of the scan visible and
+     ;; ask for limit 1. Truncate-then-filter returns nothing, because the scan
+     ;; stops at the first row and that row is invisible. Filter-then-take would
+     ;; return that last row. Nothing else separates them.
+     ;;
+     ;; This path had no coverage at all: making invisible rows count toward the
+     ;; limit left all 257 tests green, which is why a refactor of this pipeline
+     ;; for allocation was abandoned rather than shipped on a green suite.
+     (async done
+       (let [{:keys [put! get-fn]} (mem-store)
+             async-get-fn (fn [cid] (js/Promise.resolve (get-fn cid)))]
+         (-> (eng/commit! put! get-fn [{:s "a" :p "n" :o "1"} {:s "b" :p "n" :o "2"}
+                                      {:s "c" :p "n" :o "3"} {:s "d" :p "n" :o "4"}]
+                          nil test-encrypt-fn)
+             (.then (fn [chain]
+                      (eng/fold! put! get-fn chain ipld/link? nil test-blind-fn
+                                 test-encrypt-fn test-decrypt-fn nil nil async-get-fn)))
+             (.then (fn [folded]
+                      (let [snap (eng/latest-snapshot-cid get-fn folded)]
+                        (is (some? snap) "the fixture really did fold to a snapshot")
+                        (-> (eng/cold-datoms-async async-get-fn snap {:index :eavt}
+                                                   (constantly true) test-blind-fn test-decrypt-fn)
+                            (.then (fn [rows]
+                                     (let [order (mapv :e rows)]
+                                       (is (= #{"a" "b" "c" "d"} (set order))
+                                           "unlimited and unfiltered returns every row")
+                                       (is (= 4 (count order)) "exactly once each")
+                                       ;; only the LAST row of the scan is visible
+                                       (let [last-e (peek order)
+                                             visible-last (fn [{:keys [e]}] (= e last-e))]
+                                         (-> (eng/cold-datoms-async async-get-fn snap {:index :eavt}
+                                                                    visible-last test-blind-fn test-decrypt-fn)
+                                             (.then (fn [rs]
+                                                      (is (= [last-e] (mapv :e rs))
+                                                          "without a limit the predicate finds it")
+                                                      (eng/cold-datoms-async async-get-fn snap
+                                                                             {:index :eavt :limit 1}
+                                                                             visible-last test-blind-fn
+                                                                             test-decrypt-fn)))
+                                             (.then (fn [rs]
+                                                      (is (= [] (mapv :e rs))
+                                                          "limit 1 truncates the SCAN to the first row, which is not the visible one, so the answer is empty -- limit does not count visible rows")
+                                                      (done))))))))))))
+             (.catch (fn [e] (is false (str "cold scan rejected: " e)) (done))))))))
+
+#?(:cljs
    (deftest fold-batches-assert-runs-without-reordering-them
      ;; Root ADR-2609100100. The fold applied novelty one PERSISTENT assert at a
      ;; time, each allocating a fresh db across four indexes, on the path where
