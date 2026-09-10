@@ -2222,10 +2222,35 @@
    (hydrate-db-cached get-fn snapshot-cid blind-fn decrypt-fn cache-get cache-put! nil))
   ([get-fn snapshot-cid blind-fn decrypt-fn cache-get cache-put! async-get-fn]
    (letfn [(build [rows]
-            (reduce (fn [db {:keys [e a v_edn]}]
-                      (qs/assert-quad db {:s e :p a :o (qs/edn->link (edn/read-string v_edn))}))
-                    (qs/empty-db)
-                    rows))
+            ;; Bulk-load, not one persistent assert per row. Every persistent
+            ;; assert allocates a fresh db across four indexes, so a hydrate of
+            ;; N rows leaves N-1 of them as garbage -- the allocation-churn
+            ;; signature, and this runs where memory is the binding constraint.
+            ;;
+            ;; Measured 2026-09-10 (root ADR-2609100100): the invocations killed
+            ;; on this path sit at memP50 89.9 MB against a 128 MB isolate while
+            ;; the ones that answer use 14.6 MB, and cpu_ms 300000 does not help
+            ;; because more CPU does not buy memory. At the production shape
+            ;; (1665 rows) the two builds cost 23.7 MB and 9.8 MB of heap growth
+            ;; respectively; the gap narrows by 15k rows, so this is a fix for
+            ;; the regime this graph is actually in, not a general win.
+            ;;
+            ;; Safe as a blanket substitution HERE and not elsewhere: these rows
+            ;; are a snapshot scan, so every one is an assert. `fold!`'s novelty
+            ;; reduce goes through `apply-quad`, which also handles :retract and
+            ;; :retract-entity, and must stay as it is.
+            ;; NOTE the return value. `assert-quads!` carries a bang but is not
+            ;; in-place: it RETURNS the accumulator, and discarding it persists
+            ;; an empty one. Doing that lost only the vaet index in the suite --
+            ;; three Link-value tests -- because the other three mutate through,
+            ;; so the failure looked like a Link bug rather than a dropped
+            ;; result.
+            (qs/persist-db
+             (qs/assert-quads! (qs/mutable-db (qs/empty-db))
+                               (map (fn [{:keys [e a v_edn]}]
+                                      {:s e :p a :o (qs/edn->link (edn/read-string v_edn))})
+                                    rows)
+                               ipld/link?)))
           (encode-rows [rows]
             (pr-str (mapv (fn [{:keys [e a v_edn added]}]
                             [(v->edn e) (v->edn a) v_edn added])
