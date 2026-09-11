@@ -198,10 +198,6 @@
            interval (if official 0 (/ 1000.0 rate))
            ;; short reads follow complex reads: a JS array FIFO, due at generation
            immediate (array)
-           short-ops (when official
-                       {:person (vec (filter #(#{:is1 :is2 :is3} (:op %)) ops))
-                        :message (vec (filter #{:is4 :is5 :is6 :is7} (map :op ops)))})
-           short-rr (atom 0)
            extra-total (atom 0)
            ;; the interleave (S22, ayatori iteration 32): stream events are
            ;; scheduled at t0 + (sim - sim0) * tcr wall ms, LDBC's time
@@ -238,7 +234,8 @@
                         {:rate rate :seconds seconds :inflight inflight
                          :scheduled total :reads-scheduled reads-total :updates-scheduled updates-total
                          :tcr tcr :official (when official {:interleave (:interleave official) :short-reads @extra-total
-                                                             :complex-scheduled reads-total :short-read-dissipation 0.2})
+                                                             :complex-scheduled reads-total :short-read-dissipation 0.2
+                                                             :generator "LdbcSnbShortReadGenerator: buffers from every read's rows, random first, S1..S3/S4..S7 chains, -0.2 after the last of each kind, previous-finish scheduling"})
                          :completed (count rs)
                          :reads-completed (count (remove :update rs)) :updates-completed (count (filter :update rs))
                          :updates-skipped skipped
@@ -257,24 +254,58 @@
                                                 [op (stats (mapv :latency rs))]))
                          :server-ms (into {} (for [[op rs] by-op]
                                                [op (stats (mapv #(or (:server-ms %) 0) rs))]))})))
-           after-read! (fn [op rows]
-                         (when (and official (seq rows) (#{:ic02 :ic07 :ic08 :ic09} op))
-                           (let [[person message] (first rows)
-                                 pick (fn [kind id]
-                                        (let [cands (get short-ops kind)]
-                                          (when (seq cands)
-                                            (let [o (nth cands (mod (swap! short-rr inc) (count cands)))
-                                                  o (if (map? o) (:op o) o)]
-                                              {:op o :params (if (= kind :person) {:person id} {:message id})}))))]
-                             ;; probability 1.0 for the first, then x 0.2 each (LdbcSnbShortReadGenerator's dissipation)
-                             (loop [p 1.0 kinds (cycle [[:person person] [:message message]]) n 0]
-                               (when (and (< n 6) (< (rand) p))
-                                 (let [[kind id] (first kinds)]
-                                   (when-let [sr (pick kind id)]
-                                     (.push immediate (assoc sr :sched (now)))
-                                     (swap! extra-total inc))
-                                   (recur (* p 0.2) (rest kinds) (inc n))))))))
-           launch! (fn launch! [op p update? sched sim finish-one]
+           ;; S38 (ayatori iteration 48): LDBC's short-read generator, as the
+           ;; driver's LdbcSnbShortReadGenerator does it. Two id buffers are
+           ;; replenished from EVERY read's rows (person and message ids per
+           ;; result type; IC05 and IS1/IS4 add nothing). After a complex read
+           ;; a chain starts at probability 1.0 with a coin toss for a random
+           ;; first (person or message) short read; each short read polls an id
+           ;; from its buffer (an empty buffer ends the chain) and is scheduled
+           ;; at the previous operation's actual finish; the next in the chain
+           ;; is S1->S2->S3->S4->S5->S6->S7->S1..., and after the LAST enabled
+           ;; person query (S3) and the LAST enabled message query (S7) the
+           ;; probability drops by short_read_dissipation (0.2). A chain ends at
+           ;; the first failed toss. Expected ~6 short reads per complex read.
+           person-buf (array)
+           message-buf (array)
+           person-ops (vec (filter #{:is1 :is2 :is3} (map :op ops)))
+           message-ops (vec (filter #{:is4 :is5 :is6 :is7} (map :op ops)))
+           replenish! (fn [op rows]
+                        (doseq [row rows]
+                          (case op
+                            (:ic02 :ic07 :ic09) (do (.push person-buf (nth row 0)) (.push message-buf (nth row 1)))
+                            :ic08 (do (.push person-buf (nth row 0)) (.push message-buf (nth row 1)))
+                            :is2 (do (.push person-buf (nth row 4)) (.push message-buf (nth row 0)) (.push message-buf (nth row 3)))
+                            :is3 (.push person-buf (nth row 0))
+                            :is5 (.push person-buf (nth row 0))
+                            :is6 (.push person-buf (nth row 2))
+                            :is7 (do (.push person-buf (nth row 3)) (.push message-buf (nth row 0)))
+                            nil)))
+           next-short (fn [prev]
+                        ;; the next type in the chain after `prev` (nil = chain start)
+                        (let [all (into person-ops message-ops)]
+                          (cond
+                            (nil? prev) (if (< (rand) 0.5) (or (first person-ops) (first message-ops)) (or (first message-ops) (first person-ops)))
+                            :else (let [i (.indexOf all prev)] (nth all (mod (inc i) (count all)))))))
+           after-read! (fn [op rows state]
+                         (when official
+                           (replenish! op rows)
+                           (let [complex? (#{:ic02 :ic05 :ic07 :ic08 :ic09} op)
+                                 short? (contains? (set (into person-ops message-ops)) op)]
+                             (when (or complex? (and short? state))
+                               (let [state (if complex? 1.0
+                                               (- state (if (or (= op (peek person-ops)) (= op (peek message-ops))) 0.2 0.0)))
+                                     nxt (next-short (when short? op))]
+                                 (when (and nxt (> state (rand)))
+                                   (let [buf (if (#{:is1 :is2 :is3} nxt) person-buf message-buf)
+                                         id (when (pos? (.-length buf)) (.shift buf))]
+                                     (when id
+                                       (.push immediate {:op nxt :params (if (#{:is1 :is2 :is3} nxt) {:person id} {:message id})
+                                                         :sched (now) :chain state})
+                                       (swap! extra-total inc)))))))))
+           launch! (fn launch!
+                     ([op p update? sched sim finish-one] (launch! op p update? sched sim finish-one nil))
+                     ([op p update? sched sim finish-one chain]
                      (let [start (now)]
                                    (-> (if update?
                                          (fetch-edn origin "/ldbc/update" (assoc p :op op))
@@ -296,7 +327,7 @@
                                                           :status (if (and (= status 200) (nil? parsed)) 590 status)
                                                           :body (when (or (not= status 200) (nil? parsed)) (subs body 0 (min 120 (count body))))
                                                           :n (:n parsed) :server-ms (:server-ms parsed)})
-                                                  (when-not update? (after-read! op (:rows parsed))))))
+                                                  (when-not update? (after-read! op (:rows parsed) chain)))))
                                        (.catch (fn [e]
                                                  (swap! records conj
                                                         {:op op :scheduled sched :start start :end (now)
@@ -308,7 +339,7 @@
                                                      (swap! last-done-sim max sim))
                                                    (swap! in-flight dec)
                                                    (swap! done inc)
-                                                   (finish-one))))))
+                                                   (finish-one)))))))
            dispatch! (fn dispatch! []
                        ;; start every op whose scheduled time has come, while a slot is
                        ;; free: the next stream event when it is due AND its dependency is
@@ -326,9 +357,9 @@
                              (cond
                                ;; a short read that followed a complex read: due at once
                                (and official (pos? (.-length immediate)))
-                               (let [{:keys [op params sched]} (.shift immediate)]
+                               (let [{:keys [op params sched chain]} (.shift immediate)]
                                  (swap! in-flight inc)
-                                 (launch! op params false sched nil (fn [] (if (= @done (total-now)) (finish!) (dispatch!))))
+                                 (launch! op params false sched nil (fn [] (if (= @done (total-now)) (finish!) (dispatch!))) chain)
                                  (recur))
                                ev-due?
                                (do (swap! next-u inc)
