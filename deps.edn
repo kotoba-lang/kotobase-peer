@@ -31,7 +31,9 @@
         ;; 645c9e58 (iteration 34): a one-value counterpart set costs one
         ;; object, not a hash set -- the full LDBC SF1 (20.6M quads) serves
         ;; resident in 4.4 GB used heap where 10.9 GB did not fit before.
-        io.github.kotoba-lang/datalog {:git/sha "645c9e587870eef8a037315c24ad108407b4a506"}
+        ;; d4cb417b (iteration 35): the grouped ordered drive -- IC02 on the
+        ;; full SF1 82 -> 0.4 ms; tracked order versions 16 -> 1024.
+        io.github.kotoba-lang/datalog {:git/sha "d4cb417b5dae508ffcff37d4f96b6802f9b91d62"}
        ;; formerly two deps here (kqe + quad-store) -- kqe merged into
         ;; arrangement (ADR-2607050700), so this is the one coordinate now.
         io.github.kotoba-lang/arrangement {:git/sha "9c9f45d4cd043873cd5c5ea65fa3af8a8ead5e6d"}
@@ -128,6 +130,10 @@
               :extra-deps {org.neo4j/neo4j {:mvn/version "2025.03.0"}}
               :jvm-opts ["-Xmx12g"]
               :main-opts ["-m" "kotobase-peer.ic02-diag"]}
+  :ic02-scale-diag {:extra-paths ["bench"]
+                    :extra-deps {org.neo4j/neo4j {:mvn/version "2025.03.0"}}
+                    :jvm-opts ["-Xmx10g"]
+                    :main-opts ["-m" "kotobase-peer.ic02-scale-diag"]}
   :ic09-diag {:extra-paths ["bench"]
               ;; ldbc-snb-bench imports Neo4j classes at ns load; this
               ;; diagnostic only reuses its loader, but the ns still has to
