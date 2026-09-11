@@ -1,0 +1,30 @@
+{:receipt/type :ldbc-snb-interactive-network-iteration
+ :iteration 35
+ :date "2026-09-11"
+ :benchmark :ldbc-snb-interactive-network-v2
+ :claim "The date-ordered reads at full scale: datalog d4cb417b merges the bound groups (a person's friends' messages, per creator) in value order instead of walking every creationDate, so IC02 on the full SF1 reads at most 20 entries per friend instead of touching 21,417 candidates."
+ :diagnosis-before {:receipt "2026-09-11-ldbc-ic02-scale-diagnosis-before-grouped-drive.edn"
+                    :median-ms {:engine 82.4 :engine-plain 78.6 :twin 20.3 :raw-total 19.4 :raw-dates 12.1 :raw-top 6.4}
+                    :median-counts {:friends 11 :candidates 21417 :in-range 16954}
+                    :reading "the drive's wasted 512-value walk was 4 ms; the plain join was 3.8 us per candidate against 0.9 for the hand-written path; and even the hand-written path touched every candidate -- the shape, not the engine, was the wall"}
+ :diagnosis-after {:receipt "2026-09-11-ldbc-ic02-scale-diagnosis-after-grouped-drive.edn"
+                   :median-ms {:engine 0.44 :engine-plain 81.6 :twin 22.5} :disagreements 0 :speedup 185}
+ :engine-change {:repo "kotoba-lang/datalog" :sha "d4cb417b5dae508ffcff37d4f96b6802f9b91d62"
+                 :tests {:jvm "134/416/0" :cljs "138/427/0"}
+                 :hazard-found-and-closed "16 tracked order versions: at 1,000 inserts/s a reader whose independent half outlived 16 writes rebuilt the 3M-entry group order (~20 s, seen as IS2/IC09 max 20-23 s in the first sweep); versions 16 -> 1024, rebuild counters exposed in /ldbc/meta, 1 build then 0 rebuilds across 205,344 inserts"}
+ :sut {:host "levi" :heap "-Xmx10g" :quads 20569957 :gate {:checked 1082 :disagreements 0} :resident {:heap-used-mb 4602 :rss-mb 10208 :swap-used-pct 28.8}}
+ :prediction-before-running "in process IC02 falls from ~80 ms to a few ms (reads at most limit entries per friend); served IC02/IC09/IS2 fall likewise; IC07/IC08 do not move (their queries carry no :order-by/:limit -- the harness sorts after the join); the 8-slot read ceiling rises several-fold."
+ :observed "IC02 82 -> 0.44 ms in process (185x); served p50 IC02 141 -> 0.2, IC09 113 -> 9.2, IS2 28 -> 0.1, IS3 8 -> 4.4; IC07 31 -> 16.8 and IC08 unchanged in shape (as predicted, no drive); 8-slot ceiling 128 -> 640 reads/s (5x), first 32-slot row."
+ :rows
+ [{:rung :sf1-full :inflight 8 :reads-rate 640 :tcr 0.0002 :on-time-pct 100.0 :failures 0 :throughput-ops-s 1730.8 :reads-per-s 640 :updates-per-s 1092
+   :read-after-write {:checked 234 :not-visible 0 :outside-window 10 :unverifiable 0 :is6-checked 40 :no-covering-read 40}
+   :receipt "2026-09-11-ldbc-snb-network-iteration-35-full-sf1-8slots-ceiling.edn"}
+  {:rung :sf1-full :inflight 8 :reads-rate 768 :tcr 0.0002 :on-time-pct 92.91 :verdict :fails-95pct-rule :delay-p95-ms 1028}
+  {:rung :sf1-full :inflight 32 :reads-rate 512 :tcr 0.00015 :on-time-pct 100.0 :failures 0 :throughput-ops-s 1984.8 :reads-per-s 512 :updates-per-s 1475
+   :read-after-write {:checked 360 :not-visible 0 :outside-window 0 :unverifiable 0 :is6-checked 60 :no-covering-read 60}
+   :receipt "2026-09-11-ldbc-snb-network-iteration-35-full-sf1-32slots.edn"}
+  {:rung :sf1-full :inflight 32 :reads-rate 640 :tcr 0.00015 :on-time-pct 85.87 :verdict :fails-95pct-rule :delay-p95-ms 6395 :receipt "2026-09-11-ldbc-snb-network-iteration-35-full-sf1-32slots-fail-control.edn"}]
+ :server-ms-p50-at-8-slots-512 {:ic02 0.2 :ic07 16.8 :ic08 0.2 :ic09 9.2 :is1 0.1 :is2 0.1 :is3 4.4 :is4 0.0 :is5 0.0 :is6 0.1 :is7 0.1}
+ :variance-noted "an early 8-slot sweep right after a restart failed at 256 reads (81% on-time) and a later one passed 640: the first minutes after a restart carry JIT and first-use builds; the rows above are from sweeps after a 15 s warm run over all 11 ops, and each column ends on a failing rate"
+ :not-an-ldbc-score "SF1 is below the audited table; 11 of 21 reads; subset-derived parameters; no ACID suite; no auditor. Audited No.1 (SF300 139,411 ops/s) is 70x the 32-slot row."
+ :seeds [:s27-ic07-ic08-top-k-written-into-the-query :s26-full-data-parameter-set :s23b-ic05-covers-ins5 :m3-sf3-needs-13gb]}

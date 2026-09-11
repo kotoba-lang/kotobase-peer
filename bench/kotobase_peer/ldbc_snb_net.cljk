@@ -43,6 +43,7 @@
   both ways and the index path is served only if all of them agree."
   (:require [kotobase-peer.ldbc-snb-bench :as ldbc]
             [kotobase-peer.core :as eng]
+            [datalog.index :as index]
             [clojure.edn :as edn]
             [clojure.string]
             [clojure.java.io])
@@ -192,7 +193,11 @@
               method (.getRequestMethod ex)]
           (cond
             (and (= method "GET") (= path "/ldbc/meta"))
-            (respond! ex 200 (pr-str (-> meta (dissoc :updates) (assoc :host-memory (host-memory) :updates-applied @(:updates meta)))))
+            ;; the engine's maintained orders rebuild from scratch on a miss (seconds
+            ;; on the full SF1); the counts say whether a served run paid that
+            (respond! ex 200 (pr-str (-> meta (dissoc :updates) (assoc :host-memory (host-memory) :updates-applied @(:updates meta)
+                                                                       :order-rebuilds {:value (index/value-order-rebuild-count)
+                                                                                        :group (index/group-order-rebuild-count)}))))
 
             (and (= method "POST") (= path "/ldbc/ic"))
             (let [req (edn/read-string (read-body ex))
