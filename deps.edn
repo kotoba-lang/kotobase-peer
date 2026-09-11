@@ -33,7 +33,8 @@
         ;; resident in 4.4 GB used heap where 10.9 GB did not fit before.
         ;; d4cb417b (iteration 35): the grouped ordered drive -- IC02 on the
         ;; full SF1 82 -> 0.4 ms; tracked order versions 16 -> 1024.
-        io.github.kotoba-lang/datalog {:git/sha "d4cb417b5dae508ffcff37d4f96b6802f9b91d62"}
+        ;; 3ab273e4 (iteration 36): order versions as a conj/trim ring.
+        io.github.kotoba-lang/datalog {:git/sha "3ab273e44d7c766314c25fbe8c416541699fe1a0"}
        ;; formerly two deps here (kqe + quad-store) -- kqe merged into
         ;; arrangement (ADR-2607050700), so this is the one coordinate now.
         io.github.kotoba-lang/arrangement {:git/sha "9c9f45d4cd043873cd5c5ea65fa3af8a8ead5e6d"}
