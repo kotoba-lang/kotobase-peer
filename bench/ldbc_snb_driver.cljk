@@ -86,7 +86,9 @@
                :let [[pid md] (str/split l #"\|")]]
            (if (= n :message)
              {:message pid}
-             (cond-> {:person pid} md (assoc :max-date (parse-long md))))))))
+             (cond-> {:person pid}
+               (and md (= n 5)) (assoc :min-date (parse-long md))      ; IC05's second column is minDate
+               (and md (not= n 5)) (assoc :max-date (parse-long md))))))))
 
 (defn- read-updates
   "Insert parameters from an LDBC update stream file
@@ -315,7 +317,7 @@
         impl (keyword (arg args "--impl" "datalog"))
         max-swap-pct (parse-double (arg args "--max-swap-pct" "90"))
         mem (host-memory)
-        param-file {"ic02" 2 "ic07" 7 "ic08" 8 "ic09" 9 "is1" 7 "is2" 7 "is3" 7 "is4" :message "is5" :message "is6" :message "is7" :message
+        param-file {"ic02" 2 "ic05" 5 "ic07" 7 "ic08" 8 "ic09" 9 "is1" 7 "is2" 7 "is3" 7 "is4" :message "is5" :message "is6" :message "is7" :message
                     ;; noop: the HTTP layer alone (S29); carries an IC02 parameter it ignores
                     "noop" 2}
         updates (arg args "--updates" nil)

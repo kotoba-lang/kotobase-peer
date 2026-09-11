@@ -114,6 +114,8 @@
       [:datalog :ic07] (#'ldbc/kb-ic07 db person)
       [:datalog :ic08] (#'ldbc/kb-ic08 db person)
       [:datalog :ic09] (#'ldbc/kb-ic09 db person md)
+      [:datalog :ic05] (#'ldbc/kb-ic05 db person (long (:min-date req)))
+      [:index :ic05] (#'ldbc/kb-ic05-index db person (long (:min-date req)))
       [:index :ic02] (#'ldbc/kb-ic02-index db person md)
       [:index :ic07] (#'ldbc/kb-ic07-index db person)
       [:index :ic08] (#'ldbc/kb-ic08-index db person)
@@ -300,12 +302,14 @@
               :threads threads
               :warm-persons (#'ldbc/pick-persons data 5)}
         params (when params-dir
-                 (into (vec (for [[op n] {:ic02 2 :ic07 7 :ic08 8 :ic09 9}
+                 (into (vec (for [[op n] {:ic02 2 :ic05 5 :ic07 7 :ic08 8 :ic09 9}
                                  line (rest (clojure.string/split-lines
                                              (slurp (str params-dir "/interactive_" n "_param.txt"))))
                                  :when (seq line)
                                  :let [[pid md] (clojure.string/split line #"\|")]]
-                             (cond-> {:op op :person pid} md (assoc :max-date (parse-long md)))))
+                             (cond-> {:op op :person pid}
+                               (and md (= op :ic05)) (assoc :min-date (parse-long md))
+                               (and md (not= op :ic05)) (assoc :max-date (parse-long md)))))
                        ;; short reads: IS2 takes the IC07 persons; IS4/5/7 take
                        ;; short_message_param.txt (messages of this subset,
                        ;; written by bench/ldbc_short_params.cljk) when present
