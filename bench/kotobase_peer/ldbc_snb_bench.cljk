@@ -169,7 +169,16 @@
                                       (fn [acc [f title cd]] (if (wanted f) (assoc! acc f [title (parse-long cd)]) acc))
                                       (transient {})))]
                {:post->forum post->forum
-                :forums (into {} (map (fn [[f [title cd]]] [f {:title title :creationDate cd :moderator (get moderator f)}])) meta)})}))
+                :forums (into {} (map (fn [[f [title cd]]] [f {:title title :creationDate cd :moderator (get moderator f)}])) meta)})
+     ;; memberships (IC05, ayatori iteration 44): every forum_hasMember row,
+     ;; reified as INS5 reifies a membership -- mb:<forum>:<person> with its
+     ;; join date -- so the loaded and the streamed memberships have one shape.
+     ;; All of them: IC05 asks which forums a person's friends joined, and a
+     ;; forum without a kept post is still a forum they joined.
+     :memberships (persistent!
+                   (reduce-rows dir "forum_hasMember_person_0_0.csv"
+                                (fn [acc [f p jd]] (conj! acc [f p (parse-long jd)]))
+                                (transient [])))}))
 
 ;; ── kotobase side ──────────────────────────────────────────────────────────
 
@@ -181,7 +190,7 @@
   separately in the merkle-lsm receipts and is not what an IC query's
   latency depends on. Stated, not hidden: no crypto and no persistence in
   THIS number."
-  [{:keys [persons knows messages creator reply-of likes profiles city forums]}]
+  [{:keys [persons knows messages creator reply-of likes profiles city forums memberships]}]
   (let [q (fn [s p o] {:s s :p p :o o})
         ;; a LAZY seq of quads, transacted in batches: one transact over 20M
         ;; quads (full SF1) held every quad map and every effective delta at
@@ -204,6 +213,9 @@
                                      :let [kid (str "kn:" x ":" y)]
                                      z [(q kid "knows/person" x) (q kid "knows/friend" y) (q kid "knows/creationDate" (str cd))]] z))] x)
                (for [[post f] (:post->forum forums)] (q post "post/forum" f))
+               (for [[f p jd] memberships
+                     :let [mb (str "mb:" f ":" p)]
+                     x [(q mb "membership/forum" f) (q mb "membership/person" p) (q mb "membership/joinDate" (str jd))]] x)
                (for [[f {:keys [title creationDate moderator]}] (:forums forums)
                      x (cond-> [(q f "forum/title" title) (q f "forum/creationDate" (str creationDate))]
                          moderator (conj (q f "forum/moderator" moderator)))] x)
@@ -281,6 +293,40 @@
          distinct
          (sort-by (juxt (comp - #(nth % 2)) second))
          (take 20) vec)))
+
+(defn- ic05-pairs
+  "Distinct [forum post] pairs where the post's creator is one of `where`'s
+  reached persons ?x AND ?x joined the post's forum after min-date. The
+  membership is reached by its DERIVED id -- `mb:<forum>:<person>` is how
+  the loader and INS5 both name it -- so a (person, forum) pair is one
+  point lookup instead of a scan of the person's memberships: the function
+  clause binds ?mb from ?f and ?x."
+  [db where person min-date]
+  (eng/query db
+             {:find '[?f ?post]
+              :in '[?person]
+              :where (into where
+                           [['?post "hasCreator" '?x]
+                            ['?post "post/forum" '?f]
+                            '[(str "mb:" ?f ":" ?x) ?mb]
+                            ['?mb "membership/joinDate" '?d]
+                            [(list '> '?d (str min-date))]])}
+             everything [person]))
+
+(defn- kb-ic05
+  "IC05: the forums the start person's friends and friends-of-friends joined
+  after min-date, with the count of posts in each forum by those persons --
+  top 20 by count desc, forum id asc. Two reaches unioned as [forum post]
+  pairs (a post by a person who is both a friend and a friend-of-friend
+  counts once), then counted per forum."
+  [db person min-date]
+  (let [one (ic05-pairs db '[[?person "knows" ?x]] person min-date)
+        two (ic05-pairs db '[[?person "knows" ?f1] [?f1 "knows" ?x] [(not= ?x ?person)]] person min-date)]
+    (->> (into one two)
+         (reduce (fn [m [f _]] (update m f (fnil inc 0))) {})
+         (sort-by (juxt (comp - val) key))
+         (take 20)
+         (mapv (fn [[f n]] [f n])))))
 
 (defn- kb-ic07
   "IC07: the 20 most recent likes on the start person's Messages, one row per
@@ -386,6 +432,22 @@
     (->> (disj fof person)
          (mapcat #(msg-rows db % max-date))
          (top-k-by 20 newest-first-then-msg))))
+
+(defn- kb-ic05-index [db person min-date]
+  (let [friends (get (eng/entity db person) "knows" #{})
+        reach (disj (into friends (mapcat #(get (eng/entity db %) "knows" #{})) friends) person)
+        md (str min-date)]
+    (->> (for [x reach
+               post (by-avet db "hasCreator" x)
+               :let [f (attr1 db post "post/forum")]
+               :when f
+               :let [jd (attr1 db (str "mb:" f ":" x) "membership/joinDate")]
+               :when (and jd (pos? (compare jd md)))]
+           f)
+         frequencies
+         (sort-by (juxt (comp - val) key))
+         (take 20)
+         (mapv (fn [[f n]] [f n])))))
 
 (defn- kb-ic07-index [db person]
   (->> (by-avet db "hasCreator" person)
@@ -562,6 +624,7 @@
               (let [md (or (:max-date p) max-date)]
                 (case op
                   :ic02 (= (kb-ic02 db person md) (kb-ic02-index db person md))
+                  :ic05 (= (kb-ic05 db person (:min-date p)) (kb-ic05-index db person (:min-date p)))
                   :ic07 (= (set (map first (kb-ic07 db person))) (set (map first (kb-ic07-index db person))))
                   :ic08 (= (kb-ic08 db person) (kb-ic08-index db person))
                   :ic09 (= (set (map second (kb-ic09 db person md))) (set (map second (kb-ic09-index db person md))))
