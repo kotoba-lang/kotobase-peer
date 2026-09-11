@@ -1,0 +1,20 @@
+{:receipt/type :ldbc-snb-interactive-network-iteration
+ :iteration 47
+ :date "2026-09-12"
+ :benchmark :ldbc-snb-interactive-network-v2
+ :s37 {:change {:repo "kotoba-lang/datalog" :sha "9c86cc8d1009d4d2e72640a624bb5e0ea6a465e1" :what "count pushdown: (count ?e) of a last-clause composite's entity answers one weighted binding per input; project's count sums weights"}
+       :ic05 "one query: or-join [?person ?x] over the two reaches (a person in both is one ?x), the membership cut and the (creator, forum) composite, (count ?post) pushed into the last composite"
+       :gate {:checked 4780 :disagreements 0}
+       :all-99-parameters-in-thread {:before {:p50-ms 160.7 :p90-ms 380.6 :max-ms 2301.6} :after {:p50-ms 111.7 :p90-ms 261.2 :max-ms 388.0} :non-empty 78 :file "2026-09-12-ldbc-ic05-all-params-server-ms-count-pushdown.txt"}}
+ :official-schedule {:inflight 64 :sut-threads 16
+                     :runs [{:tcr 0.0002 :on-time-pct 100.0 :throughput-ops-s 1269.3}
+                            {:tcr 0.00015 :on-time-pct 100.0 :throughput-ops-s 1689.0}
+                            {:tcr 0.00012 :on-time-pct 100.0 :throughput-ops-s 1995.6 :updates-per-s 1901 :complex 3150 :short-reads 3005 :wire-p50-ms {:ic05 377.3 :ic02 8.5 :ic09 20.0 :is1 22.2}}
+                            {:tcr 0.0001 :on-time-pct 88.95 :throughput-ops-s 1719.5 :verdict :fails-95pct-rule}]}
+ :rows
+ [{:rung :sf1-full :schedule :official :inflight 64 :sut-threads 16 :tcr 0.00012 :on-time-pct 100.0 :failures 0 :throughput-ops-s 1995.6
+   :ops {:ic [:ic02 :ic05 :ic07 :ic08 :ic09] :is [:is1 :is2 :is3 :is4 :is5 :is6 :is7] :ins [:ins1 :ins2 :ins3 :ins4 :ins5 :ins6 :ins7 :ins8]}
+   :read-after-write {:checked 477 :not-visible 0 :outside-window 20 :unverifiable 0 :is6-checked 78 :no-covering-read 80}
+   :note "iteration 46's row was 1360.9 at TCR 0.00015 (96.2%); 0.0001 fails (89.0%)" :receipt "2026-09-12-ldbc-snb-network-iteration-47-official-schedule-64slots.edn"}]
+ :not-an-ldbc-score "SF1 is below the audited table; 5 of 14 complex reads; short-read generation approximated; no ACID suite; no auditor. Audited No.1 (SF300 139,411 ops/s at TCR 0.00315) is 70x this row at a 26x slower TCR."
+ :seeds [:s39-ic05-remaining-112ms-the-two-hop-reach-and-22k-membership-bindings :s38-official-short-read-generator :s34-bindings-as-arrays :m4-owner-decision-a-host]}
