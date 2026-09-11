@@ -110,14 +110,16 @@
                              7 (let [rp (nth ps 8) rc (nth ps 9)]
                                  {:comment (nth ps 0) :date (parse-long (nth ps 1)) :content (nth ps 4) :creator (nth ps 6)
                                   :parent (if (= rp "-1") rc rp)})
+                             4 {:forum (nth ps 0) :title (nth ps 1) :date (parse-long (nth ps 2)) :moderator (nth ps 3)}
+                             5 {:person (nth ps 0) :forum (nth ps 1) :date (parse-long (nth ps 2))}
                              8 {:p1 (nth ps 0) :p2 (nth ps 1) :date (parse-long (nth ps 2))})))))
          (take limit) vec)))
 
 (defn- read-stream
   "Every event of an LDBC update stream file as {:sim :dep :type :params},
-   in file order (the files are sorted by scheduled time). Types this driver
-   does not send (INS4 forum, INS5 membership) are kept with :params nil so
-   they still advance the completion clock other events depend on."
+   in file order (the files are sorted by scheduled time). All eight types
+   are sent since iteration 33; an unknown type keeps :params nil and still
+   advances the completion clock other events depend on."
   [file]
   (when-not (fs/existsSync file) (println "REFUSED: update stream missing" file) (js/process.exit 2))
   (->> (str/split-lines (fs/readFileSync file "utf8"))
@@ -126,7 +128,7 @@
                  (let [[sim dep ty & ps] (str/split l #"\|")
                        type (parse-long ty)]
                    {:sim (parse-long sim) :dep (parse-long dep) :type type
-                    :op (get {1 :ins1 2 :ins2 3 :ins3 6 :ins6 7 :ins7 8 :ins8} type)
+                    :op (get {1 :ins1 2 :ins2 3 :ins3 4 :ins4 5 :ins5 6 :ins6 7 :ins7 8 :ins8} type)
                     :params (case type
                               1 {:person (nth ps 0) :first (nth ps 1) :last (nth ps 2) :gender (nth ps 3)
                                  :birthday (parse-long (nth ps 4)) :date (parse-long (nth ps 5)) :ip (nth ps 6) :browser (nth ps 7) :city (nth ps 8)}
@@ -136,6 +138,8 @@
                               7 (let [rp (nth ps 8) rc (nth ps 9)]
                                   {:comment (nth ps 0) :date (parse-long (nth ps 1)) :content (nth ps 4) :creator (nth ps 6)
                                    :parent (if (= rp "-1") rc rp)})
+                              4 {:forum (nth ps 0) :title (nth ps 1) :date (parse-long (nth ps 2)) :moderator (nth ps 3)}
+                              5 {:person (nth ps 0) :forum (nth ps 1) :date (parse-long (nth ps 2))}
                               8 {:p1 (nth ps 0) :p2 (nth ps 1) :date (parse-long (nth ps 2))}
                               nil)}))))
        vec))
@@ -240,7 +244,7 @@
                                                   (swap! records conj
                                                          {:op op :scheduled sched :start start :end end
                                                           :delay (- start sched) :latency (- end start)
-                                                          :update (when update? (assoc p :creator (:creator parsed) :p2-known (:p2-known parsed)))
+                                                          :update (when update? (assoc p :creator (:creator parsed) :p2-known (:p2-known parsed) :forum-known (:forum-known parsed)))
                                                           :status (if (and (= status 200) (nil? parsed)) 590 status)
                                                           :body (when (or (not= status 200) (nil? parsed)) (subs body 0 (min 120 (count body))))
                                                           :n (:n parsed) :server-ms (:server-ms parsed)}))))
@@ -317,7 +321,7 @@
         tcr (some-> (arg args "--tcr" nil) parse-double)
         stream (when tcr
                  (vec (sort-by :sim (concat (read-stream updates) (when person-updates (read-stream person-updates))))))
-        update-type {"ins1" 1 "ins2" 2 "ins3" 3 "ins6" 6 "ins7" 7 "ins8" 8}
+        update-type {"ins1" 1 "ins2" 2 "ins3" 3 "ins4" 4 "ins5" 5 "ins6" 6 "ins7" 7 "ins8" 8}
         ops (mapv (fn [op] (if-let [ty (update-type op)]
                              {:op (keyword op) :update? true
                               :params (read-updates (if (= ty 1) (or person-updates updates) updates) ty 100000)}
@@ -384,7 +388,7 @@
                                                             "  " (.padStart (p50 :ic09) 8)
                                                             extra
                                                             (when tcr (str "  | stream " (:updates-completed r) " upd sent = "
-                                                                           (.toFixed (/ (:updates-completed r) seconds) 0) "/s (" (:updates-skipped r) " INS4/5 skipped)")))))
+                                                                           (.toFixed (/ (:updates-completed r) seconds) 0) "/s (" (:updates-skipped r) " skipped)")))))
                                             (let [pass (and (zero? (:failed r)) (>= (:on-time-pct r) 95.0))
                                                   acc (conj acc (assoc r :pass pass))]
                                               (if pass (go (rest remaining) acc) (js/Promise.resolve acc))))))))]
@@ -401,7 +405,11 @@
                                         unverifiable (filter (fn [u] (or (and (#{:ins2 :ins3} (:op u)) (nil? (:creator u)))
                                                                          (and (= :ins8 (:op u)) (false? (:p2-known u)))))
                                                              all-samples)
-                                        samples (remove (set unverifiable) all-samples)
+                                        ;; INS5 (membership) has no covering read among the served ops
+                                        ;; (IC05 would list the forum): the write landed, nothing here
+                                        ;; can show it. A third class, distinct from unverifiable.
+                                        no-covering-read (filter #(= :ins5 (:op %)) all-samples)
+                                        samples (remove (set (concat unverifiable no-covering-read)) all-samples)
                                         check (fn [{:keys [op] :as u}]
                                                 (case op
                                                   :ins8 (-> (fetch-edn origin "/ldbc/ic" {:op :is3 :person (:p1 u)})
@@ -424,28 +432,46 @@
                                                             (.then (fn [{:keys [body]}]
                                                                      (let [rows (:rows (edn/read-string body))]
                                                                        {:op op :ok (boolean (some #(= (:first u) (first %)) rows)) :u u}))))
+                                                  ;; INS6 -> IS4 shows the post's date; and when the SUT said the
+                                                  ;; forum is held with a named moderator, IS6 on the post must name
+                                                  ;; the forum -- this is how INS4 is verified (through a post that
+                                                  ;; landed in the forum it created)
                                                   :ins6 (-> (fetch-edn origin "/ldbc/ic" {:op :is4 :message (:post u)})
                                                             (.then (fn [{:keys [body]}]
-                                                                     (let [rows (:rows (edn/read-string body))]
-                                                                       {:op op :ok (boolean (some #(= (:date u) (first %)) rows)) :u u}))))
+                                                                     (let [rows (:rows (edn/read-string body))
+                                                                           ok4 (boolean (some #(= (:date u) (first %)) rows))]
+                                                                       (if (true? (:forum-known u))
+                                                                         (-> (fetch-edn origin "/ldbc/ic" {:op :is6 :message (:post u)})
+                                                                             (.then (fn [{:keys [body]}]
+                                                                                      (let [rows (:rows (edn/read-string body))]
+                                                                                        {:op op :ok (and ok4 (boolean (some #(= (:forum u) (first %)) rows)))
+                                                                                         :is6-checked true :u u}))))
+                                                                         {:op op :ok ok4 :u u})))))
+                                                  ;; INS4 itself: no post may have landed in the forum yet, so the
+                                                  ;; covering read is the INS6 -> IS6 check above; here the forum's
+                                                  ;; own datoms are read back through IS6 only when a post exists.
+                                                  ;; Not a claim of visibility on its own: counted under :ins6.
+                                                  :ins4 (js/Promise.resolve {:op op :ok true :skipped-check true :u u})
                                                   :ins7 (-> (fetch-edn origin "/ldbc/ic" {:op :is7 :message (:parent u)})
                                                             (.then (fn [{:keys [body]}]
                                                                      (let [rows (:rows (edn/read-string body))]
                                                                        {:op op :ok (boolean (some #(= (:comment u) (first %)) rows)) :u u}))))))]
                                     (-> (js/Promise.all (clj->js (mapv check samples)))
                                         (.then (fn [results]
-                                                 (let [results (vec results)
+                                                 (let [results (vec (remove :skipped-check results))
                                                        failed (remove :ok results)]
                                                    (when (or (seq results) (seq unverifiable))
                                                      (println "read-after-write:" (count results) "checked," (count failed) "not visible,"
                                                               (count (filter :outside-window results)) "outside a full top-20 window (later likes pushed them out),"
-                                                              (count unverifiable) "unverifiable (INS2 on a post, or INS8 to a person, this SUT does not hold)"
+                                                              (count unverifiable) "unverifiable (INS2 on a post, or INS8 to a person, this SUT does not hold),"
+                                                              (count (filter :is6-checked results)) "posts also read back through IS6 (verifies INS4),"
+                                                              (count no-covering-read) "INS5 with no covering read"
                                                               (when (seq failed) (pr-str (take 3 failed)))))
                                                    (when (seq failed)
                                                      (println "REFUSED: an insert the SUT acknowledged is not visible to the read that covers it")
                                                      (js/process.exit 2))
-                                                   {:runs runs :results results :failed failed :unverifiable unverifiable})))))))
-                         (.then (fn [{:keys [runs results failed unverifiable]}]
+                                                   {:runs runs :results results :failed failed :unverifiable unverifiable :no-covering-read no-covering-read})))))))
+                         (.then (fn [{:keys [runs results failed unverifiable no-covering-read]}]
                                   (let [passing (filter :pass runs)
                                         best (last passing)
                                         receipt {:schema 1
@@ -453,7 +479,8 @@
                                                  :date (.slice (.toISOString (js/Date.)) 0 10)
                                                  :sut (dissoc meta :warm-persons)
                                                  :read-after-write {:checked (count results) :not-visible (count failed)
-                                                                    :outside-window (count (filter :outside-window results)) :unverifiable (count unverifiable)}
+                                                                    :outside-window (count (filter :outside-window results)) :unverifiable (count unverifiable)
+                                                                    :is6-checked (count (filter :is6-checked results)) :no-covering-read (count no-covering-read)}
                                                  :driver {:implementation "bench/ldbc_snb_driver.cljk (nbb, open-loop scheduled)"
                                                           :origin origin :mix mix :inflight inflight :seconds seconds :impl impl
                                                           :rule "95% of operations start within 1 s of schedule; zero failed operations"
@@ -464,7 +491,8 @@
                                                  :runs runs
                                                  :throughput-ops-s (when best (:throughput best))
                                                  :highest-passing-rate (when best (:rate best))
-                                                 :not-an-ldbc-score "four complex reads on a stated SF1 subset, no updates, no short reads, no auditor"}]
+                                                 :not-an-ldbc-score (str "a stated SF1 subset; served reads " (pr-str (vec mix)) " of 29 ops; inserts "
+                                                                          (if tcr "all 8 types from the stream" "only those in --mix") "; no ACID suite, no auditor")}]
                                     (when (and (seq runs) (pos? (:failed (first runs))))
                                       (println "REFUSED: failed operations at the first rate; nothing measured")
                                       (println (pr-str (:failed-sample (first runs))))

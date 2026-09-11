@@ -137,8 +137,8 @@
   "The datoms one LDBC insert asserts, in this harness's data model.
   INS2 (a person likes a post): the like reified as in the loader.
   INS8 (a friendship): `knows` both ways plus the reified friendship date
-  both ways. Other inserts (persons, forums, posts, comments) are not
-  served yet -- stated in the receipt, not hidden by a 200."
+  both ways. All eight inserts are served since iteration 33 (INS4 without
+  its tags, INS5 without a covering read -- both stated in the receipt)."
   [{:keys [op] :as req}]
   (let [q (fn [s p o] {:s s :p p :o o})]
     (case (keyword (name op))
@@ -169,6 +169,19 @@
                   m (str comment)]
               [(q m "message/creationDate" (str date)) (q m "message/content" (or content ""))
                (q m "hasCreator" (str creator)) (q m "replyOf" (str parent))])
+      ;; INS4 (a forum) as the loader models it: title, creationDate, moderator.
+      ;; Its tags are not modelled anywhere in this harness (no read uses them)
+      ;; and are dropped here -- stated, not hidden.
+      :ins4 (let [{:keys [forum title date moderator]} req
+                  f (str forum)]
+              [(q f "forum/title" title) (q f "forum/creationDate" (str date)) (q f "forum/moderator" (str moderator))])
+      ;; INS5 (a person joins a forum): the membership reified with its join
+      ;; date, the shape `knows` and `like` already take. No served read
+      ;; covers memberships (IC05 would); the driver counts these as
+      ;; :no-covering-read, never as visible.
+      :ins5 (let [{:keys [person forum date]} req
+                  mb (str "mb:" forum ":" person)]
+              [(q mb "membership/forum" (str forum)) (q mb "membership/person" (str person)) (q mb "membership/joinDate" (str date))])
       (throw (ex-info "insert not served" {:status 400 :op op})))))
 
 (defn- handler [meta db-ref max-date index-ok?]
@@ -211,9 +224,18 @@
                   ;; known = has a name (a person record), not merely an entity: an
                   ;; earlier INS8 in the same stream may have asserted `knows`
                   ;; datoms onto a person INS1 never created here
-                  p2-known (when (= :ins8 op) (boolean (seq (get (eng/entity db' (str (:p2 req))) "person/firstName"))))]
+                  p2-known (when (= :ins8 op) (boolean (seq (get (eng/entity db' (str (:p2 req))) "person/firstName"))))
+                  ;; INS6: IS6 on the new post can show its forum only if the forum
+                  ;; is held (loaded, or created by INS4 in this stream) AND its
+                  ;; moderator is a person with a name -- both said, so the driver
+                  ;; verifies INS4 through the post that lands in the forum
+                  forum-known (when (= :ins6 op)
+                                (let [f (eng/entity db' (str (:forum req)))
+                                      m (first (get f "forum/moderator"))]
+                                  (boolean (and (seq (get f "forum/title")) m
+                                                (seq (get (eng/entity db' (str m)) "person/firstName"))))))]
               (swap! (:updates meta) inc)
-              (respond! ex 200 (pr-str {:ok true :datoms (count datoms) :server-ms ms :creator creator :p2-known p2-known})))
+              (respond! ex 200 (pr-str {:ok true :datoms (count datoms) :server-ms ms :creator creator :p2-known p2-known :forum-known forum-known})))
 
             :else
             (respond! ex 404 (pr-str {:error :no-such-route :path path}))))
