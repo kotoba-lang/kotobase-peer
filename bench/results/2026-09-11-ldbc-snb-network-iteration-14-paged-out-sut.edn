@@ -1,0 +1,204 @@
+{:mechanism
+ ["server-ms equals client-ms in every arm: the time is inside the query on the server, not on the wire."
+  "the same function on the same data is 1.9 ms in-process and 90-310 ms served. The served JVMs had RSS 0.02-0.03 GB with 0.9 GB of used heap: paged out. The host had 34.5 of 35.8 GB swap in use, 0.2-0.4 GB free, 5.9M pages in the compressor, and my own 20 GB full-SF1 JVM was part of that pressure."
+  "every row in iteration 13 and every arm here was therefore measured through paging. The load average printed beside those rows (12-25) did not show it."],
+ :schema 1,
+ :date "2026-09-11",
+ :question
+ "iteration 13 seed S1: IC08 served at 236 ms p50 against 0.77 ms in the in-JVM harness (2026-08-14). Which of start-person choice / subset size / concurrency is it?",
+ :in-process-control
+ {:how
+  "the same kb-ic08 var, same 3,500-post subset, fresh JVM (-Xmx6g), 30 calls after one warm call; scratch script inproc_ic08.clj",
+  :high-degree
+  {:rows 4, :first-call-ms 30.4, :p50-of-30-ms 1.9, :min-ms 1.15},
+  :official
+  {:rows 0, :first-call-ms 29, :p50-of-30-ms 17.45, :min-ms 11.45},
+  :fresh-thread {:first-ms 3.1, :second-ms 1.73},
+  :note
+  "the EMPTY answer (official person, 0 rows) is 9x slower than the 4-row one on the same subset -- a planner finding in its own right, recorded, not chased here"},
+ :what-this-is-not
+ ["not a scoreboard row: no throughput under v2 was validly measured this iteration"
+  "not an LDBC score"],
+ :iteration 14,
+ :fix
+ {:driver
+  "bench/ldbc_snb_driver.cljk reads host memory (free, swap total/used/%) into the receipt and REFUSES (exit 2) above --max-swap-pct (default 90)",
+  :shown-both-ways
+  {:refused "swap 97.8% > --max-swap-pct 50 -> exit 2",
+   :passed "--max-swap-pct 100 -> ran (E2)"}},
+ :benchmark
+ "kotoba-lang/ayatori bench/benchmark.edn :ldbc-snb-interactive-network-v2 -- this receipt is a mechanism separation, not a scoreboard row",
+ :verdicts
+ {:h-person :refuted,
+  :h-concurrency :held-but-not-the-cause,
+  :h-scan :refuted},
+ :receipt/type :ldbc-snb-interactive-network-mechanism,
+ :predictions-before-running
+ {:h-person
+  "IC08 with highest-degree persons >= 10x below official persons on the same subset",
+  :h-concurrency
+  "official persons at inflight 1 within 1.5x of iteration 13 inflight 8 (236 ms)",
+  :h-scan "a 10x smaller subset cuts IC08 by ~10x"},
+ :arms
+ {:A-official-35k-inflight1
+  {:sut-quads 810221,
+   :server-p50-ms
+   {:ic02 349.496917,
+    :ic07 82.058125,
+    :ic08 307.746459,
+    :ic09 1499.392166},
+   :completed 24,
+   :params
+   "official substitution_parameters-sf1 interactive_{2,7,8,9}_param.txt, cycled",
+   :sut-elements
+   {:persons 9892,
+    :knows-edges 180623,
+    :messages 86932,
+    :posts 35000,
+    :comments 51932,
+    :has-creator 86932,
+    :reply-of 51932,
+    :likes 38821},
+   :empty-answers 12,
+   :host-memory nil,
+   :inflight 1,
+   :rate 1,
+   :load-avg ["14.94" "20.55" "23.87"],
+   :rows-mean 7.041666666666667,
+   :origin "http://127.0.0.1:8090",
+   :on-time-pct 20.833333333333336,
+   :client-p50-ms
+   {:ic02 360.6722499999996,
+    :ic07 84.94962499999747,
+    :ic08 309.9437079999989,
+    :ic09 1514.721666999998}},
+  :B-highdegree-35k-inflight1
+  {:sut-quads 810221,
+   :server-p50-ms
+   {:ic02 1028.4335,
+    :ic07 130.23,
+    :ic08 157.819917,
+    :ic09 19765.402208},
+   :completed 24,
+   :params
+   "official substitution_parameters-sf1 interactive_{2,7,8,9}_param.txt, cycled",
+   :sut-elements
+   {:persons 9892,
+    :knows-edges 180623,
+    :messages 86932,
+    :posts 35000,
+    :comments 51932,
+    :has-creator 86932,
+    :reply-of 51932,
+    :likes 38821},
+   :empty-answers 0,
+   :host-memory nil,
+   :inflight 1,
+   :rate 1,
+   :load-avg ["23.75" "21.58" "23.84"],
+   :rows-mean 19.166666666666668,
+   :origin "http://127.0.0.1:8090",
+   :on-time-pct 25,
+   :client-p50-ms
+   {:ic02 1064.0136250000069,
+    :ic07 140.52158299999792,
+    :ic08 162.57808300000033,
+    :ic09 20018.506792000004}},
+  :D-official-3500-inflight1
+  {:sut-quads 414130,
+   :server-p50-ms
+   {:ic02 7.429375, :ic07 5.994666, :ic08 219.728667, :ic09 982.3835},
+   :completed 24,
+   :params
+   "official substitution_parameters-sf1 interactive_{2,7,8,9}_param.txt, cycled",
+   :sut-elements
+   {:persons 9892,
+    :knows-edges 180623,
+    :messages 8511,
+    :posts 3500,
+    :comments 5011,
+    :has-creator 8511,
+    :reply-of 5011,
+    :likes 852},
+   :empty-answers 20,
+   :host-memory nil,
+   :inflight 1,
+   :rate 1,
+   :load-avg ["18.23" "20.56" "23.37"],
+   :rows-mean 3.3333333333333335,
+   :origin "http://127.0.0.1:8092",
+   :on-time-pct 100,
+   :client-p50-ms
+   {:ic02 47.27241700000013,
+    :ic07 15.610625000001164,
+    :ic08 224.23749999999927,
+    :ic09 988.049583}},
+  :E-highdegree-3500-inflight1
+  {:sut-quads 414130,
+   :server-p50-ms
+   {:ic02 174.779041,
+    :ic07 7.391667,
+    :ic08 95.57525,
+    :ic09 1901.868208},
+   :completed 24,
+   :params
+   "official substitution_parameters-sf1 interactive_{2,7,8,9}_param.txt, cycled",
+   :sut-elements
+   {:persons 9892,
+    :knows-edges 180623,
+    :messages 8511,
+    :posts 3500,
+    :comments 5011,
+    :has-creator 8511,
+    :reply-of 5011,
+    :likes 852},
+   :empty-answers 5,
+   :host-memory nil,
+   :inflight 1,
+   :rate 1,
+   :load-avg ["20.41" "21.01" "23.46"],
+   :rows-mean 12.791666666666666,
+   :origin "http://127.0.0.1:8092",
+   :on-time-pct 50,
+   :client-p50-ms
+   {:ic02 186.1738750000004,
+    :ic07 16.43270799999982,
+    :ic08 142.2544999999991,
+    :ic09 1959.220875000001}},
+  :E2-highdegree-3500-inflight1-after-freeing-20g
+  {:sut-quads 414130,
+   :server-p50-ms
+   {:ic02 125.336125,
+    :ic07 91.284708,
+    :ic08 77.190875,
+    :ic09 3427.69425},
+   :completed 12,
+   :params
+   "official substitution_parameters-sf1 interactive_{2,7,8,9}_param.txt, cycled",
+   :sut-elements
+   {:persons 9892,
+    :knows-edges 180623,
+    :messages 8511,
+    :posts 3500,
+    :comments 5011,
+    :has-creator 8511,
+    :reply-of 5011,
+    :likes 852},
+   :empty-answers 3,
+   :host-memory
+   {:total-gib 32,
+    :free-gib 0.234619140625,
+    :swap-total-mib 27648,
+    :swap-used-mib 22887.69,
+    :swap-used-pct 82.78244357638889},
+   :inflight 1,
+   :rate 1,
+   :load-avg ["48.28" "26.89" "24.98"],
+   :rows-mean 11.25,
+   :origin "http://127.0.0.1:8092",
+   :on-time-pct 33.33333333333333,
+   :client-p50-ms
+   {:ic02 132.76774999999907,
+    :ic07 93.59529199999997,
+    :ic08 89.71695799999907, 
+    :ic09 3437.698459000001}}}}

@@ -45,7 +45,25 @@
             ["fs" :as fs]
             ["os" :as os]
             ["path" :as path]
+            ["child_process" :as cp]
             ["perf_hooks" :refer [performance]]))
+
+(defn- host-memory
+  "What the host's memory looks like at measurement time. Iteration 14
+   (2026-09-11) measured the same IC08 at 1.9 ms in-process and 96-310 ms
+   served, on the same data and function, and the difference was the SUT
+   JVM paged out on a host with 34 GB of 35 GB swap in use. A load average
+   does not show that; swap does. macOS only for the swap line (sysctl);
+   elsewhere the keys are nil, not 0."
+  []
+  (let [total (os/totalmem) free (os/freemem)
+        swap (try (str (.execSync cp "sysctl -n vm.swapusage" #js {:encoding "utf8"}))
+                  (catch :default _ nil))
+        num (fn [k] (when swap (some-> (re-find (re-pattern (str k " = ([0-9.]+)M")) swap) second parse-double)))
+        st (num "total") su (num "used")]
+    {:total-gib (/ total 1073741824.0) :free-gib (/ free 1073741824.0)
+     :swap-total-mib st :swap-used-mib su
+     :swap-used-pct (when (and st su (pos? st)) (* 100.0 (/ su st)))}))
 
 (defn- arg [args k default]
   (let [i (.indexOf args k)]
@@ -175,15 +193,24 @@
         inflight (parse-long (arg args "--inflight" "64"))
         mix (str/split (arg args "--mix" "ic02,ic07,ic08,ic09") #",")
         out (arg args "--out" nil)
+        max-swap-pct (parse-double (arg args "--max-swap-pct" "90"))
+        mem (host-memory)
         param-file {"ic02" 2 "ic07" 7 "ic08" 8 "ic09" 9}
         ops (mapv (fn [op] {:op (keyword op) :params (read-params pdir (param-file op))}) mix)]
+    ;; A SUT that is paged out answers the benchmark's question about the
+    ;; host, not the engine. Refuse before measuring, and say which number.
+    (when (and (:swap-used-pct mem) (> (:swap-used-pct mem) max-swap-pct))
+      (println "REFUSED: host swap" (.toFixed (:swap-used-pct mem) 1) "% used exceeds --max-swap-pct" max-swap-pct
+               "-- a served number here measures paging, not the engine (iteration 14)")
+      (js/process.exit 2))
     (-> (fetch-edn origin "/ldbc/meta" nil)
         (.then (fn [{:keys [status body]}]
                  (when-not (= 200 status)
                    (println "REFUSED: server not ready" status body) (js/process.exit 2))
                  (let [meta (edn/read-string body)]
                    (println "SUT" (pr-str (select-keys meta [:elements :quads :threads :subset-rule])))
-                   (println "load" (pr-str (mapv #(.toFixed % 2) (os/loadavg))) "origin" origin
+                   (println "load" (pr-str (mapv #(.toFixed % 2) (os/loadavg)))
+                            "swap-used%" (some-> (:swap-used-pct mem) (.toFixed 1)) "origin" origin
                             "mix" (pr-str mix) "inflight" inflight "seconds" seconds)
                    (println)
                    (println "  rate  sched  done  fail  on-time%  thru/s  delay-p95  empty  rows  ic02-p50  ic07-p50  ic08-p50  ic09-p50")
@@ -223,7 +250,8 @@
                                                           :origin origin :mix mix :inflight inflight :seconds seconds
                                                           :rule "95% of operations start within 1 s of schedule; zero failed operations"
                                                           :params "official substitution_parameters-sf1 interactive_{2,7,8,9}_param.txt, cycled"
-                                                          :load-avg (mapv #(.toFixed % 2) (os/loadavg))}
+                                                          :load-avg (mapv #(.toFixed % 2) (os/loadavg))
+                                                          :host-memory mem :max-swap-pct max-swap-pct}
                                                  :runs runs
                                                  :throughput-ops-s (when best (:throughput best))
                                                  :highest-passing-rate (when best (:rate best))
