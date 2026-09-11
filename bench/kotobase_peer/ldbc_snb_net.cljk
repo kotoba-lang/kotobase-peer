@@ -118,6 +118,10 @@
       [:index :ic07] (#'ldbc/kb-ic07-index db person)
       [:index :ic08] (#'ldbc/kb-ic08-index db person)
       [:index :ic09] (#'ldbc/kb-ic09-index db person md)
+      ;; S29 (ayatori iteration 38): the HTTP layer's cost per request, measured
+      ;; by an op that does nothing -- the same route, parse and response shape
+      [:datalog :noop] []
+      [:index :noop] []
       [:datalog :is2] (#'ldbc/kb-is2 db person)
       [:datalog :is4] (#'ldbc/kb-is4 db message)
       [:datalog :is5] (#'ldbc/kb-is5 db message)
