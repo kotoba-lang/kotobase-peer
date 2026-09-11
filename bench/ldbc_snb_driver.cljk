@@ -105,7 +105,7 @@
   "One scheduled run at `rate` ops/s for `seconds`. Resolves to the run's
    record. Open loop: dispatch times come from the schedule, not from
    completions; `inflight` bounds concurrency like driver threads would."
-  [{:keys [origin rate seconds inflight ops]}]
+  [{:keys [origin rate seconds inflight ops impl]}]
   (js/Promise.
    (fn [resolve _]
      (let [total (long (* rate seconds))
@@ -151,7 +151,7 @@
                                  (let [{:keys [op params]} (nth ops (mod k (count ops)))
                                        p (nth params (mod (quot k (count ops)) (count params)))
                                        start (now)]
-                                   (-> (fetch-edn origin "/ldbc/ic" (assoc p :op op))
+                                   (-> (fetch-edn origin "/ldbc/ic" (assoc p :op op :impl (or impl :datalog)))
                                        (.then (fn [{:keys [status body]}]
                                                 (let [end (now)
                                                       ;; a 200 is an answer only if it has the answer's shape;
@@ -193,6 +193,7 @@
         inflight (parse-long (arg args "--inflight" "64"))
         mix (str/split (arg args "--mix" "ic02,ic07,ic08,ic09") #",")
         out (arg args "--out" nil)
+        impl (keyword (arg args "--impl" "datalog"))
         max-swap-pct (parse-double (arg args "--max-swap-pct" "90"))
         mem (host-memory)
         param-file {"ic02" 2 "ic07" 7 "ic08" 8 "ic09" 9}
@@ -222,6 +223,7 @@
                    (println "load" (pr-str (mapv #(.toFixed % 2) (os/loadavg)))
                             "swap-used%" (str (name who) "=" (some-> (:swap-used-pct m) (.toFixed 1)))
                             "sut-rss/heap-mb" (str (:rss-mb sut-mem) "/" (:heap-used-mb sut-mem)) "origin" origin
+                            "impl" (name impl) "index-path" (pr-str (:index-path meta))
                             "mix" (pr-str mix) "inflight" inflight "seconds" seconds)
                    (println)
                    (println "  rate  sched  done  fail  on-time%  thru/s  delay-p95  empty  rows  ic02-p50  ic07-p50  ic08-p50  ic09-p50")
@@ -229,7 +231,7 @@
                              (if (empty? remaining)
                                (js/Promise.resolve acc)
                                (-> (run-rate! {:origin origin :rate (first remaining) :seconds seconds
-                                               :inflight inflight :ops ops})
+                                               :inflight inflight :ops ops :impl impl})
                                    (.then (fn [r]
                                             (let [l (:latency-ms r)
                                                   p50 (fn [op] (or (some-> (get-in l [op :p50]) (.toFixed 1)) "-"))]
@@ -258,7 +260,7 @@
                                                  :date (.slice (.toISOString (js/Date.)) 0 10)
                                                  :sut (dissoc meta :warm-persons)
                                                  :driver {:implementation "bench/ldbc_snb_driver.cljk (nbb, open-loop scheduled)"
-                                                          :origin origin :mix mix :inflight inflight :seconds seconds
+                                                          :origin origin :mix mix :inflight inflight :seconds seconds :impl impl
                                                           :rule "95% of operations start within 1 s of schedule; zero failed operations"
                                                           :params "official substitution_parameters-sf1 interactive_{2,7,8,9}_param.txt, cycled"
                                                           :load-avg (mapv #(.toFixed % 2) (os/loadavg))

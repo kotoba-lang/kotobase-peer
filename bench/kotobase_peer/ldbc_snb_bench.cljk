@@ -253,6 +253,81 @@
        (sort-by (juxt (comp - #(nth % 2)) second))
        (take 20) vec))
 
+;; ── kotobase side, index path ──────────────────────────────────────────────
+;; The same four reads written against the datom plane's index access paths
+;; (`entity` = EAVT, `datoms :avet [a v]` = AVET point lookup) instead of the
+;; Datalog join. ADR-2608039970: a surface whose algebra binds directly to L1
+;; index access may do so; `bridge/q` is an option, not the default. These
+;; exist because the co-scientist loop (ayatori iteration 16, 2026-09-11)
+;; found IC09 = 71% and IC08 = 25% of the SUT's CPU at its throughput
+;; ceiling, most of it in `datalog.core/hash-join-rows` building a broad
+;; index per query. Every one of these returns the SAME rows as its Datalog
+;; twin above -- `index-path-agrees?` checks that on real parameters and the
+;; net server refuses to serve the index path if it does not.
+
+(defn- by-avet
+  "Subjects with `[s p o]` -- the AVET point lookup through the public API."
+  [db p o]
+  (map :e (eng/datoms db {:index :avet :components [p o]} everything)))
+
+(defn- attr1 [db s a] (first (get (eng/entity db s) a)))
+
+(defn- msg-rows
+  "[creator msg date] for every Message by `creator` with date < max-date."
+  [db creator max-date]
+  (keep (fn [m] (let [d (parse-long (attr1 db m "message/creationDate"))]
+                  (when (< d max-date) [creator m d])))
+        (by-avet db "hasCreator" creator)))
+
+(defn- kb-ic02-index [db person max-date]
+  (->> (get (eng/entity db person) "knows")
+       (mapcat #(msg-rows db % max-date))
+       (sort-by (juxt (comp - #(nth % 2)) second))
+       (take 20) vec))
+
+(defn- kb-ic09-index [db person max-date]
+  (let [friends (get (eng/entity db person) "knows" #{})
+        fof (into friends (mapcat #(get (eng/entity db %) "knows")) friends)]
+    (->> (disj fof person)
+         (mapcat #(msg-rows db % max-date))
+         (sort-by (juxt (comp - #(nth % 2)) second))
+         (take 20) vec)))
+
+(defn- kb-ic07-index [db person]
+  (->> (by-avet db "hasCreator" person)
+       (mapcat (fn [m] (map (fn [like] [(attr1 db like "like/person") m
+                                         (parse-long (attr1 db like "like/creationDate"))])
+                            (by-avet db "like/message" m))))
+       (group-by first)
+       (map (fn [[_ ls]] (first (sort-by (comp - #(nth % 2)) ls))))
+       (sort-by (juxt (comp - #(nth % 2)) first))
+       (take 20) vec))
+
+(defn- kb-ic08-index [db person]
+  (->> (by-avet db "hasCreator" person)
+       (mapcat (fn [m] (map (fn [r] [(attr1 db r "hasCreator") r
+                                      (parse-long (attr1 db r "message/creationDate"))])
+                            (by-avet db "replyOf" m))))
+       (sort-by (juxt (comp - #(nth % 2)) second))
+       (take 20) vec))
+
+(defn index-path-agrees?
+  "For every `{:op :person :max-date}` in `params`, the index path returns the
+  rows the Datalog path returns (ordered rows for IC02/IC08; IC07 compares
+  liker sets and IC09 message sets, the same tie rule the Neo4j gate uses).
+  Returns `{:checked n :disagreements [...]}` -- a count, so one disagreement
+  and a broken run are different answers."
+  [db max-date params]
+  (let [one (fn [{:keys [op person] :as p}]
+              (let [md (or (:max-date p) max-date)]
+                (case op
+                  :ic02 (= (kb-ic02 db person md) (kb-ic02-index db person md))
+                  :ic07 (= (set (map first (kb-ic07 db person))) (set (map first (kb-ic07-index db person))))
+                  :ic08 (= (kb-ic08 db person) (kb-ic08-index db person))
+                  :ic09 (= (set (map second (kb-ic09 db person md))) (set (map second (kb-ic09-index db person md)))))))]
+    {:checked (count params)
+     :disagreements (vec (remove one params))}))
+
 ;; ── neo4j side ─────────────────────────────────────────────────────────────
 
 (def ^:private cy-ic02
