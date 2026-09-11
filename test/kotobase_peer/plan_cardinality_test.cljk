@@ -107,3 +107,24 @@
            (mapv :estimate-source (:plan plan))))
     (is (zero? @visibility-calls)
         "a cost estimate must not run authorization once per candidate row")))
+
+(deftest the-plan-is-cached-by-query-shape-and-refreshed
+  ;; same query value -> the planner runs once; a different shape plans again;
+  ;; after the refresh count the planner runs again for the same shape. The
+  ;; answer is the same either way (a plan is an order, never a filter).
+  (let [d1 (db)
+        q1 '{:find [?m ?d] :in [?p] :where [[?m "creator" ?p] [?m "date" ?d]]}
+        q2 '{:find [?m] :in [?p] :where [[?m "creator" ?p]]}
+        calls (atom 0)
+        counted (fn [f] (fn [& args] (swap! calls inc) (apply f args)))]
+    (reset! @#'eng/plan-cache {})
+    (with-redefs [eng/datalog-query-plan (counted eng/datalog-query-plan)]
+      (let [a (eng/query d1 q1 everything ["p1"])
+            b (eng/query d1 q1 everything ["p2"])]
+        (is (= 1 @calls) "two calls, one shape, one plan")
+        (eng/query d1 q2 everything ["p1"])
+        (is (= 2 @calls) "a second shape plans once more")
+        (swap! @#'eng/plan-cache assoc-in [q1 :uses] 100000)
+        (is (= a (eng/query d1 q1 everything ["p1"])) "the refreshed plan answers the same rows")
+        (is (= 3 @calls) "past the refresh count the shape is planned again")
+        (is (= b (eng/query d1 q1 everything ["p2"])))))))

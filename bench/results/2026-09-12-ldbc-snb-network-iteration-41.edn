@@ -1,0 +1,18 @@
+{:receipt/type :ldbc-snb-interactive-network-iteration
+ :iteration 41
+ :date "2026-09-12"
+ :benchmark :ldbc-snb-interactive-network-v2
+ :s32 {:method "per-op cost at saturation (1 slot, rate 400, back-to-back; the iteration-40 rule) for the heavy ops, then JFR with 40-deep stacks on IS3 alone"
+       :before-ms-p50 {:is3 6.32 :ic09 5.34 :ic07 4.80 :ic08 0.68 :ic02 0.57}
+       :profile "IS3 (882 friends for the first parameter): join-clause 63% of engine samples, of which scan* -> datalog.query/query 41% (a set of {:s :p :o} maps per keyed scan: hasheq + hash-map assoc + the for lazy-seq ~35%), and datalog-query-plan 12% (plan-clause-order over a 5-clause query on every request). The index twin answers the same IS3 in 0.72 ms: the generic join is 8x the hand-written path here"
+       :changes [{:repo "kotoba-lang/datalog" :sha "8dc45c75ab5e3f04b333b4545e55ca893f6cb389" :what "query-vec: an index scan as an eager vector with no set and no lazy seq; scan* takes it (every consumer maps, keeps or seqs)"}
+                 {:repo "kotoba-lang/kotobase-peer" :what "the plan is cached by query VALUE (shape), like a prepared statement, refreshed every 1,024 uses; a plan is an order, never a filter, so a cached plan is never wrong"}]
+       :after-ms-p50 {:is3 5.82 :ic09 5.12 :ic07 4.05 :ic08 0.40 :ic02 0.58 :is2 0.12}
+       :receipts ["2026-09-12-ldbc-jfr-is3-saturated-execution-samples.txt" "2026-09-12-ldbc-snb-network-iteration-41-saturated-before-*.edn" "2026-09-12-ldbc-snb-network-iteration-41-saturated-after-*.edn"]}
+ :sut {:host "levi (M4: 4P+6E)" :jvm-flags "-Xmx10g -XX:-G1UseAdaptiveIHOP -XX:InitiatingHeapOccupancyPercent=75" :threads 16 :gate {:checked 1082 :disagreements 0} :order-rebuilds {:value 1 :group 3}}
+ :rows
+ [{:rung :sf1-full :inflight 64 :sut-threads 16 :reads-rate 3328 :tcr 0.00015 :on-time-pct 100.0 :failures 0 :throughput-ops-s 4797.0 :reads-per-s 3328 :updates-per-s 1475
+   :read-after-write {:checked 360 :not-visible 0 :outside-window 0 :unverifiable 0 :is6-checked 59 :no-covering-read 60}
+   :note "3712 fails (63.0%); iteration 39's row was 4374.1 at 2944" :receipt "2026-09-12-ldbc-snb-network-iteration-41-full-sf1-64slots.edn"}]
+ :not-an-ldbc-score "SF1 is below the audited table; 11 of 21 reads; subset-derived parameters; no ACID suite; no auditor. Audited No.1 (SF300 139,411 ops/s) is 29x this row."
+ :seeds [:s33-binding-representation-in-join-clause-the-8x-to-the-twin :m4-p-cores :s26-full-data-parameter-set :s23b-ic05 :m3-sf3]}
