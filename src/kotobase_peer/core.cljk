@@ -819,6 +819,28 @@
                     (range) where)
         :optimized? false}))))
 
+(def ^:private plan-cache
+  "query value -> {:query <the planned query> :uses n}. A plan is a clause
+  ORDER plus cardinality hints; any order answers the same rows, so a cached
+  plan is never wrong, only possibly stale against drifting statistics. It
+  is refreshed after `plan-cache-uses` uses. Keyed by the query's VALUE
+  (its shape), not its inputs, the way a prepared statement is: measured
+  2026-09-12 (ayatori iteration 41, JFR on IS3 at saturation on the full
+  SF1), planning was 12% of the request -- `plan-clause-order` over a
+  5-clause query on every call."
+  (atom {}))
+
+(def ^:private plan-cache-uses 1024)
+
+(defn- planned-query [db find+where visible? inputs]
+  (let [hit (get @plan-cache find+where)]
+    (if (and hit (< (:uses hit) plan-cache-uses))
+      (do (swap! plan-cache update-in [find+where :uses] inc)
+          (:query hit))
+      (let [{q :query} (datalog-query-plan db find+where visible? inputs)]
+        (swap! plan-cache assoc find+where {:query q :uses 1})
+        q))))
+
 (defn query
   "`datomic.api/q`-equivalent: `{:find [?var ...] :in [?param ...] :where
    [[e a v] ...] :rules [...]}` conjunctive multi-clause join over
@@ -839,8 +861,7 @@
    vectors. `visible?` is REQUIRED, same convention as `q` above."
   ([db find+where visible?] (query db find+where visible? []))
   ([db find+where visible? inputs]
-   (let [{planned-query :query} (datalog-query-plan db find+where visible? inputs)]
-     (datalog/q db planned-query visible? inputs))))
+   (datalog/q db (planned-query db find+where visible? inputs) visible? inputs)))
 
 ;; ── pull: a Datomic-shaped pull-pattern language over entity-attrs/refs-to ──
 ;; (one of the "3 pillars" this landing adds -- ADR-2607061200's own note
