@@ -102,7 +102,14 @@
          (keep (fn [l] (let [[_ _ ty & ps] (str/split l #"\|")]
                          (when (= ty t)
                            (case type
+                             1 {:person (nth ps 0) :first (nth ps 1) :last (nth ps 2) :gender (nth ps 3)
+                                :birthday (parse-long (nth ps 4)) :date (parse-long (nth ps 5)) :ip (nth ps 6) :browser (nth ps 7) :city (nth ps 8)}
                              2 {:person (nth ps 0) :post (nth ps 1) :date (parse-long (nth ps 2))}
+                             3 {:person (nth ps 0) :comment (nth ps 1) :date (parse-long (nth ps 2))}
+                             6 {:post (nth ps 0) :date (parse-long (nth ps 2)) :content (nth ps 6) :creator (nth ps 8) :forum (nth ps 9)}
+                             7 (let [rp (nth ps 8) rc (nth ps 9)]
+                                 {:comment (nth ps 0) :date (parse-long (nth ps 1)) :content (nth ps 4) :creator (nth ps 6)
+                                  :parent (if (= rp "-1") rc rp)})
                              8 {:p1 (nth ps 0) :p2 (nth ps 1) :date (parse-long (nth ps 2))})))))
          (take limit) vec)))
 
@@ -232,9 +239,11 @@
         mem (host-memory)
         param-file {"ic02" 2 "ic07" 7 "ic08" 8 "ic09" 9 "is1" 7 "is2" 7 "is3" 7 "is4" :message "is5" :message "is6" :message "is7" :message}
         updates (arg args "--updates" nil)
-        update-type {"ins2" 2 "ins8" 8}
+        person-updates (arg args "--person-updates" nil)
+        update-type {"ins1" 1 "ins2" 2 "ins3" 3 "ins6" 6 "ins7" 7 "ins8" 8}
         ops (mapv (fn [op] (if-let [ty (update-type op)]
-                             {:op (keyword op) :update? true :params (read-updates updates ty 100000)}
+                             {:op (keyword op) :update? true
+                              :params (read-updates (if (= ty 1) (or person-updates updates) updates) ty 100000)}
                              {:op (keyword op) :params (read-params pdir (param-file op))}))
                   mix)]
     (-> (fetch-edn origin "/ldbc/meta" nil)
@@ -310,7 +319,7 @@
                                         ;; rung) has no creator to read IC07 for: the write landed
                                         ;; (the SUT said so) but no served read covers it. Counted
                                         ;; and printed as unverifiable, never as visible.
-                                        unverifiable (filter (fn [u] (or (and (= :ins2 (:op u)) (nil? (:creator u)))
+                                        unverifiable (filter (fn [u] (or (and (#{:ins2 :ins3} (:op u)) (nil? (:creator u)))
                                                                          (and (= :ins8 (:op u)) (false? (:p2-known u)))))
                                                              all-samples)
                                         samples (remove (set unverifiable) all-samples)
@@ -320,16 +329,37 @@
                                                             (.then (fn [{:keys [body]}]
                                                                      (let [rows (:rows (edn/read-string body))]
                                                                        {:op op :ok (boolean (some #(= (:p2 u) (first %)) rows)) :u u}))))
-                                                  :ins2 (-> (fetch-edn origin "/ldbc/ic" {:op :ic07 :person (:creator u)})
+                                                  ;; IC07 is a top-20 window: a like whose date is older than every
+                                                  ;; row of a full window is outside it BY DESIGN (later likes from the
+                                                  ;; same stream pushed it out), not lost -- counted as :outside-window
+                                                  (:ins2 :ins3) (-> (fetch-edn origin "/ldbc/ic" {:op :ic07 :person (:creator u)})
+                                                                    (.then (fn [{:keys [body]}]
+                                                                             (let [rows (:rows (edn/read-string body))
+                                                                                   seen (boolean (some #(= (:person u) (first %)) rows))
+                                                                                   pushed-out (and (not seen) (= 20 (count rows))
+                                                                                                   (every? #(>= (nth % 2) (:date u)) rows))]
+                                                                               {:op op :ok (or seen pushed-out) :outside-window pushed-out :u u}))))
+                                                  ;; INS1 -> IS1 shows the profile; INS6 -> IS4 shows the post's
+                                                  ;; content; INS7 -> IS7 on the parent lists the comment
+                                                  :ins1 (-> (fetch-edn origin "/ldbc/ic" {:op :is1 :person (:person u)})
                                                             (.then (fn [{:keys [body]}]
                                                                      (let [rows (:rows (edn/read-string body))]
-                                                                       {:op op :ok (boolean (some #(= (:person u) (first %)) rows)) :u u}))))))]
+                                                                       {:op op :ok (boolean (some #(= (:first u) (first %)) rows)) :u u}))))
+                                                  :ins6 (-> (fetch-edn origin "/ldbc/ic" {:op :is4 :message (:post u)})
+                                                            (.then (fn [{:keys [body]}]
+                                                                     (let [rows (:rows (edn/read-string body))]
+                                                                       {:op op :ok (boolean (some #(= (:date u) (first %)) rows)) :u u}))))
+                                                  :ins7 (-> (fetch-edn origin "/ldbc/ic" {:op :is7 :message (:parent u)})
+                                                            (.then (fn [{:keys [body]}]
+                                                                     (let [rows (:rows (edn/read-string body))]
+                                                                       {:op op :ok (boolean (some #(= (:comment u) (first %)) rows)) :u u}))))))]
                                     (-> (js/Promise.all (clj->js (mapv check samples)))
                                         (.then (fn [results]
                                                  (let [results (vec results)
                                                        failed (remove :ok results)]
                                                    (when (or (seq results) (seq unverifiable))
                                                      (println "read-after-write:" (count results) "checked," (count failed) "not visible,"
+                                                              (count (filter :outside-window results)) "outside a full top-20 window (later likes pushed them out),"
                                                               (count unverifiable) "unverifiable (INS2 on a post, or INS8 to a person, this SUT does not hold)"
                                                               (when (seq failed) (pr-str (take 3 failed)))))
                                                    (when (seq failed)
@@ -343,7 +373,8 @@
                                                  :receipt/type :ldbc-snb-interactive-network
                                                  :date (.slice (.toISOString (js/Date.)) 0 10)
                                                  :sut (dissoc meta :warm-persons)
-                                                 :read-after-write {:checked (count results) :not-visible (count failed) :unverifiable (count unverifiable)}
+                                                 :read-after-write {:checked (count results) :not-visible (count failed)
+                                                                    :outside-window (count (filter :outside-window results)) :unverifiable (count unverifiable)}
                                                  :driver {:implementation "bench/ldbc_snb_driver.cljk (nbb, open-loop scheduled)"
                                                           :origin origin :mix mix :inflight inflight :seconds seconds :impl impl
                                                           :rule "95% of operations start within 1 s of schedule; zero failed operations"

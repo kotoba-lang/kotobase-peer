@@ -143,6 +143,25 @@
               (into [(q p1 "knows" p2) (q p2 "knows" p1)]
                     (for [[x y] [[p1 p2] [p2 p1]] :let [k (str "kn:" x ":" y)]
                           d [(q k "knows/person" x) (q k "knows/friend" y) (q k "knows/creationDate" (str date))]] d)))
+      ;; INS1 (a person): the profile as the loader models it
+      :ins1 (let [{:keys [person first last gender birthday date ip browser city]} req
+                  p (str person)]
+              [(q p "person/firstName" first) (q p "person/lastName" last) (q p "person/gender" gender)
+               (q p "person/birthday" (str birthday)) (q p "person/creationDate" (str date))
+               (q p "person/locationIP" ip) (q p "person/browserUsed" browser) (q p "person/city" (str city))])
+      ;; INS3 (a person likes a comment): the same reified like as INS2
+      :ins3 (let [{:keys [person comment date]} req
+                  lid (str "like:" person ":" comment)]
+              [(q lid "like/person" (str person)) (q lid "like/message" (str comment)) (q lid "like/creationDate" (str date))])
+      ;; INS6 (a post) and INS7 (a comment replying to a post or a comment)
+      :ins6 (let [{:keys [post date content creator forum]} req
+                  m (str post)]
+              [(q m "message/creationDate" (str date)) (q m "message/content" (or content ""))
+               (q m "hasCreator" (str creator)) (q m "post/forum" (str forum))])
+      :ins7 (let [{:keys [comment date content creator parent]} req
+                  m (str comment)]
+              [(q m "message/creationDate" (str date)) (q m "message/content" (or content ""))
+               (q m "hasCreator" (str creator)) (q m "replyOf" (str parent))])
       (throw (ex-info "insert not served" {:status 400 :op op})))))
 
 (defn- handler [meta db-ref max-date index-ok?]
@@ -175,7 +194,10 @@
                   db' (swap! db-ref eng/transact datoms)
                   ms (/ (- (System/nanoTime) t0) 1e6)
                   op (keyword (name (:op req)))
-                  creator (when (= :ins2 op) (first (get (eng/entity db' (str (:post req))) "hasCreator")))
+                  creator (case op
+                            :ins2 (first (get (eng/entity db' (str (:post req))) "hasCreator"))
+                            :ins3 (first (get (eng/entity db' (str (:comment req))) "hasCreator"))
+                            nil)
                   ;; INS8 to a person this SUT never received (the stream's INS1
                   ;; persons are not served yet): the datoms land, but no read
                   ;; that needs the friend's name can show them -- said so
