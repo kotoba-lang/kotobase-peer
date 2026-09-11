@@ -222,10 +222,17 @@
                      (println "REFUSED:" (name who) "swap" (.toFixed (:swap-used-pct m) 1) "% used exceeds --max-swap-pct" max-swap-pct
                               "-- a served number here measures paging, not the engine (iteration 14)")
                      (js/process.exit 2))
+                   ;; A resident JVM's RSS exceeds its used heap (metaspace, code,
+                   ;; stacks sit on top). RSS below used heap means part of the
+                   ;; heap is not in memory. The first rule here was "below half"
+                   ;; (iteration 14 saw 0.02 GB against 0.9); iteration 26 saw a
+                   ;; full-SF1 SUT at rss 8.5 GB against 10.9 GB used heap, 6 GB in
+                   ;; the host's swap and 3.8M page-ins, answer IC02 at 111 ms
+                   ;; against 3.4 on the subset -- and pass. 0.95 is the rule now.
                    (when (and (:rss-mb sut-mem) (:heap-used-mb sut-mem) (pos? (:heap-used-mb sut-mem))
-                              (< (:rss-mb sut-mem) (* 0.5 (:heap-used-mb sut-mem))))
-                     (println "REFUSED: SUT rss" (:rss-mb sut-mem) "MB is below half its used heap" (:heap-used-mb sut-mem)
-                              "MB -- the SUT is paged out (iteration 14)")
+                              (< (:rss-mb sut-mem) (* 0.95 (:heap-used-mb sut-mem))))
+                     (println "REFUSED: SUT rss" (:rss-mb sut-mem) "MB is below its used heap" (:heap-used-mb sut-mem)
+                              "MB -- part of the SUT's heap is not resident (iterations 14, 26)")
                      (js/process.exit 2))
                    (println "SUT" (pr-str (select-keys meta [:elements :quads :threads :subset-rule])))
                    (println "load" (pr-str (mapv #(.toFixed % 2) (os/loadavg)))
