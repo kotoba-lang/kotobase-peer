@@ -750,7 +750,29 @@
                                                   (kqe/estimate-cardinality db pattern))
                                 :estimate-source (if (some? supplied)
                                                    :materialized-statistics
-                                                   :index-estimate)}))
+                                                   :index-estimate)
+                                ;; What the executor's hash-join budget reads is
+                                ;; the size of the BROAD relation it would scan
+                                ;; (constants only, every variable open), not
+                                ;; the rows this clause matches once `:in`
+                                ;; inputs are substituted. The two coincide for
+                                ;; a clause without inputs; for one WITH an
+                                ;; input they differ by the whole relation.
+                                ;; Measured 2026-09-11 (ayatori iteration 17):
+                                ;; LDBC IC08's `[?msg "hasCreator" ?person]`
+                                ;; estimates 0 for a person with no message, the
+                                ;; budget read 0 <= 4 as "small relation", and
+                                ;; hash-joined a broad scan of 86,932 rows to
+                                ;; find nothing -- 60 ms for an empty answer
+                                ;; against 2.1 ms for a non-empty one. Estimating
+                                ;; the broad relation instead was measured too:
+                                ;; ~10 ms per clause on that relation, which made
+                                ;; every non-empty IC08 6x slower. So the hint
+                                ;; is WITHHELD for an input-narrowed clause, and
+                                ;; the executor takes its documented default --
+                                ;; the keyed path -- which is the right one when
+                                ;; one binding pins the key.
+                                :input-narrowed? (boolean (some #(contains? input-bindings %) clause))}))
                            (range) where)
              plan (stats/plan-clause-order clauses)]
          {:query (assoc query
@@ -765,7 +787,7 @@
                         ;; then thrown away; the executor was left guessing at
                         ;; something the planner had measured.
                         :clause-cardinality
-                        (into {} (map (juxt :clause :estimated-rows)) plan))
+                        (into {} (comp (remove :input-narrowed?) (map (juxt :clause :estimated-rows))) plan))
           :plan plan
           :optimized? true})
        {:query query

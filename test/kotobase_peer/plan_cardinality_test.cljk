@@ -34,6 +34,31 @@
     (is (= 30 (get hint '[?m "creator" ?p])))
     (is (= 5 (get hint '[?p "role" "author"])))))
 
+(deftest an-input-narrowed-clause-is-withheld-from-the-hint
+  ;; The executor reads the hint as the size of the BROAD relation its hash
+  ;; join would scan. For a clause an `:in` input narrows, the plan's own
+  ;; estimate is the narrowed count -- 0 for a subject with no facts -- and
+  ;; the executor would read 0 as "tiny relation, scan it whole". Measured
+  ;; 2026-09-11 (ayatori iteration 17): LDBC IC08 spent 60 ms hash-joining
+  ;; 86,932 rows to return nothing, against 2 ms when the person had
+  ;; messages. The narrowed clause is therefore absent from the hint; the
+  ;; clauses no input touches keep theirs.
+  (let [query '{:find [?m ?d] :in [?p]
+                :where [[?m "creator" ?p] [?m "date" ?d] [?p "role" "author"]]}
+        plan (eng/datalog-query-plan (db) query everything ["p9"])
+        hint (get-in plan [:query :clause-cardinality])]
+    (is (:optimized? plan))
+    (testing "the narrowed clauses estimate 0 for a subject with no facts"
+      (is (= 0 (:estimated-rows (first (filter #(= '[?m "creator" ?p] (:clause %)) (:plan plan)))))))
+    (testing "and are not in the hint -- both clauses that mention ?p"
+      (is (not (contains? hint '[?m "creator" ?p])))
+      (is (not (contains? hint '[?p "role" "author"]))))
+    (testing "the untouched clause keeps its number"
+      (is (= 30 (get hint '[?m "date" ?d]))))
+    (testing "the answer is still empty, and a bound person still answers"
+      (is (= #{} (eng/query (db) query everything ["p9"])))
+      (is (= 6 (count (eng/query (db) query everything ["p1"])))))))
+
 (deftest an-unoptimized-plan-emits-no-hint
   ;; Queries with functions/negation keep source order and are not estimated,
   ;; so there is nothing to hand over. A hint that is absent leaves the
