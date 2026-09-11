@@ -23,7 +23,7 @@
   substitute them into the probe pattern -- and the order it picks should be
   checked rather than assumed a second time.
 
-  Usage: clojure -M:ic09-diag <ldbc-dynamic-dir> [posts]"
+  Usage: kbb -M:ic09-diag <ldbc-dynamic-dir> [posts]"
   (:require [kotoba.lang.text :as str]
             [kotobase-peer.core :as eng]
             [kotobase-peer.ldbc-snb-bench :as ldbc]

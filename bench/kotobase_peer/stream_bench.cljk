@@ -20,7 +20,7 @@
   Peak co-resident rows are O(fan-in x max(batch, target-rows)) per level,
   independent of total dataset size -- the property the gates measure.
 
-  gate-1M: `clojure -J-Xmx4g -M:stream-bench 1000000` must complete with
+  gate-1M: `kbb -J-Xmx4g -M:stream-bench 1000000` must complete with
   rows conserved. gate-10M: `-J-Xmx8g ... 10000000`."
   (:require [clojure.java.io :as io]
             [ipld.core :as ipld]

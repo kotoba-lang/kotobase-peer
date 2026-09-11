@@ -1,4 +1,4 @@
-#!/usr/bin/env nbb
+#!/usr/bin/env kbb
 ;; bench/ldbc_short_params.cljk — short-read parameters for the SF1 subset.
 ;;
 ;; LDBC's driver derives IS4/IS5/IS7 message ids from complex-read results;
@@ -8,7 +8,7 @@
 ;; spread across the window, and always a message the SUT holds. Writes
 ;; short_message_param.txt (header `messageId`) beside the official files.
 ;;
-;;   nbb bench/ldbc_short_params.cljk <ldbc-dynamic-dir> <params-dir> [posts=35000] [count=99]
+;;   kbb --backend sci bench/ldbc_short_params.cljk <ldbc-dynamic-dir> <params-dir> [posts=35000] [count=99]
 (ns ldbc-short-params
   (:require [clojure.string :as str]
             ["fs" :as fs]

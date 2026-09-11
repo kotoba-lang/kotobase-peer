@@ -306,7 +306,7 @@ ETag-CAS lease; active contenders return `:leased`, expired work is reclaimed,
 and the lease is removed from the committed checkpoint after each bounded
 effect.
 
-Run `clojure -M:merkle-bench 1000 100000 10000000` for the ADR scale sweep;
+Run `kbb -M:merkle-bench 1000 100000 10000000` for the ADR scale sweep;
 `MERKLE_BENCH_WRITERS` selects simulated concurrent flushers (default 32).
 For release evidence, prefer `npm run bench:merkle-scale`, which runs each
 size in an isolated JVM, defaults to one writer and a 2 GiB heap, and enables
@@ -316,7 +316,7 @@ Every result includes flush p50/p95/p99, compaction and total wall time,
 process CPU, sampled peak heap, object counts/bytes, and read/write
 amplification. Missing metrics, lost rows, threshold breaches, or OOM make the
 runner nonzero; a smaller successful tier cannot mask a failed larger tier.
-Run `clojure -M:view-bench 100000 512` for the browser/no-local-disk serving
+Run `kbb -M:view-bench 100000 512` for the browser/no-local-disk serving
 gate. It builds an immutable materialized-view pack, then executes deterministic
 point and bounded-range queries through the same sparse-index selection, byte
 range slicing, block-CID verification, and decode path used by a browser host.
@@ -350,7 +350,7 @@ every returned range is verified against its logical block CID before decode.
 `build-view-delta` appends an epoch pack linked to the previous bundle;
 `query-packed-chain` applies newest-key-wins assertions/retraction tombstones,
 and `compact-packed-chain` deterministically collapses a bounded chain back to
-one base pack. Run `clojure -M:view-delta-bench 10000 1000 512` for this gate.
+one base pack. Run `kbb -M:view-delta-bench 10000 1000 512` for this gate.
 
 Resumable join hosts can encode a large positive-conjunctive Datalog frontier
 with `datalog-materialization/build-frontier-work-chain`. It canonicalizes
@@ -630,7 +630,7 @@ entirely chain's job. Neither library needed to change.
 ## Test
 
 ```bash
-clojure -M:test              # JVM      -- 183 tests / 479 assertions
+kbb -M:test              # JVM      -- 183 tests / 479 assertions
 npm run test:cljs            # cljs     -- 173 tests / 454 assertions (real shadow-cljs build + node, not nbb)
 ```
 

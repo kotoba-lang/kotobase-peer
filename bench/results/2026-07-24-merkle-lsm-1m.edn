@@ -1,7 +1,7 @@
 {:schema 1
  :date "2026-07-24"
  :implementation "kotobase-peer.merkle-lsm-bench"
- :command "clojure -J-Xmx16g -M:merkle-bench 1000000"
+ :command "kbb -J-Xmx16g -M:merkle-bench 1000000"
  :environment
  {:machine "Apple M4, 32GB RAM, macOS (Darwin 25.4.0)"
   :jvm "OpenJDK 21.0.1"
@@ -28,7 +28,7 @@
  :interpretation
  {:scale-gate "ADR-2607211343 P1: is peak RSS sub-linear in datom count? At 100k the compaction harness peaked at ~4.88GB RSS; this 1M run (10x the data) peaked at 6.93GB (1.42x) -- the first direct evidence that RSS scales sub-linearly past 100k. Row conservation held exactly (compacted-count == datoms, harness would have thrown otherwise)."
   :throughput "1,102 rows/s end-to-end at 1M (compaction is 82% of wall time), vs ~372 rows/s reported for the 100k gap-closure harness -- not directly comparable (different harness composition), recorded here for the merkle-lsm-bench harness's own future baselines."
-  :ten-million-status "NOT yet run to completion. A 10M attempt (clojure -J-Xmx20g -M:merkle-bench 10000000) was launched 2026-07-24 and externally terminated early on this shared workstation before producing output. Sub-linear extrapolation suggests ~10GB RSS at 10M, but per ADR-2607211343's own rule this must be MEASURED, not extrapolated -- the 10M gate remains open."
+  :ten-million-status "NOT yet run to completion. A 10M attempt (kbb -J-Xmx20g -M:merkle-bench 10000000) was launched 2026-07-24 and externally terminated early on this shared workstation before producing output. Sub-linear extrapolation suggests ~10GB RSS at 10M, but per ADR-2607211343's own rule this must be MEASURED, not extrapolated -- the 10M gate remains open."
   :caveats ["single machine, in-memory store, no B2/R2 round-trips -- measures engine CPU/memory, not storage latency"
             "writers=32 futures on a shared workstation with concurrent agent sessions; wall-clock times include scheduler contention"
             "flush percentiles are per-1000-row-batch build-run times under 32-way concurrency, not end-user write latencies"]}}

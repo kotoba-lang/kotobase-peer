@@ -1,6 +1,6 @@
-#!/usr/bin/env nbb
-;; Generates shadow-cljs.edn's :source-paths from `clojure -Spath` -- the
-;; same git/sha deps.edn dependencies `clojure -M:test` already resolves,
+#!/usr/bin/env kbb
+;; Generates shadow-cljs.edn's :source-paths from `kbb -Spath` -- the
+;; same git/sha deps.edn dependencies `kbb -M:test` already resolves,
 ;; so the cljs build tests against the exact pinned versions, not a
 ;; hand-duplicated list that can drift. Jar entries (Clojure/core.specs/
 ;; spec.alpha on the JVM classpath) are filtered out; shadow-cljs
@@ -12,7 +12,7 @@
 ;;
 ;; ## Why the string calls here are JS interop and not `kotoba.lang.text`
 ;;
-;; npm invokes this as bare `nbb gen-shadow-cljs-edn.cljk`, with NO classpath --
+;; npm invokes this as bare `kbb --backend sci gen-shadow-cljs-edn.cljk`, with NO classpath --
 ;; because THIS SCRIPT is what computes the classpath. So it cannot require a
 ;; library to do it: the bootstrap is circular. Measured 2026-09-09, requiring
 ;; `kotoba.lang.text` here made `npm run test:cljs` and `npm run build:view-e2e`
@@ -28,7 +28,7 @@
 (def cp-mod (js/require "node:child_process"))
 
 (def cp
-  (.trim (.toString (.execSync cp-mod "clojure -Spath") "utf8")))
+  (.trim (.toString (.execSync cp-mod "kbb -Spath") "utf8")))
 
 (def dirs
   (->> (.split cp ":")
@@ -46,4 +46,4 @@
                      "             :asset-path \"/\"\n"
                      "             :modules {:view-e2e {:init-fn kotobase-peer.browser-view-e2e/run}}}}}\n"))
 
-(println "wrote shadow-cljs.edn with" (count dirs) "source dirs from clojure -Spath")
+(println "wrote shadow-cljs.edn with" (count dirs) "source dirs from kbb -Spath")
