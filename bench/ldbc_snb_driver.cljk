@@ -113,6 +113,33 @@
                              8 {:p1 (nth ps 0) :p2 (nth ps 1) :date (parse-long (nth ps 2))})))))
          (take limit) vec)))
 
+(defn- read-stream
+  "Every event of an LDBC update stream file as {:sim :dep :type :params},
+   in file order (the files are sorted by scheduled time). Types this driver
+   does not send (INS4 forum, INS5 membership) are kept with :params nil so
+   they still advance the completion clock other events depend on."
+  [file]
+  (when-not (fs/existsSync file) (println "REFUSED: update stream missing" file) (js/process.exit 2))
+  (->> (str/split-lines (fs/readFileSync file "utf8"))
+       (keep (fn [l]
+               (when (seq l)
+                 (let [[sim dep ty & ps] (str/split l #"\|")
+                       type (parse-long ty)]
+                   {:sim (parse-long sim) :dep (parse-long dep) :type type
+                    :op (get {1 :ins1 2 :ins2 3 :ins3 6 :ins6 7 :ins7 8 :ins8} type)
+                    :params (case type
+                              1 {:person (nth ps 0) :first (nth ps 1) :last (nth ps 2) :gender (nth ps 3)
+                                 :birthday (parse-long (nth ps 4)) :date (parse-long (nth ps 5)) :ip (nth ps 6) :browser (nth ps 7) :city (nth ps 8)}
+                              2 {:person (nth ps 0) :post (nth ps 1) :date (parse-long (nth ps 2))}
+                              3 {:person (nth ps 0) :comment (nth ps 1) :date (parse-long (nth ps 2))}
+                              6 {:post (nth ps 0) :date (parse-long (nth ps 2)) :content (nth ps 6) :creator (nth ps 8) :forum (nth ps 9)}
+                              7 (let [rp (nth ps 8) rc (nth ps 9)]
+                                  {:comment (nth ps 0) :date (parse-long (nth ps 1)) :content (nth ps 4) :creator (nth ps 6)
+                                   :parent (if (= rp "-1") rc rp)})
+                              8 {:p1 (nth ps 0) :p2 (nth ps 1) :date (parse-long (nth ps 2))}
+                              nil)}))))
+       vec))
+
 (defn- percentile [xs q]
   (if (empty? xs) nil
       (let [s (vec (sort xs))]
@@ -138,18 +165,36 @@
   "One scheduled run at `rate` ops/s for `seconds`. Resolves to the run's
    record. Open loop: dispatch times come from the schedule, not from
    completions; `inflight` bounds concurrency like driver threads would."
-  [{:keys [origin rate seconds inflight ops impl]}]
+  [{:keys [origin rate seconds inflight ops impl stream tcr]}]
   (js/Promise.
    (fn [resolve _]
-     (let [total (long (* rate seconds))
+     (let [reads-total (long (* rate seconds))
            interval (/ 1000.0 rate)
            t0 (+ (now) 50)
+           ;; the interleave (S22, ayatori iteration 32): stream events are
+           ;; scheduled at t0 + (sim - sim0) * tcr wall ms, LDBC's time
+           ;; compression; only those that fall inside the run are taken.
+           ;; An event may START when every event scheduled before its
+           ;; dependency time has COMPLETED (the driver's GCT rule), so a
+           ;; dependency wait is lateness against its schedule, as the
+           ;; certified driver counts it.
+           sim0 (when (seq stream) (:sim (first stream)))
+           events (when stream
+                    (vec (take-while #(< (:wall %) (* 1000.0 seconds))
+                                     (map #(assoc % :wall (* (- (:sim %) sim0) (or tcr 1.0))) stream))))
+           updates-total (count events)
+           total (+ reads-total updates-total)
+           next-u (atom 0)
+           in-flight-sims (atom (sorted-set))
+           last-done-sim (atom (or sim0 0))
+           completed-up-to (fn [] (if (seq @in-flight-sims) (dec (first @in-flight-sims)) @last-done-sim))
            records (atom [])
            in-flight (atom 0)
            next-k (atom 0)
            done (atom 0)
            finish! (fn []
-                     (let [rs @records
+                     (let [rs (remove :skipped @records)   ; events not sent are not operations
+                           skipped (count (filter :skipped @records))
                            t-end (reduce max t0 (map :end rs))
                            delays (map :delay rs)
                            ok (filter #(= 200 (:status %)) rs)
@@ -158,7 +203,10 @@
                            by-op (group-by :op rs)]
                        (resolve
                         {:rate rate :seconds seconds :inflight inflight
-                         :scheduled total :completed (count rs)
+                         :scheduled total :reads-scheduled reads-total :updates-scheduled updates-total
+                         :tcr tcr :completed (count rs)
+                         :reads-completed (count (remove :update rs)) :updates-completed (count (filter :update rs))
+                         :updates-skipped skipped
                          :failed (count failed)
                          :failed-sample (vec (take 3 (map #(select-keys % [:op :status :body]) failed)))
                          :on-time on-time
@@ -174,19 +222,8 @@
                                                 [op (stats (mapv :latency rs))]))
                          :server-ms (into {} (for [[op rs] by-op]
                                                [op (stats (mapv #(or (:server-ms %) 0) rs))]))})))
-           dispatch! (fn dispatch! []
-                       ;; start every op whose scheduled time has come, while a slot is free
-                       (loop []
-                         (let [k @next-k]
-                           (when (and (< k total) (< @in-flight inflight))
-                             (let [sched (+ t0 (* k interval))
-                                   t (now)]
-                               (when (>= t sched)
-                                 (swap! next-k inc)
-                                 (swap! in-flight inc)
-                                 (let [{:keys [op params update?]} (nth ops (mod k (count ops)))
-                                       p (nth params (mod (quot k (count ops)) (count params)))
-                                       start (now)]
+           launch! (fn launch! [op p update? sched sim finish-one]
+                     (let [start (now)]
                                    (-> (if update?
                                          (fetch-edn origin "/ldbc/update" (assoc p :op op))
                                          (fetch-edn origin "/ldbc/ic" (assoc p :op op :impl (or impl :datalog))))
@@ -213,16 +250,53 @@
                                                          :delay (- start sched) :latency (- (now) start)
                                                          :status 599 :body (str e)})))
                                        (.finally (fn []
+                                                   (when sim
+                                                     (swap! in-flight-sims disj sim)
+                                                     (swap! last-done-sim max sim))
                                                    (swap! in-flight dec)
                                                    (swap! done inc)
-                                                   (if (= @done total) (finish!) (dispatch!))))))
-                                 (recur)))))))
+                                                   (finish-one))))))
+           dispatch! (fn dispatch! []
+                       ;; start every op whose scheduled time has come, while a slot is
+                       ;; free: the next stream event when it is due AND its dependency is
+                       ;; complete, else the next read when it is due
+                       (loop []
+                         (let [t (now)
+                               k @next-k
+                               u @next-u
+                               ev (when (< u updates-total) (nth events u))
+                               ev-due? (and ev (>= t (+ t0 (:wall ev))) (<= (:dep ev) (completed-up-to)))
+                               k-due? (and (< k reads-total) (>= t (+ t0 (* k interval))))]
+                           (when (< @in-flight inflight)
+                             (cond
+                               ev-due?
+                               (do (swap! next-u inc)
+                                   (if (nil? (:params ev))
+                                     ;; a type this driver does not send: completes at once
+                                     (do (swap! last-done-sim max (:sim ev))
+                                         (swap! records conj {:op (or (:op ev) :ins-other) :update {:skipped true} :skipped true
+                                                              :scheduled (+ t0 (:wall ev)) :start t :end t :delay (- t (+ t0 (:wall ev))) :latency 0 :status 200 :n 0})
+                                         (swap! done inc)
+                                         (when (= @done total) (finish!))
+                                         (recur))
+                                     (do (swap! in-flight inc)
+                                         (swap! in-flight-sims conj (:sim ev))
+                                         (launch! (:op ev) (:params ev) true (+ t0 (:wall ev)) (:sim ev)
+                                                  (fn [] (if (= @done total) (finish!) (dispatch!))))
+                                         (recur))))
+                               k-due?
+                               (let [sched (+ t0 (* k interval))
+                                     {:keys [op params update?]} (nth ops (mod k (count ops)))
+                                     p (nth params (mod (quot k (count ops)) (count params)))]
+                                 (swap! next-k inc)
+                                 (swap! in-flight inc)
+                                 (launch! op p update? sched nil (fn [] (if (= @done total) (finish!) (dispatch!))))
+                                 (recur))
+                               :else nil)))))
            tick (fn tick []
                   (dispatch!)
-                  (when (< @next-k total)
-                    (let [sched (+ t0 (* @next-k interval))
-                          wait (max 0 (- sched (now)))]
-                      (js/setTimeout tick (min wait 5)))))]
+                  (when (or (< @next-k reads-total) (< @next-u updates-total))
+                    (js/setTimeout tick 2)))]
        (js/setTimeout tick 0)))))
 
 (defn -main [& args]
@@ -240,6 +314,9 @@
         param-file {"ic02" 2 "ic07" 7 "ic08" 8 "ic09" 9 "is1" 7 "is2" 7 "is3" 7 "is4" :message "is5" :message "is6" :message "is7" :message}
         updates (arg args "--updates" nil)
         person-updates (arg args "--person-updates" nil)
+        tcr (some-> (arg args "--tcr" nil) parse-double)
+        stream (when tcr
+                 (vec (sort-by :sim (concat (read-stream updates) (when person-updates (read-stream person-updates))))))
         update-type {"ins1" 1 "ins2" 2 "ins3" 3 "ins6" 6 "ins7" 7 "ins8" 8}
         ops (mapv (fn [op] (if-let [ty (update-type op)]
                              {:op (keyword op) :update? true
@@ -286,7 +363,7 @@
                              (if (empty? remaining)
                                (js/Promise.resolve acc)
                                (-> (run-rate! {:origin origin :rate (first remaining) :seconds seconds
-                                               :inflight inflight :ops ops :impl impl})
+                                               :inflight inflight :ops ops :impl impl :stream stream :tcr tcr})
                                    (.then (fn [r]
                                             (let [l (:latency-ms r)
                                                   p50 (fn [op] (or (some-> (get-in l [op :p50]) (.toFixed 1)) "-"))
@@ -305,7 +382,9 @@
                                                             "  " (.padStart (p50 :ic07) 8)
                                                             "  " (.padStart (p50 :ic08) 8)
                                                             "  " (.padStart (p50 :ic09) 8)
-                                                            extra)))
+                                                            extra
+                                                            (when tcr (str "  | stream " (:updates-completed r) " upd sent = "
+                                                                           (.toFixed (/ (:updates-completed r) seconds) 0) "/s (" (:updates-skipped r) " INS4/5 skipped)")))))
                                             (let [pass (and (zero? (:failed r)) (>= (:on-time-pct r) 95.0))
                                                   acc (conj acc (assoc r :pass pass))]
                                               (if pass (go (rest remaining) acc) (js/Promise.resolve acc))))))))]
@@ -314,7 +393,7 @@
                                   ;; read-after-write: the last inserts of every run must be
                                   ;; visible to the reads that cover them (INS8 -> IS3 lists the
                                   ;; new friend; INS2 -> IC07 on the post's creator lists the liker)
-                                  (let [all-samples (mapcat (fn [r] (mapcat (fn [[op us]] (map #(assoc % :op op) us)) (:updates-sample r))) runs)
+                                  (let [all-samples (remove :skipped (mapcat (fn [r] (mapcat (fn [[op us]] (map #(assoc % :op op) us)) (:updates-sample r))) runs))
                                         ;; an INS2 whose post this SUT does not hold (a subset
                                         ;; rung) has no creator to read IC07 for: the write landed
                                         ;; (the SUT said so) but no served read covers it. Counted

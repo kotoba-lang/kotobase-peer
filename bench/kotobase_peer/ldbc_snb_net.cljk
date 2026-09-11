@@ -61,6 +61,13 @@
   "Heap used (JVM), RSS (ps), host swap (macOS sysctl; nil elsewhere). RSS far
   below heap-used is the paged-out signature iteration 14 found."
   []
+  ;; used heap is read AFTER a collection so it is the live set: garbage
+  ;; pages the host has compressed (macOS compresses idle pages proactively;
+  ;; levi held 250k pages in its compressor with 8 GB free) made RSS fall
+  ;; below a garbage-inflated used heap and refused a resident SUT
+  ;; (iteration 32). Live objects are touched by the collector and are
+  ;; resident when it returns; RSS against live heap is the real test.
+  (System/gc)
   (let [rt (Runtime/getRuntime)
         pid (str (.pid (java.lang.ProcessHandle/current)))
         rss-kb (some-> (sh "ps" "-o" "rss=" "-p" pid) parse-long)
