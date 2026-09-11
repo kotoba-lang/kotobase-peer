@@ -181,47 +181,43 @@
   latency depends on. Stated, not hidden: no crypto and no persistence in
   THIS number."
   [{:keys [persons knows messages creator reply-of likes profiles city forums]}]
-  (let [quads (transient [])
-        add! (fn [s p o] (conj! quads {:s s :p p :o o}))]
-    (doseq [[id [fname lname]] persons]
-      (add! id "person/firstName" fname)
-      (add! id "person/lastName" lname))
-    (doseq [[id {:keys [gender birthday creationDate locationIP browserUsed]}] profiles]
-      (add! id "person/gender" gender)
-      (add! id "person/birthday" (str birthday))
-      (add! id "person/creationDate" (str creationDate))
-      (add! id "person/locationIP" locationIP)
-      (add! id "person/browserUsed" browserUsed))
-    (doseq [[p place] city] (add! p "person/city" place))
-    (doseq [[a b cd] knows]                   ; undirected -> both directions
-      (add! a "knows" b)
-      (add! b "knows" a)
-      ;; the friendship date, reified per direction (no edge properties):
-      ;; 3 datoms x 2 directions per edge -- the data-model cost IS3 pays,
-      ;; stated like `likes` below
-      (doseq [[x y] [[a b] [b a]]]
-        (let [kid (str "kn:" x ":" y)]
-          (add! kid "knows/person" x)
-          (add! kid "knows/friend" y)
-          (add! kid "knows/creationDate" (str cd)))))
-    (doseq [[post f] (:post->forum forums)] (add! post "post/forum" f))
-    (doseq [[f {:keys [title creationDate moderator]}] (:forums forums)]
-      (add! f "forum/title" title)
-      (add! f "forum/creationDate" (str creationDate))
-      (when moderator (add! f "forum/moderator" moderator)))
-    (doseq [[id [cd content]] messages]
-      (add! id "message/creationDate" (str cd))
-      (add! id "message/content" (or content "")))
-    (doseq [[m p] creator] (add! m "hasCreator" p))
-    (doseq [[c parent] reply-of] (add! c "replyOf" parent))
-    (doseq [[p m cd] likes]                   ; reified: no edge properties
-      (let [lid (str "like:" p ":" m)]
-        (add! lid "like/person" p)
-        (add! lid "like/message" m)
-        (add! lid "like/creationDate" (str cd))))
-    (let [qs (persistent! quads)]
-      {:db (eng/transact (eng/empty-db) qs)
-       :quads (count qs)})))
+  (let [q (fn [s p o] {:s s :p p :o o})
+        ;; a LAZY seq of quads, transacted in batches: one transact over 20M
+        ;; quads (full SF1) held every quad map and every effective delta at
+        ;; once and ran a 13 GB heap out (ayatori iteration 25); 250k per
+        ;; batch bounds both, and the db value accumulates across batches
+        quads (concat
+               (for [[id [fname lname]] persons
+                     x [(q id "person/firstName" fname) (q id "person/lastName" lname)]] x)
+               (for [[id {:keys [gender birthday creationDate locationIP browserUsed]}] profiles
+                     x [(q id "person/gender" gender) (q id "person/birthday" (str birthday))
+                        (q id "person/creationDate" (str creationDate)) (q id "person/locationIP" locationIP)
+                        (q id "person/browserUsed" browserUsed)]] x)
+               (for [[p place] city] (q p "person/city" place))
+               ;; undirected -> both directions; the friendship date reified per
+               ;; direction (no edge properties): 3 datoms x 2 -- the data-model
+               ;; cost IS3 pays, stated like `likes` below
+               (for [[a b cd] knows
+                     x (concat [(q a "knows" b) (q b "knows" a)]
+                               (for [[x y] [[a b] [b a]]
+                                     :let [kid (str "kn:" x ":" y)]
+                                     z [(q kid "knows/person" x) (q kid "knows/friend" y) (q kid "knows/creationDate" (str cd))]] z))] x)
+               (for [[post f] (:post->forum forums)] (q post "post/forum" f))
+               (for [[f {:keys [title creationDate moderator]}] (:forums forums)
+                     x (cond-> [(q f "forum/title" title) (q f "forum/creationDate" (str creationDate))]
+                         moderator (conj (q f "forum/moderator" moderator)))] x)
+               (for [[id [cd content]] messages
+                     x [(q id "message/creationDate" (str cd)) (q id "message/content" (or content ""))]] x)
+               (for [[m p] creator] (q m "hasCreator" p))
+               (for [[c parent] reply-of] (q c "replyOf" parent))
+               (for [[p m cd] likes                 ; reified: no edge properties
+                     :let [lid (str "like:" p ":" m)]
+                     x [(q lid "like/person" p) (q lid "like/message" m) (q lid "like/creationDate" (str cd))]] x))
+        result (reduce (fn [{:keys [db n]} batch]
+                         {:db (eng/transact db batch) :n (+ n (count batch))})
+                       {:db (eng/empty-db) :n 0}
+                       (partition-all 250000 quads))]
+    {:db (:db result) :quads (:n result)}))
 
 (def ^:private everything (constantly true))
 
@@ -266,16 +262,21 @@
                                [?msg "hasCreator" ?x]
                                [?msg "message/creationDate" ?date]]
                           person max-date)
-        ;; the two-hop half may reach the start person and messages the
-        ;; one-hop half already has; the union's top 20 is a subset of the
-        ;; union of the two top-20s, so limiting each is exact
+        ;; the two-hop half reaches the start person (a friend's friend is
+        ;; you); the exclusion is INSIDE the query so the limit is taken
+        ;; after it. Iteration 18 excluded afterwards, which cut rows the
+        ;; answer needed whenever the start person's own messages sat in the
+        ;; two-hop top 20 -- never on the subset (every official IC09 was
+        ;; empty there), caught by the startup gate on full SF1 (iteration
+        ;; 25, one parameter). The union's top 20 is a subset of the union of
+        ;; the two top-20s, so limiting each is exact once both are filtered.
         two (top20-before db '[[?person "knows" ?f1]
                                [?f1 "knows" ?x]
+                               [(not= ?x ?person)]
                                [?msg "hasCreator" ?x]
                                [?msg "message/creationDate" ?date]]
                           person max-date)]
     (->> (into one two)
-         (remove (fn [[f _ _]] (= f person)))
          distinct
          (sort-by (juxt (comp - #(nth % 2)) second))
          (take 20) vec)))

@@ -28,7 +28,7 @@
         ;; value index with the independent half of the join run once
         ;; (iteration 19). main is .cljk from 8645651 on, so this classpath
         ;; loads only through scripts/cljk-classpath.cljk.
-        io.github.kotoba-lang/datalog {:git/sha "77197339ec2659f06323669b640b55d2ae511efd"}
+        io.github.kotoba-lang/datalog {:git/sha "f059e215403f35db73c409482d84b95af53d2c10"}
        ;; formerly two deps here (kqe + quad-store) -- kqe merged into
         ;; arrangement (ADR-2607050700), so this is the one coordinate now.
         io.github.kotoba-lang/arrangement {:git/sha "9c9f45d4cd043873cd5c5ea65fa3af8a8ead5e6d"}
