@@ -294,43 +294,36 @@
          (sort-by (juxt (comp - #(nth % 2)) second))
          (take 20) vec)))
 
-(defn- ic05-pairs
-  "Distinct [forum post] pairs: a reached person ?x, a membership of ?x
-  joined after min-date, its forum ?f, and a post by ?x in ?f. Written so
-  the engine's composite lookups take both halves (datalog, ayatori
-  iteration 45): `[?mb membership/person ?x]` + the joinDate range is one
-  cut of ?x's memberships in join-date order, and `[?post hasCreator ?x]`
-  + `[?post post/forum ?f]` is one lookup of ?x's posts under ?f -- the
-  ~300 posts of every reached person are never walked. `[(not= ?x
-  ?person)]` is true for the one-hop reach too and keeps the planner from
-  reordering the pairs apart (a function clause pins source order)."
-  [db where person min-date]
-  (eng/query db
-             {:find '[?f ?post]
-              :in '[?person]
-              :where (into where
-                           [['?mb "membership/person" '?x]
-                            ['?mb "membership/joinDate" '?d]
-                            [(list '> '?d (str min-date))]
-                            ['?mb "membership/forum" '?f]
-                            ['?post "hasCreator" '?x]
-                            ['?post "post/forum" '?f]])}
-             everything [person]))
-
 (defn- kb-ic05
   "IC05: the forums the start person's friends and friends-of-friends joined
   after min-date, with the count of posts in each forum by those persons --
-  top 20 by count desc, forum id asc. Two reaches unioned as [forum post]
-  pairs (a post by a person who is both a friend and a friend-of-friend
-  counts once), then counted per forum."
+  top 20 by count desc, forum id asc.
+
+  ONE query with the count in `:find` (ayatori iteration 47): the reach is
+  an `or-join` on [?person ?x] (a person who is both a friend and a
+  friend-of-friend is one ?x), the membership cut and the (creator, forum)
+  posts are the engine's composite lookups, and `(count ?post)` is pushed
+  into the last composite -- one weighted binding per (person, forum)
+  instead of one binding per post. Iteration 45 materialized ~200k
+  (forum, post) pairs per mid-timeline parameter to produce 20 counts."
   [db person min-date]
-  (let [one (ic05-pairs db '[[?person "knows" ?x] [(not= ?x ?person)]] person min-date)
-        two (ic05-pairs db '[[?person "knows" ?f1] [?f1 "knows" ?x] [(not= ?x ?person)]] person min-date)]
-    (->> (into one two)
-         (reduce (fn [m [f _]] (update m f (fnil inc 0))) {})
-         (sort-by (juxt (comp - val) key))
-         (take 20)
-         (mapv (fn [[f n]] [f n])))))
+  (->> (eng/query db
+                  {:find '[?f (count ?post)]
+                   :in '[?person]
+                   :where [(list 'or-join '[?person ?x]
+                                 '[?person "knows" ?x]
+                                 (list 'and '[?person "knows" ?f1] '[?f1 "knows" ?x]))
+                           '[(not= ?x ?person)]
+                           '[?mb "membership/person" ?x]
+                           '[?mb "membership/joinDate" ?d]
+                           [(list '> '?d (str min-date))]
+                           '[?mb "membership/forum" ?f]
+                           '[?post "hasCreator" ?x]
+                           '[?post "post/forum" ?f]]}
+                  everything [person])
+       (sort-by (juxt (comp - second) first))
+       (take 20)
+       (mapv (fn [[f n]] [f n]))))
 
 (defn- kb-ic07
   "IC07: the 20 most recent likes on the start person's Messages, one row per
