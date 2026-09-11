@@ -59,28 +59,26 @@
       (is (= #{} (eng/query (db) query everything ["p9"])))
       (is (= 6 (count (eng/query (db) query everything ["p1"])))))))
 
-(deftest the-relation-size-is-cached-per-index-version-and-never-stale
-  ;; The whole-relation estimate is the planner's cost (9 ms of a 9 ms IC08,
-  ;; measured 2026-09-11); it is cached by identity of the attribute's :aevt
-  ;; inner map. The cache must be exact across versions: a transaction that
-  ;; touches the attribute must be seen, one that does not must hit.
+(deftest the-relation-size-is-the-subject-count-and-costs-nothing-under-writes
+  ;; The whole-relation estimate used to be an exact datom count cached by
+  ;; identity of the attribute's :aevt inner map; under a write stream that
+  ;; cache recounted the whole relation on nearly every plan (iteration 36:
+  ;; 2-3M buckets, 80-100 ms p95 on the full SF1). It is now the number of
+  ;; subjects holding the attribute -- O(1), no cache, nothing to go stale.
   (let [d1 (db)
         query '{:find [?m ?d] :where [[?m "creator" ?p] [?m "date" ?d]]}
-        est (fn [d] (get-in (eng/datalog-query-plan d query everything) [:query :clause-cardinality '[?m "creator" ?p]]))
-        _ (est d1)
-        entry-after-first (get @@#'eng/relation-size-cache "creator")]
+        est (fn [d] (get-in (eng/datalog-query-plan d query everything) [:query :clause-cardinality '[?m "creator" ?p]]))]
     (is (= 30 (est d1)))
-    (testing "a second plan on the same db hits the same entry"
-      (est d1)
-      (is (identical? entry-after-first (get @@#'eng/relation-size-cache "creator"))))
-    (testing "a transaction on another attribute keeps the hit"
-      (let [d2 (eng/transact d1 [{:s "p0" :p "role" :o "editor"}])]
-        (is (= 30 (est d2)))
-        (is (identical? entry-after-first (get @@#'eng/relation-size-cache "creator")))))
-    (testing "a transaction on the attribute is seen: the count moves and the entry is replaced"
+    (testing "a transaction on the attribute moves the number with no cache to invalidate"
       (let [d3 (eng/transact d1 [{:s "m99" :p "creator" :o "p0"}])]
         (is (= 31 (est d3)))
-        (is (not (identical? entry-after-first (get @@#'eng/relation-size-cache "creator"))))))))
+        (is (= 30 (est d1)) "the older db value still answers for itself")))
+    (testing "subjects, not datoms: a second value on an existing subject does not move it"
+      (let [d4 (eng/transact d1 [{:s "m1" :p "creator" :o "p0"}])]
+        (is (= 30 (est d4)))))
+    (testing "control: the count is taken from the attribute asked for, not any other"
+      (is (not= (est d1) (get-in (eng/datalog-query-plan d1 '{:find [?p] :where [[?p "role" ?r]]} everything)
+                                 [:query :clause-cardinality '[?p "role" ?r]]))))))
 
 (deftest an-unoptimized-plan-emits-no-hint
   ;; Queries with functions/negation keep source order and are not estimated,

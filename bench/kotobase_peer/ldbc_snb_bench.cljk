@@ -284,25 +284,38 @@
 
 (defn- kb-ic07
   "IC07: the 20 most recent likes on the start person's Messages, one row per
-  liker (their latest like)."
+  liker (their latest like), like date desc then liker asc.
+
+  The top-N is written INTO the query (ayatori iteration 36) so the grouped
+  drive answers it: the driver is like/creationDate, the group is
+  `[?like like/message ?msg]` over the person's messages, and the drive
+  merges those groups' like orders instead of joining every like. One row
+  per liker is not a query clause, so N starts at 20 and doubles while the
+  N rows returned hold fewer than 20 distinct likers AND the query was not
+  exhausted (fewer than N rows back means there are no more)."
   [db person]
-  (->> (eng/query db
-                  '{:find [?liker ?msg ?date]
-                    :in [?person]
-                    :where [[?msg "hasCreator" ?person]
-                            [?like "like/message" ?msg]
-                            [?like "like/person" ?liker]
-                            [?like "like/creationDate" ?date]]}
-                  everything [person])
-       (map (fn [[l m d]] [l m (parse-long d)]))
-       (group-by first)
-       (map (fn [[_ ls]] (first (sort-by (comp - #(nth % 2)) ls))))
-       (sort-by (juxt (comp - #(nth % 2)) first))
-       (take 20) vec))
+  (loop [n 20]
+    (let [rows (eng/query db
+                          {:find '[?liker ?msg ?date]
+                           :in '[?person]
+                           :where '[[?msg "hasCreator" ?person]
+                                    [?like "like/message" ?msg]
+                                    [?like "like/person" ?liker]
+                                    [?like "like/creationDate" ?date]]
+                           :order-by '[[?date :desc] [?liker :asc]]
+                           :limit n}
+                          everything [person])
+          per-liker (reduce (fn [acc [l m d]] (if (some #(= l (first %)) acc) acc (conj acc [l m (parse-long d)])))
+                            [] rows)]
+      (if (or (>= (count per-liker) 20) (< (count rows) n))
+        (vec (take 20 per-liker))
+        (recur (* 2 n))))))
 
 (defn- kb-ic08
   "IC08: the 20 most recent Comments that are direct replies to the start
-  person's Messages."
+  person's Messages, date desc then reply id asc. Top-20 inside the query
+  (ayatori iteration 36): the driver is the reply's creationDate, the group
+  is `[?reply replyOf ?msg]` over the person's messages."
   [db person]
   (->> (eng/query db
                   '{:find [?author ?reply ?date]
@@ -310,11 +323,11 @@
                     :where [[?msg "hasCreator" ?person]
                             [?reply "replyOf" ?msg]
                             [?reply "hasCreator" ?author]
-                            [?reply "message/creationDate" ?date]]}
+                            [?reply "message/creationDate" ?date]]
+                    :order-by [[?date :desc] [?reply :asc]]
+                    :limit 20}
                   everything [person])
-       (map (fn [[a r d]] [a r (parse-long d)]))
-       (sort-by (juxt (comp - #(nth % 2)) second))
-       (take 20) vec))
+       (mapv (fn [[a r d]] [a r (parse-long d)]))))
 
 ;; ── kotobase side, index path ──────────────────────────────────────────────
 ;; The same four reads written against the datom plane's index access paths

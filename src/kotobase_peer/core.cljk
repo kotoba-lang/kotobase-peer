@@ -690,31 +690,27 @@
                 (or (get statistic "rows") (:rows statistic))))
             clauses))))
 
-(def ^:private relation-size-cache
-  "attr -> {:index <the :aevt inner map the count was taken from> :n count}.
-  The planner estimates every clause of every query, and for a clause with
-  nothing bound but the attribute the estimate is the whole relation's size:
-  a reduce over every subject bucket of `(get (:aevt db) attr)`. Measured
-  2026-09-11 on simeon (ayatori iteration 20, LDBC SF1 subset, 810k quads):
-  replyOf 2.9 ms, hasCreator 4.6 ms, creationDate 0.7 ms -- 9.2 ms of
-  planning for an IC08 whose execution then took under a millisecond. The
-  inner map is an immutable value that a transaction touching the attribute
-  replaces and one not touching it keeps, so IDENTITY of that map is the
-  version: a hit is exact, a miss recounts. One entry per attribute."
-  (atom {}))
-
 (defn- relation-size
-  "`kqe/estimate-cardinality` for `[nil attr nil]`, cached per (attr, version
-  of the attribute's index). Every other pattern shape is a point lookup or a
-  single bucket and is not cached."
+  "The planner's estimate for `[nil attr nil]`: the number of SUBJECTS
+  holding `attr` -- `(count (get (:aevt db) attr))`, O(1) on the persistent
+  map -- not the number of datoms.
+
+  It used to be the exact datom count, cached per (attr, identity of the
+  attribute's `:aevt` inner map) so a plan did not pay a reduce over every
+  bucket (ayatori iteration 20: 9.2 ms of planning for a sub-millisecond
+  IC08). Under writes that cache is a storm: every insert touching the
+  attribute replaces the inner map, so the next plan recounts the whole
+  relation -- on the full SF1 that is 2-3M buckets, 80-100 ms, and it
+  showed as p95 spikes on exactly the reads whose queries carry an
+  all-open clause on an attribute the stream writes (IC08 and IS7 on
+  replyOf, IS2 on creationDate/content) while IC02, whose creationDate
+  clause is a fused range and not this shape, stayed at 0.6 ms (iteration
+  36, 2026-09-11). Subjects instead of datoms: identical for a
+  cardinality-one attribute, a lower bound for a multi-valued one, and the
+  only consumer is clause ORDERING plus a keep-the-keyed-path hint whose
+  threshold is single digits -- neither is moved by the difference."
   [db attr]
-  (let [inner (get (:aevt db) attr)
-        hit (get @relation-size-cache attr)]
-    (if (and hit (identical? (:index hit) inner))
-      (:n hit)
-      (let [n (kqe/estimate-cardinality db [nil attr nil])]
-        (swap! relation-size-cache assoc attr {:index inner :n n})
-        n))))
+  (count (get (:aevt db) attr {})))
 
 (defn datalog-query-plan
   "Compile a safe cost-ordered plan for a plain conjunctive Datalog query.
