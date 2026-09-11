@@ -205,10 +205,19 @@
 
             (and (= method "POST") (= path "/ldbc/ic"))
             (let [req (edn/read-string (read-body ex))
-                  t0 (System/nanoTime)
-                  rows (answer @db-ref max-date index-ok? req)
-                  ms (/ (- (System/nanoTime) t0) 1e6)]
-              (respond! ex 200 (pr-str {:rows rows :n (count rows) :server-ms ms})))
+                  ;; S31 (ayatori iteration 40): `:repeat n` answers the same
+                  ;; request n times in this thread and reports every time, so a
+                  ;; served-vs-in-process gap can be split into per-request
+                  ;; overhead and steady-state cost without a second JVM
+                  n (max 1 (or (:repeat req) 1))
+                  db @db-ref
+                  timings (mapv (fn [_] (let [t0 (System/nanoTime)
+                                              rows (answer db max-date index-ok? req)]
+                                          [(/ (- (System/nanoTime) t0) 1e6) rows]))
+                                (range n))
+                  [ms rows] (peek timings)]
+              (respond! ex 200 (pr-str (cond-> {:rows rows :n (count rows) :server-ms ms}
+                                         (> n 1) (assoc :repeat-ms (mapv first timings))))))
 
             ;; M2, first step (ayatori iteration 30): the SUT transacts. One
             ;; atom holds the db value; `swap!` with `eng/transact` is the
