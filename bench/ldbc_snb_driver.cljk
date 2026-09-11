@@ -197,20 +197,31 @@
         mem (host-memory)
         param-file {"ic02" 2 "ic07" 7 "ic08" 8 "ic09" 9}
         ops (mapv (fn [op] {:op (keyword op) :params (read-params pdir (param-file op))}) mix)]
-    ;; A SUT that is paged out answers the benchmark's question about the
-    ;; host, not the engine. Refuse before measuring, and say which number.
-    (when (and (:swap-used-pct mem) (> (:swap-used-pct mem) max-swap-pct))
-      (println "REFUSED: host swap" (.toFixed (:swap-used-pct mem) 1) "% used exceeds --max-swap-pct" max-swap-pct
-               "-- a served number here measures paging, not the engine (iteration 14)")
-      (js/process.exit 2))
     (-> (fetch-edn origin "/ldbc/meta" nil)
         (.then (fn [{:keys [status body]}]
                  (when-not (= 200 status)
                    (println "REFUSED: server not ready" status body) (js/process.exit 2))
-                 (let [meta (edn/read-string body)]
+                 (let [meta (edn/read-string body)
+                       ;; A SUT that is paged out answers the benchmark's question
+                       ;; about the host, not the engine. The SUT's own reading wins
+                       ;; when it has one (cross-host); the driver's host is the
+                       ;; fallback. Refuse before measuring, and say which number.
+                       sut-mem (:host-memory meta)
+                       judged (if (map? sut-mem) [:sut sut-mem] [:driver-host mem])
+                       [who m] judged]
+                   (when (and (:swap-used-pct m) (> (:swap-used-pct m) max-swap-pct))
+                     (println "REFUSED:" (name who) "swap" (.toFixed (:swap-used-pct m) 1) "% used exceeds --max-swap-pct" max-swap-pct
+                              "-- a served number here measures paging, not the engine (iteration 14)")
+                     (js/process.exit 2))
+                   (when (and (:rss-mb sut-mem) (:heap-used-mb sut-mem) (pos? (:heap-used-mb sut-mem))
+                              (< (:rss-mb sut-mem) (* 0.5 (:heap-used-mb sut-mem))))
+                     (println "REFUSED: SUT rss" (:rss-mb sut-mem) "MB is below half its used heap" (:heap-used-mb sut-mem)
+                              "MB -- the SUT is paged out (iteration 14)")
+                     (js/process.exit 2))
                    (println "SUT" (pr-str (select-keys meta [:elements :quads :threads :subset-rule])))
                    (println "load" (pr-str (mapv #(.toFixed % 2) (os/loadavg)))
-                            "swap-used%" (some-> (:swap-used-pct mem) (.toFixed 1)) "origin" origin
+                            "swap-used%" (str (name who) "=" (some-> (:swap-used-pct m) (.toFixed 1)))
+                            "sut-rss/heap-mb" (str (:rss-mb sut-mem) "/" (:heap-used-mb sut-mem)) "origin" origin
                             "mix" (pr-str mix) "inflight" inflight "seconds" seconds)
                    (println)
                    (println "  rate  sched  done  fail  on-time%  thru/s  delay-p95  empty  rows  ic02-p50  ic07-p50  ic08-p50  ic09-p50")
@@ -251,7 +262,8 @@
                                                           :rule "95% of operations start within 1 s of schedule; zero failed operations"
                                                           :params "official substitution_parameters-sf1 interactive_{2,7,8,9}_param.txt, cycled"
                                                           :load-avg (mapv #(.toFixed % 2) (os/loadavg))
-                                                          :host-memory mem :max-swap-pct max-swap-pct}
+                                                          :driver-host-memory mem :sut-host-memory sut-mem
+                                                          :judged-by who :max-swap-pct max-swap-pct}
                                                  :runs runs
                                                  :throughput-ops-s (when best (:throughput best))
                                                  :highest-passing-rate (when best (:rate best))

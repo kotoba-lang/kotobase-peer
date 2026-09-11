@@ -30,13 +30,48 @@
   200 with an empty vector -- an empty answer and a failed answer must not
   look alike to the driver (the join-hazard lesson, root ADR-2609109900).
 
-  Usage: clojure -M:ldbc-snb-net <ldbc-dynamic-dir> [posts] [port] [threads]"
+  The SUT reports its OWN residency in /ldbc/meta (:host-memory: JVM heap
+  used, process RSS, host swap). Iteration 14 measured the same query at
+  1.9 ms in-process and 96-310 ms served because the serving JVM was paged
+  out; the driver could only see its own host. With the SUT saying what it
+  looks like, the driver refuses on the SUT's swap, not the driver's, and a
+  cross-host run is judged by the right machine.
+
+  Usage: clojure -M:ldbc-snb-net <ldbc-dynamic-dir> [posts] [port] [threads] [bind-host]"
   (:require [kotobase-peer.ldbc-snb-bench :as ldbc]
-            [clojure.edn :as edn])
+            [clojure.edn :as edn]
+            [clojure.string])
   (:import [com.sun.net.httpserver HttpServer HttpHandler HttpExchange]
            [java.net InetSocketAddress]
            [java.util.concurrent Executors]
            [java.nio.charset StandardCharsets]))
+
+(defn- sh [& args]
+  (try (let [p (.start (ProcessBuilder. ^java.util.List (vec args)))
+             out (slurp (.getInputStream p))]
+         (.waitFor p) (clojure.string/trim out))
+       (catch Throwable _ nil)))
+
+(defn- host-memory
+  "Heap used (JVM), RSS (ps), host swap (macOS sysctl; nil elsewhere). RSS far
+  below heap-used is the paged-out signature iteration 14 found."
+  []
+  (let [rt (Runtime/getRuntime)
+        pid (str (.pid (java.lang.ProcessHandle/current)))
+        rss-kb (some-> (sh "ps" "-o" "rss=" "-p" pid) parse-long)
+        swap (sh "sysctl" "-n" "vm.swapusage")
+        num (fn [k] (some->> swap (re-find (re-pattern (str k " = ([0-9.]+)M"))) second parse-double))
+        st (num "total") su (num "used")]
+    {:heap-used-mb (quot (- (.totalMemory rt) (.freeMemory rt)) 1048576)
+     :heap-max-mb (quot (.maxMemory rt) 1048576)
+     :rss-mb (when rss-kb (quot rss-kb 1024))
+     :swap-total-mib st :swap-used-mib su
+     ;; no swap file at all is 0% used, not unknown -- a host with swap off
+     ;; must not fall through to the driver's own reading
+     :swap-used-pct (cond (and st su (pos? st)) (* 100.0 (/ su st))
+                          (and st (zero? st)) 0.0
+                          :else nil)
+     :host (sh "hostname")}))
 
 (defn- respond! [^HttpExchange ex status ^String body]
   (let [bytes (.getBytes body StandardCharsets/UTF_8)]
@@ -69,7 +104,7 @@
               method (.getRequestMethod ex)]
           (cond
             (and (= method "GET") (= path "/ldbc/meta"))
-            (respond! ex 200 (pr-str meta))
+            (respond! ex 200 (pr-str (assoc meta :host-memory (host-memory))))
 
             (and (= method "POST") (= path "/ldbc/ic"))
             (let [req (edn/read-string (read-body ex))
@@ -92,6 +127,7 @@
         n-posts (parse-long (or (second args) "35000"))
         port (parse-long (or (nth args 2 nil) "8090"))
         threads (parse-long (or (nth args 3 nil) "8"))
+        bind-host (or (nth args 4 nil) "127.0.0.1")
         t0 (System/nanoTime)
         data (#'ldbc/load-subset dir n-posts)
         load-ms (/ (- (System/nanoTime) t0) 1e6)
@@ -120,7 +156,7 @@
               :build-ms build-ms
               :threads threads
               :warm-persons (#'ldbc/pick-persons data 5)}
-        server (HttpServer/create (InetSocketAddress. "127.0.0.1" (int port)) 0)]
+        server (HttpServer/create (InetSocketAddress. ^String bind-host (int port)) 0)]
     ;; warm the engine on the same five high-degree persons the in-JVM
     ;; harness warms on, so the first scheduled operation is not a JIT sample
     (doseq [p (:warm-persons meta)]
@@ -129,6 +165,6 @@
     (.createContext server "/" (handler meta db max-date))
     (.setExecutor server (Executors/newFixedThreadPool (int threads)))
     (.start server)
-    (println (pr-str (assoc meta :listening (str "http://127.0.0.1:" port))))
+    (println (pr-str (assoc meta :listening (str "http://" bind-host ":" port) :host-memory (host-memory))))
     (flush)
     @(promise)))
