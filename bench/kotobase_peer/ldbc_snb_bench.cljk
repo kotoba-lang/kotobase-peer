@@ -295,22 +295,26 @@
          (take 20) vec)))
 
 (defn- ic05-pairs
-  "Distinct [forum post] pairs where the post's creator is one of `where`'s
-  reached persons ?x AND ?x joined the post's forum after min-date. The
-  membership is reached by its DERIVED id -- `mb:<forum>:<person>` is how
-  the loader and INS5 both name it -- so a (person, forum) pair is one
-  point lookup instead of a scan of the person's memberships: the function
-  clause binds ?mb from ?f and ?x."
+  "Distinct [forum post] pairs: a reached person ?x, a membership of ?x
+  joined after min-date, its forum ?f, and a post by ?x in ?f. Written so
+  the engine's composite lookups take both halves (datalog, ayatori
+  iteration 45): `[?mb membership/person ?x]` + the joinDate range is one
+  cut of ?x's memberships in join-date order, and `[?post hasCreator ?x]`
+  + `[?post post/forum ?f]` is one lookup of ?x's posts under ?f -- the
+  ~300 posts of every reached person are never walked. `[(not= ?x
+  ?person)]` is true for the one-hop reach too and keeps the planner from
+  reordering the pairs apart (a function clause pins source order)."
   [db where person min-date]
   (eng/query db
              {:find '[?f ?post]
               :in '[?person]
               :where (into where
-                           [['?post "hasCreator" '?x]
-                            ['?post "post/forum" '?f]
-                            '[(str "mb:" ?f ":" ?x) ?mb]
+                           [['?mb "membership/person" '?x]
                             ['?mb "membership/joinDate" '?d]
-                            [(list '> '?d (str min-date))]])}
+                            [(list '> '?d (str min-date))]
+                            ['?mb "membership/forum" '?f]
+                            ['?post "hasCreator" '?x]
+                            ['?post "post/forum" '?f]])}
              everything [person]))
 
 (defn- kb-ic05
@@ -320,7 +324,7 @@
   pairs (a post by a person who is both a friend and a friend-of-friend
   counts once), then counted per forum."
   [db person min-date]
-  (let [one (ic05-pairs db '[[?person "knows" ?x]] person min-date)
+  (let [one (ic05-pairs db '[[?person "knows" ?x] [(not= ?x ?person)]] person min-date)
         two (ic05-pairs db '[[?person "knows" ?f1] [?f1 "knows" ?x] [(not= ?x ?person)]] person min-date)]
     (->> (into one two)
          (reduce (fn [m [f _]] (update m f (fnil inc 0))) {})

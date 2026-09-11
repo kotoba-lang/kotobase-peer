@@ -1,0 +1,17 @@
+{:receipt/type :ldbc-snb-interactive-network-iteration
+ :iteration 45
+ :date "2026-09-12"
+ :benchmark :ldbc-snb-interactive-network-v2
+ :s35 {:change {:repo "kotoba-lang/datalog" :sha "9d010f9727ae5f10b8b6d2f25fb78cc2f4674454"
+                :what "composite lookups: two adjacent clauses on a fresh entity -- [?e g ?gv] [?e a ?av] or the range form on a, ?gv bound -- become one lookup through datalog.index/grouped-values under gv (a point, a cut, or all entries). Bound-ness tracked in clause order; only off the drive and on a materialized db"}
+       :ic05-rewritten "membership-first: [?mb membership/person ?x] + joinDate > min (one cut of ?x's memberships in join-date order), [?mb membership/forum ?f], then [?post hasCreator ?x] [?post post/forum ?f] (one lookup of ?x's posts under ?f); the derived-id function clause is gone"
+       :gate {:checked 4780 :disagreements 0 :ic05-params 99 :group-orders-built 7}
+       :ic05-cost-in-thread {:first-parameter-ms {:before [2302 2714 2456] :after [7.8 6.3 6.2]}
+                             :all-99-parameters {:p50-ms 160.7 :p90-ms 380.6 :max-ms 2301.6 :non-empty 78 :file "2026-09-12-ldbc-ic05-all-params-server-ms.txt"}
+                             :twin-ms 680
+                             :reading "15x on the median parameter and 400x on the empty one; what remains is the size of the answer set (tens of thousands of (person, forum, post) triples per query for a mid-timeline minDate)"}
+       :mix-decision "still not admitted: this driver's mix is uniform round-robin, and at 161 ms p50 a 1/12 share of a 4k ops/s mix needs 48 thread-seconds per second. LDBC's own mix is not uniform -- complex reads are issued at per-query frequencies with short reads dominant -- so admitting IC05 honestly needs the official frequency table in the driver (S36), not a smaller share picked here"}
+ :sut {:host "levi (M4: 4P+6E)" :threads 16 :quads 25405564 :gate {:checked 4780 :disagreements 0}}
+ :rows "none moved; iteration 44's 4631.8 stands"
+ :not-an-ldbc-score "SF1 is below the audited table; 11 of 21 reads in the mix (IC05 served, gated, not mixed); no ACID suite; no auditor."
+ :seeds [:s36-official-operation-frequencies-in-the-driver :s34-bindings-as-arrays :m4-owner-decision-a-host :m3-sf3]}
