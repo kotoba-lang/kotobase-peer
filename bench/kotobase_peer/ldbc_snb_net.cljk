@@ -42,6 +42,7 @@
   path: at startup every official parameter for IC02/07/08/09 is answered
   both ways and the index path is served only if all of them agree."
   (:require [kotobase-peer.ldbc-snb-bench :as ldbc]
+            [kotobase-peer.core :as eng]
             [clojure.edn :as edn]
             [clojure.string]
             [clojure.java.io])
@@ -125,7 +126,26 @@
       [:index :is7] (#'ldbc/kb-is7-index db message)
       (throw (ex-info "unknown op or impl" {:status 400 :op op :impl impl})))))
 
-(defn- handler [meta db max-date index-ok?]
+(defn- update-datoms
+  "The datoms one LDBC insert asserts, in this harness's data model.
+  INS2 (a person likes a post): the like reified as in the loader.
+  INS8 (a friendship): `knows` both ways plus the reified friendship date
+  both ways. Other inserts (persons, forums, posts, comments) are not
+  served yet -- stated in the receipt, not hidden by a 200."
+  [{:keys [op] :as req}]
+  (let [q (fn [s p o] {:s s :p p :o o})]
+    (case (keyword (name op))
+      :ins2 (let [{:keys [person post date]} req
+                  lid (str "like:" person ":" post)]
+              [(q lid "like/person" (str person)) (q lid "like/message" (str post)) (q lid "like/creationDate" (str date))])
+      :ins8 (let [{:keys [p1 p2 date]} req
+                  p1 (str p1) p2 (str p2)]
+              (into [(q p1 "knows" p2) (q p2 "knows" p1)]
+                    (for [[x y] [[p1 p2] [p2 p1]] :let [k (str "kn:" x ":" y)]
+                          d [(q k "knows/person" x) (q k "knows/friend" y) (q k "knows/creationDate" (str date))]] d)))
+      (throw (ex-info "insert not served" {:status 400 :op op})))))
+
+(defn- handler [meta db-ref max-date index-ok?]
   (reify HttpHandler
     (handle [_ ex]
       (try
@@ -133,14 +153,38 @@
               method (.getRequestMethod ex)]
           (cond
             (and (= method "GET") (= path "/ldbc/meta"))
-            (respond! ex 200 (pr-str (assoc meta :host-memory (host-memory))))
+            (respond! ex 200 (pr-str (-> meta (dissoc :updates) (assoc :host-memory (host-memory) :updates-applied @(:updates meta)))))
 
             (and (= method "POST") (= path "/ldbc/ic"))
             (let [req (edn/read-string (read-body ex))
                   t0 (System/nanoTime)
-                  rows (answer db max-date index-ok? req)
+                  rows (answer @db-ref max-date index-ok? req)
                   ms (/ (- (System/nanoTime) t0) 1e6)]
               (respond! ex 200 (pr-str {:rows rows :n (count rows) :server-ms ms})))
+
+            ;; M2, first step (ayatori iteration 30): the SUT transacts. One
+            ;; atom holds the db value; `swap!` with `eng/transact` is the
+            ;; single writer, and every read takes the value it finds -- a
+            ;; snapshot per read, no lock on the read path. The response
+            ;; carries what a read-after-write check needs (the post's
+            ;; creator for INS2), so the driver can verify the write landed.
+            (and (= method "POST") (= path "/ldbc/update"))
+            (let [req (edn/read-string (read-body ex))
+                  t0 (System/nanoTime)
+                  datoms (update-datoms req)
+                  db' (swap! db-ref eng/transact datoms)
+                  ms (/ (- (System/nanoTime) t0) 1e6)
+                  op (keyword (name (:op req)))
+                  creator (when (= :ins2 op) (first (get (eng/entity db' (str (:post req))) "hasCreator")))
+                  ;; INS8 to a person this SUT never received (the stream's INS1
+                  ;; persons are not served yet): the datoms land, but no read
+                  ;; that needs the friend's name can show them -- said so
+                  ;; known = has a name (a person record), not merely an entity: an
+                  ;; earlier INS8 in the same stream may have asserted `knows`
+                  ;; datoms onto a person INS1 never created here
+                  p2-known (when (= :ins8 op) (boolean (seq (get (eng/entity db' (str (:p2 req))) "person/firstName"))))]
+              (swap! (:updates meta) inc)
+              (respond! ex 200 (pr-str {:ok true :datoms (count datoms) :server-ms ms :creator creator :p2-known p2-known})))
 
             :else
             (respond! ex 404 (pr-str {:error :no-such-route :path path}))))
@@ -221,7 +265,7 @@
     (doseq [p (:warm-persons meta)]
       (#'ldbc/kb-ic02 db p max-date) (#'ldbc/kb-ic07 db p)
       (#'ldbc/kb-ic08 db p) (#'ldbc/kb-ic09 db p max-date))
-    (.createContext server "/" (handler meta db max-date index-ok?))
+    (.createContext server "/" (handler (assoc meta :updates (atom 0)) (atom db) max-date index-ok?))
     (.setExecutor server (Executors/newFixedThreadPool (int threads)))
     (.start server)
     (println (pr-str (assoc meta :listening (str "http://" bind-host ":" port) :host-memory (host-memory))))

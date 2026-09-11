@@ -88,6 +88,24 @@
              {:message pid}
              (cond-> {:person pid} md (assoc :max-date (parse-long md))))))))
 
+(defn- read-updates
+  "Insert parameters from an LDBC update stream file
+   (scheduled|dependency|type|params...): type 2 -> INS2 {:person :post
+   :date}, type 8 -> INS8 {:p1 :p2 :date}. Taken in stream order, at most
+   `limit` of each. The scheduled times are not used: this driver puts the
+   inserts in the round-robin mix at the same rate as the reads (stated in
+   the receipt; the certified driver interleaves them by simulation time)."
+  [file type limit]
+  (when-not (fs/existsSync file) (println "REFUSED: update stream missing" file) (js/process.exit 2))
+  (let [t (str type)]
+    (->> (str/split-lines (fs/readFileSync file "utf8"))
+         (keep (fn [l] (let [[_ _ ty & ps] (str/split l #"\|")]
+                         (when (= ty t)
+                           (case type
+                             2 {:person (nth ps 0) :post (nth ps 1) :date (parse-long (nth ps 2))}
+                             8 {:p1 (nth ps 0) :p2 (nth ps 1) :date (parse-long (nth ps 2))})))))
+         (take limit) vec)))
+
 (defn- percentile [xs q]
   (if (empty? xs) nil
       (let [s (vec (sort xs))]
@@ -142,6 +160,9 @@
                          :start-delay-ms (stats (vec delays))
                          :empty-answers (count (filter #(zero? (or (:n %) 0)) ok))
                          :rows-mean (if (seq ok) (/ (reduce + (map :n ok)) (double (count ok))) 0)
+                         :updates-applied (count (filter :update rs))
+                         :updates-sample (into {} (for [[op rs] by-op :when (some :update rs)]
+                                                   [op (mapv :update (take-last 20 (filter :update rs)))]))
                          :latency-ms (into {} (for [[op rs] by-op]
                                                 [op (stats (mapv :latency rs))]))
                          :server-ms (into {} (for [[op rs] by-op]
@@ -156,10 +177,12 @@
                                (when (>= t sched)
                                  (swap! next-k inc)
                                  (swap! in-flight inc)
-                                 (let [{:keys [op params]} (nth ops (mod k (count ops)))
+                                 (let [{:keys [op params update?]} (nth ops (mod k (count ops)))
                                        p (nth params (mod (quot k (count ops)) (count params)))
                                        start (now)]
-                                   (-> (fetch-edn origin "/ldbc/ic" (assoc p :op op :impl (or impl :datalog)))
+                                   (-> (if update?
+                                         (fetch-edn origin "/ldbc/update" (assoc p :op op))
+                                         (fetch-edn origin "/ldbc/ic" (assoc p :op op :impl (or impl :datalog))))
                                        (.then (fn [{:keys [status body]}]
                                                 (let [end (now)
                                                       ;; a 200 is an answer only if it has the answer's shape;
@@ -167,10 +190,13 @@
                                                       ;; as an empty answer (control C, 2026-09-11)
                                                       parsed (when (= status 200)
                                                                (let [v (try (edn/read-string body) (catch :default _ nil))]
-                                                                 (when (and (map? v) (vector? (:rows v)) (integer? (:n v))) v)))]
+                                                                 (cond (and (map? v) (vector? (:rows v)) (integer? (:n v))) v
+                                                                       (and (map? v) (true? (:ok v)) (integer? (:datoms v))) (assoc v :n (:datoms v))
+                                                                       :else nil)))]
                                                   (swap! records conj
                                                          {:op op :scheduled sched :start start :end end
                                                           :delay (- start sched) :latency (- end start)
+                                                          :update (when update? (assoc p :creator (:creator parsed) :p2-known (:p2-known parsed)))
                                                           :status (if (and (= status 200) (nil? parsed)) 590 status)
                                                           :body (when (or (not= status 200) (nil? parsed)) (subs body 0 (min 120 (count body))))
                                                           :n (:n parsed) :server-ms (:server-ms parsed)}))))
@@ -205,7 +231,12 @@
         max-swap-pct (parse-double (arg args "--max-swap-pct" "90"))
         mem (host-memory)
         param-file {"ic02" 2 "ic07" 7 "ic08" 8 "ic09" 9 "is1" 7 "is2" 7 "is3" 7 "is4" :message "is5" :message "is6" :message "is7" :message}
-        ops (mapv (fn [op] {:op (keyword op) :params (read-params pdir (param-file op))}) mix)]
+        updates (arg args "--updates" nil)
+        update-type {"ins2" 2 "ins8" 8}
+        ops (mapv (fn [op] (if-let [ty (update-type op)]
+                             {:op (keyword op) :update? true :params (read-updates updates ty 100000)}
+                             {:op (keyword op) :params (read-params pdir (param-file op))}))
+                  mix)]
     (-> (fetch-edn origin "/ldbc/meta" nil)
         (.then (fn [{:keys [status body]}]
                  (when-not (= 200 status)
@@ -271,12 +302,48 @@
                                               (if pass (go (rest remaining) acc) (js/Promise.resolve acc))))))))]
                      (-> (go rates [])
                          (.then (fn [runs]
+                                  ;; read-after-write: the last inserts of every run must be
+                                  ;; visible to the reads that cover them (INS8 -> IS3 lists the
+                                  ;; new friend; INS2 -> IC07 on the post's creator lists the liker)
+                                  (let [all-samples (mapcat (fn [r] (mapcat (fn [[op us]] (map #(assoc % :op op) us)) (:updates-sample r))) runs)
+                                        ;; an INS2 whose post this SUT does not hold (a subset
+                                        ;; rung) has no creator to read IC07 for: the write landed
+                                        ;; (the SUT said so) but no served read covers it. Counted
+                                        ;; and printed as unverifiable, never as visible.
+                                        unverifiable (filter (fn [u] (or (and (= :ins2 (:op u)) (nil? (:creator u)))
+                                                                         (and (= :ins8 (:op u)) (false? (:p2-known u)))))
+                                                             all-samples)
+                                        samples (remove (set unverifiable) all-samples)
+                                        check (fn [{:keys [op] :as u}]
+                                                (case op
+                                                  :ins8 (-> (fetch-edn origin "/ldbc/ic" {:op :is3 :person (:p1 u)})
+                                                            (.then (fn [{:keys [body]}]
+                                                                     (let [rows (:rows (edn/read-string body))]
+                                                                       {:op op :ok (boolean (some #(= (:p2 u) (first %)) rows)) :u u}))))
+                                                  :ins2 (-> (fetch-edn origin "/ldbc/ic" {:op :ic07 :person (:creator u)})
+                                                            (.then (fn [{:keys [body]}]
+                                                                     (let [rows (:rows (edn/read-string body))]
+                                                                       {:op op :ok (boolean (some #(= (:person u) (first %)) rows)) :u u}))))))]
+                                    (-> (js/Promise.all (clj->js (mapv check samples)))
+                                        (.then (fn [results]
+                                                 (let [results (vec results)
+                                                       failed (remove :ok results)]
+                                                   (when (or (seq results) (seq unverifiable))
+                                                     (println "read-after-write:" (count results) "checked," (count failed) "not visible,"
+                                                              (count unverifiable) "unverifiable (INS2 on a post, or INS8 to a person, this SUT does not hold)"
+                                                              (when (seq failed) (pr-str (take 3 failed)))))
+                                                   (when (seq failed)
+                                                     (println "REFUSED: an insert the SUT acknowledged is not visible to the read that covers it")
+                                                     (js/process.exit 2))
+                                                   {:runs runs :results results :failed failed :unverifiable unverifiable})))))))
+                         (.then (fn [{:keys [runs results failed unverifiable]}]
                                   (let [passing (filter :pass runs)
                                         best (last passing)
                                         receipt {:schema 1
                                                  :receipt/type :ldbc-snb-interactive-network
                                                  :date (.slice (.toISOString (js/Date.)) 0 10)
                                                  :sut (dissoc meta :warm-persons)
+                                                 :read-after-write {:checked (count results) :not-visible (count failed) :unverifiable (count unverifiable)}
                                                  :driver {:implementation "bench/ldbc_snb_driver.cljk (nbb, open-loop scheduled)"
                                                           :origin origin :mix mix :inflight inflight :seconds seconds :impl impl
                                                           :rule "95% of operations start within 1 s of schedule; zero failed operations"
