@@ -171,12 +171,38 @@
   "One scheduled run at `rate` ops/s for `seconds`. Resolves to the run's
    record. Open loop: dispatch times come from the schedule, not from
    completions; `inflight` bounds concurrency like driver threads would."
-  [{:keys [origin rate seconds inflight ops impl stream tcr]}]
+  [{:keys [origin rate seconds inflight ops impl stream tcr official]}]
   (js/Promise.
    (fn [resolve _]
-     (let [reads-total (long (* rate seconds))
-           interval (/ 1000.0 rate)
-           t0 (+ (now) 50)
+     (let [t0 (+ (now) 50)
+           ;; S36 (ayatori iteration 46): the OFFICIAL schedule. LDBC's driver
+           ;; issues complex read N every update_interleave * freq_N of
+           ;; simulation time (sf1.properties: update_interleave 4477, IC02
+           ;; freq 37 ...), and short reads follow complex reads onto the
+           ;; entities they returned, each next one with probability x
+           ;; short_read_dissipation (0.2). Here: every complex op in the mix
+           ;; with a freq is scheduled at t0 + k * interleave * freq * tcr;
+           ;; short reads are generated when a complex read completes (see
+           ;; `after-read!`) and are due at once. `rate` is not used.
+           sched-reads (when official
+                         (let [{:keys [interleave freq]} official]
+                           (->> (for [{:keys [op params] :as o} ops
+                                      :let [f (get freq op)]
+                                      :when f
+                                      :let [step (* interleave f tcr)]
+                                      k (range (long (/ (* 1000.0 seconds) step)))]
+                                  {:wall (* k step) :op op :params (nth params (mod k (count params))) :update? (:update? o)})
+                                (sort-by :wall)
+                                vec)))
+           reads-total (if official (count sched-reads) (long (* rate seconds)))
+           interval (if official 0 (/ 1000.0 rate))
+           ;; short reads follow complex reads: a JS array FIFO, due at generation
+           immediate (array)
+           short-ops (when official
+                       {:person (vec (filter #(#{:is1 :is2 :is3} (:op %)) ops))
+                        :message (vec (filter #{:is4 :is5 :is6 :is7} (map :op ops)))})
+           short-rr (atom 0)
+           extra-total (atom 0)
            ;; the interleave (S22, ayatori iteration 32): stream events are
            ;; scheduled at t0 + (sim - sim0) * tcr wall ms, LDBC's time
            ;; compression; only those that fall inside the run are taken.
@@ -190,6 +216,7 @@
                                      (map #(assoc % :wall (* (- (:sim %) sim0) (or tcr 1.0))) stream))))
            updates-total (count events)
            total (+ reads-total updates-total)
+           total-now (fn [] (+ total @extra-total))
            next-u (atom 0)
            in-flight-sims (atom (sorted-set))
            last-done-sim (atom (or sim0 0))
@@ -210,7 +237,9 @@
                        (resolve
                         {:rate rate :seconds seconds :inflight inflight
                          :scheduled total :reads-scheduled reads-total :updates-scheduled updates-total
-                         :tcr tcr :completed (count rs)
+                         :tcr tcr :official (when official {:interleave (:interleave official) :short-reads @extra-total
+                                                             :complex-scheduled reads-total :short-read-dissipation 0.2})
+                         :completed (count rs)
                          :reads-completed (count (remove :update rs)) :updates-completed (count (filter :update rs))
                          :updates-skipped skipped
                          :failed (count failed)
@@ -228,6 +257,23 @@
                                                 [op (stats (mapv :latency rs))]))
                          :server-ms (into {} (for [[op rs] by-op]
                                                [op (stats (mapv #(or (:server-ms %) 0) rs))]))})))
+           after-read! (fn [op rows]
+                         (when (and official (seq rows) (#{:ic02 :ic07 :ic08 :ic09} op))
+                           (let [[person message] (first rows)
+                                 pick (fn [kind id]
+                                        (let [cands (get short-ops kind)]
+                                          (when (seq cands)
+                                            (let [o (nth cands (mod (swap! short-rr inc) (count cands)))
+                                                  o (if (map? o) (:op o) o)]
+                                              {:op o :params (if (= kind :person) {:person id} {:message id})}))))]
+                             ;; probability 1.0 for the first, then x 0.2 each (LdbcSnbShortReadGenerator's dissipation)
+                             (loop [p 1.0 kinds (cycle [[:person person] [:message message]]) n 0]
+                               (when (and (< n 6) (< (rand) p))
+                                 (let [[kind id] (first kinds)]
+                                   (when-let [sr (pick kind id)]
+                                     (.push immediate (assoc sr :sched (now)))
+                                     (swap! extra-total inc))
+                                   (recur (* p 0.2) (rest kinds) (inc n))))))))
            launch! (fn launch! [op p update? sched sim finish-one]
                      (let [start (now)]
                                    (-> (if update?
@@ -249,7 +295,8 @@
                                                           :update (when update? (assoc p :creator (:creator parsed) :p2-known (:p2-known parsed) :forum-known (:forum-known parsed)))
                                                           :status (if (and (= status 200) (nil? parsed)) 590 status)
                                                           :body (when (or (not= status 200) (nil? parsed)) (subs body 0 (min 120 (count body))))
-                                                          :n (:n parsed) :server-ms (:server-ms parsed)}))))
+                                                          :n (:n parsed) :server-ms (:server-ms parsed)})
+                                                  (when-not update? (after-read! op (:rows parsed))))))
                                        (.catch (fn [e]
                                                  (swap! records conj
                                                         {:op op :scheduled sched :start start :end (now)
@@ -272,9 +319,17 @@
                                u @next-u
                                ev (when (< u updates-total) (nth events u))
                                ev-due? (and ev (>= t (+ t0 (:wall ev))) (<= (:dep ev) (completed-up-to)))
-                               k-due? (and (< k reads-total) (>= t (+ t0 (* k interval))))]
+                               k-due? (if official
+                                        (and (< k reads-total) (>= t (+ t0 (:wall (nth sched-reads k)))))
+                                        (and (< k reads-total) (>= t (+ t0 (* k interval)))))]
                            (when (< @in-flight inflight)
                              (cond
+                               ;; a short read that followed a complex read: due at once
+                               (and official (pos? (.-length immediate)))
+                               (let [{:keys [op params sched]} (.shift immediate)]
+                                 (swap! in-flight inc)
+                                 (launch! op params false sched nil (fn [] (if (= @done (total-now)) (finish!) (dispatch!))))
+                                 (recur))
                                ev-due?
                                (do (swap! next-u inc)
                                    (if (nil? (:params ev))
@@ -283,25 +338,26 @@
                                          (swap! records conj {:op (or (:op ev) :ins-other) :update {:skipped true} :skipped true
                                                               :scheduled (+ t0 (:wall ev)) :start t :end t :delay (- t (+ t0 (:wall ev))) :latency 0 :status 200 :n 0})
                                          (swap! done inc)
-                                         (when (= @done total) (finish!))
+                                         (when (= @done (total-now)) (finish!))
                                          (recur))
                                      (do (swap! in-flight inc)
                                          (swap! in-flight-sims conj (:sim ev))
                                          (launch! (:op ev) (:params ev) true (+ t0 (:wall ev)) (:sim ev)
-                                                  (fn [] (if (= @done total) (finish!) (dispatch!))))
+                                                  (fn [] (if (= @done (total-now)) (finish!) (dispatch!))))
                                          (recur))))
                                k-due?
-                               (let [sched (+ t0 (* k interval))
-                                     {:keys [op params update?]} (nth ops (mod k (count ops)))
-                                     p (nth params (mod (quot k (count ops)) (count params)))]
+                               (let [sched (if official (+ t0 (:wall (nth sched-reads k))) (+ t0 (* k interval)))
+                                     {:keys [op params update?]} (if official (nth sched-reads k) (nth ops (mod k (count ops))))
+                                     p (if official params (nth params (mod (quot k (count ops)) (count params))))]
                                  (swap! next-k inc)
                                  (swap! in-flight inc)
-                                 (launch! op p update? sched nil (fn [] (if (= @done total) (finish!) (dispatch!))))
+                                 (launch! op p update? sched nil (fn [] (if (= @done (total-now)) (finish!) (dispatch!))))
                                  (recur))
                                :else nil)))))
            tick (fn tick []
                   (dispatch!)
-                  (when (or (< @next-k reads-total) (< @next-u updates-total))
+                  (when (or (< @next-k reads-total) (< @next-u updates-total)
+                            (and official (or (pos? (.-length immediate)) (pos? @in-flight))))
                     (js/setTimeout tick 2)))]
        (js/setTimeout tick 0)))))
 
@@ -323,7 +379,20 @@
         updates (arg args "--updates" nil)
         person-updates (arg args "--person-updates" nil)
         tcr (some-> (arg args "--tcr" nil) parse-double)
-        stream (when tcr
+        ;; --official <sf1.properties>: complex reads at LDBC's per-query
+        ;; interleaves, short reads following them; the sweep is then over
+        ;; --tcrs (time-compression ratios), not --rates
+        official (when-let [f (arg args "--official" nil)]
+                   (when-not (fs/existsSync f) (println "REFUSED: properties missing" f) (js/process.exit 2))
+                   (let [kv (into {} (for [l (str/split-lines (fs/readFileSync f "utf8"))
+                                           :let [[k v] (str/split l #"=")] :when (and k v (str/starts-with? k "ldbc"))]
+                                       [(str/trim k) (str/trim v)]))
+                         q (fn [n] (some-> (get kv (str "ldbc.snb.interactive.LdbcQuery" n "_freq")) parse-long))]
+                     {:interleave (parse-long (get kv "ldbc.snb.interactive.update_interleave"))
+                      :freq (into {} (for [[op n] {:ic01 1 :ic02 2 :ic03 3 :ic04 4 :ic05 5 :ic06 6 :ic07 7 :ic08 8 :ic09 9 :ic10 10 :ic11 11 :ic12 12 :ic13 13 :ic14 14}
+                                           :let [fq (q n)] :when fq] [op fq]))}))
+        tcrs (when official (mapv parse-double (str/split (arg args "--tcrs" "0.0002") #",")))
+        stream (when (or tcr official)
                  (vec (sort-by :sim (concat (read-stream updates) (when person-updates (read-stream person-updates))))))
         update-type {"ins1" 1 "ins2" 2 "ins3" 3 "ins4" 4 "ins5" 5 "ins6" 6 "ins7" 7 "ins8" 8}
         ops (mapv (fn [op] (if-let [ty (update-type op)]
@@ -370,14 +439,15 @@
                    (letfn [(go [remaining acc]
                              (if (empty? remaining)
                                (js/Promise.resolve acc)
-                               (-> (run-rate! {:origin origin :rate (first remaining) :seconds seconds
-                                               :inflight inflight :ops ops :impl impl :stream stream :tcr tcr})
+                               (-> (run-rate! {:origin origin :rate (if official 0 (first remaining)) :seconds seconds
+                                               :inflight inflight :ops ops :impl impl :stream stream
+                                               :tcr (if official (first remaining) tcr) :official official})
                                    (.then (fn [r]
                                             (let [l (:latency-ms r)
                                                   p50 (fn [op] (or (some-> (get-in l [op :p50]) (.toFixed 1)) "-"))
                                                   extra (apply str (for [op (map keyword mix) :when (not (#{:ic02 :ic07 :ic08 :ic09} op))]
                                                                      (str "  " (.padStart (str (name op) " " (p50 op)) 9))))]
-                                              (println (str "  " (.padStart (str (:rate r)) 4)
+                                              (println (str "  " (.padStart (if official (str (:tcr r)) (str (:rate r))) 4)
                                                             "  " (.padStart (str (:scheduled r)) 5)
                                                             "  " (.padStart (str (:completed r)) 4)
                                                             "  " (.padStart (str (:failed r)) 4)
@@ -391,12 +461,14 @@
                                                             "  " (.padStart (p50 :ic08) 8)
                                                             "  " (.padStart (p50 :ic09) 8)
                                                             extra
-                                                            (when tcr (str "  | stream " (:updates-completed r) " upd sent = "
-                                                                           (.toFixed (/ (:updates-completed r) seconds) 0) "/s (" (:updates-skipped r) " skipped)")))))
+                                                            (when (:tcr r) (str "  | stream " (:updates-completed r) " upd sent = "
+                                                                                (.toFixed (/ (:updates-completed r) seconds) 0) "/s (" (:updates-skipped r) " skipped)"))
+                                                            (when official (str "  | official: " (:complex-scheduled (:official r)) " complex, "
+                                                                               (:short-reads (:official r)) " short reads followed")))))
                                             (let [pass (and (zero? (:failed r)) (>= (:on-time-pct r) 95.0))
                                                   acc (conj acc (assoc r :pass pass))]
                                               (if pass (go (rest remaining) acc) (js/Promise.resolve acc))))))))]
-                     (-> (go rates [])
+                     (-> (go (if official tcrs rates) [])
                          (.then (fn [runs]
                                   ;; read-after-write: the last inserts of every run must be
                                   ;; visible to the reads that cover them (INS8 -> IS3 lists the
@@ -495,6 +567,8 @@
                                                  :runs runs
                                                  :throughput-ops-s (when best (:throughput best))
                                                  :highest-passing-rate (when best (:rate best))
+                                                 :highest-passing-tcr (when best (:tcr best))
+                                                 :official (when official (:official best))
                                                  :not-an-ldbc-score (str "a stated SF1 subset; served reads " (pr-str (vec mix)) " of 29 ops; inserts "
                                                                           (if tcr "all 8 types from the stream" "only those in --mix") "; no ACID suite, no auditor")}]
                                     (when (and (seq runs) (pos? (:failed (first runs))))

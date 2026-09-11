@@ -1,0 +1,21 @@
+{:receipt/type :ldbc-snb-interactive-network-iteration
+ :iteration 46
+ :date "2026-09-12"
+ :benchmark :ldbc-snb-interactive-network-v2
+ :s36-official-schedule
+ {:source "ldbc/ldbc_snb_interactive_v1_driver src/main/resources/configuration/ldbc/snb/interactive/sf1.properties (fetched 2026-09-12; copied to bench/ldbc-sf1-official.properties): update_interleave 4477 sim-ms; LdbcQuery freq 1:26 2:37 3:69 4:36 5:57 6:129 7:87 8:45 9:157 10:30 11:16 12:44 13:19 14:49"
+  :driver "--official <properties> --tcrs a,b,c: complex read N scheduled every update_interleave x freq_N x TCR wall ms (each type its own clock, parameters cycled); the update stream at the same TCR with the dependency rule; short reads FOLLOW complex reads onto the first row's person and message ids with probability 1.0 then x 0.2 each (an approximation of LdbcSnbShortReadGenerator's dissipation -- the official generator walks more of the result; stated). The sweep is over TCR; the LDBC metric is throughput at the lowest passing TCR."
+  :mix [:ic02 :ic05 :ic07 :ic08 :ic09 :is1 :is2 :is3 :is4 :is5 :is6 :is7 :stream-all-8-inserts]
+  :runs [{:tcr 0.0004 :on-time-pct 99.03 :throughput-ops-s 625.5 :updates-per-s 536 :complex 943 :short-reads 905}
+         {:tcr 0.0002 :on-time-pct 100.0 :throughput-ops-s 1252.3 :updates-per-s 1092 :complex 1888 :short-reads 1808}
+         {:tcr 0.00015 :on-time-pct 96.18 :throughput-ops-s 1360.9 :updates-per-s 1475 :complex 2518 :short-reads 2402 :wire-p50-ms {:ic02 85.8 :ic05 659.7 :ic07 98.2 :ic08 82.6 :ic09 96.2 :is1 165.5 :is4 137.9}}
+         {:tcr 0.0001 :on-time-pct 30.84 :throughput-ops-s 1073.1 :updates-per-s 2407 :verdict :fails-95pct-rule}]
+  :reading "at TCR 0.00015 the mix passes at 96.2% with every wire latency inflated by queueing behind IC05 (160 ms server p50 at 26/s = 4.2 thread-seconds per second on 16 threads, plus 64 in flight); at 0.0001 it fails. The official mix is mostly updates (1 per 4477 sim-ms) with ~1 short read per complex read -- 1,475 upd/s + 126 complex/s + 120 short/s at the passing point"}
+ :sut {:host "levi (M4: 4P+6E)" :threads 16 :quads 25405564 :gate {:checked 4780 :disagreements 0}}
+ :rows
+ [{:rung :sf1-full :schedule :official :inflight 64 :sut-threads 16 :tcr 0.00015 :on-time-pct 96.18 :failures 0 :throughput-ops-s 1360.9
+   :ops {:ic [:ic02 :ic05 :ic07 :ic08 :ic09] :is [:is1 :is2 :is3 :is4 :is5 :is6 :is7] :ins [:ins1 :ins2 :ins3 :ins4 :ins5 :ins6 :ins7 :ins8]}
+   :read-after-write {:checked 462 :not-visible 0 :outside-window 20 :unverifiable 0 :is6-checked 79 :no-covering-read 80}
+   :note "the first row under LDBC's own operation schedule; TCR 0.0001 fails (30.8%). IC05 admitted." :receipt "2026-09-12-ldbc-snb-network-iteration-46-official-schedule-64slots.edn"}]
+ :not-an-ldbc-score "SF1 is below the audited table; 5 of 14 complex reads; short-read generation approximated; no ACID suite; no auditor. Audited No.1 (SF300 139,411 ops/s at TCR 0.00315) is 102x this row's throughput at a 21x slower TCR."
+ :seeds [:s37-ic05-is-the-schedule-wall-160ms :s38-official-short-read-generator-exactly :s34-bindings-as-arrays :m4-owner-decision-a-host]}
