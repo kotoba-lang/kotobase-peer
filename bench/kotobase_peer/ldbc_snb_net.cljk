@@ -1,0 +1,134 @@
+(ns kotobase-peer.ldbc-snb-net
+  "The LDBC SNB Interactive complex reads IC02 / IC07 / IC08 / IC09 served
+  OVER THE NETWORK from kotobase's hot db, so that a driver in another
+  process can measure them the way the benchmark defines the metric --
+  throughput (ops/s) at a schedule, with the 95% on-time requirement --
+  instead of the way `ldbc-snb-bench` measures them (elapsed nanoseconds
+  around an in-JVM function call).
+
+  Owner instruction 2026-09-11: the benchmark is LDBC SNB Interactive, the
+  target is the audited world No.1, and it is measured over the network.
+  This namespace is the system-under-test side of that; the driver is
+  `bench/ldbc_snb_driver.cljk` (nbb). Both are deliberately small: a JDK
+  `HttpServer` on loopback and a scheduled `fetch`. What they measure is
+  kotobase's query engine plus one HTTP hop, which is the smallest thing
+  that is still a network measurement. A cross-host run (fleet mac-mini) and
+  the live Worker are the same driver against a different origin.
+
+  Data and queries are `ldbc-snb-bench`'s, reached through their vars the way
+  `ic09-diag` / `scan-instrument` already do -- the same deterministic SF1
+  subset, the same four Datalog queries, the same harness-side top-20. So
+  the correctness gate that namespace holds (answers asserted equal to
+  Neo4j's) applies to what is served here byte for byte; this file adds no
+  query logic of its own.
+
+  Routes (EDN in, EDN out):
+    GET  /ldbc/meta            -> {:ready true :elements .. :quads .. :max-date ..}
+    POST /ldbc/ic  {:op ic02 :person id [:max-date n]}
+                               -> {:rows [..] :n count :server-ms x}
+  A request the server cannot answer is a 4xx/5xx with an EDN body, never a
+  200 with an empty vector -- an empty answer and a failed answer must not
+  look alike to the driver (the join-hazard lesson, root ADR-2609109900).
+
+  Usage: clojure -M:ldbc-snb-net <ldbc-dynamic-dir> [posts] [port] [threads]"
+  (:require [kotobase-peer.ldbc-snb-bench :as ldbc]
+            [clojure.edn :as edn])
+  (:import [com.sun.net.httpserver HttpServer HttpHandler HttpExchange]
+           [java.net InetSocketAddress]
+           [java.util.concurrent Executors]
+           [java.nio.charset StandardCharsets]))
+
+(defn- respond! [^HttpExchange ex status ^String body]
+  (let [bytes (.getBytes body StandardCharsets/UTF_8)]
+    (.add (.getResponseHeaders ex) "content-type" "application/edn; charset=utf-8")
+    (.sendResponseHeaders ex status (alength bytes))
+    (with-open [os (.getResponseBody ex)]
+      (.write os bytes))))
+
+(defn- read-body [^HttpExchange ex]
+  (with-open [is (.getRequestBody ex)]
+    (slurp is :encoding "UTF-8")))
+
+(defn- answer
+  "Dispatch one IC read. Returns rows (a vector) or throws with :status."
+  [db max-date {:keys [op person] :as req}]
+  (let [person (str person)
+        md (long (or (:max-date req) max-date))]
+    (case (keyword (name op))
+      :ic02 (#'ldbc/kb-ic02 db person md)
+      :ic07 (#'ldbc/kb-ic07 db person)
+      :ic08 (#'ldbc/kb-ic08 db person)
+      :ic09 (#'ldbc/kb-ic09 db person md)
+      (throw (ex-info "unknown op" {:status 400 :op op})))))
+
+(defn- handler [meta db max-date]
+  (reify HttpHandler
+    (handle [_ ex]
+      (try
+        (let [path (.getPath (.getRequestURI ex))
+              method (.getRequestMethod ex)]
+          (cond
+            (and (= method "GET") (= path "/ldbc/meta"))
+            (respond! ex 200 (pr-str meta))
+
+            (and (= method "POST") (= path "/ldbc/ic"))
+            (let [req (edn/read-string (read-body ex))
+                  t0 (System/nanoTime)
+                  rows (answer db max-date req)
+                  ms (/ (- (System/nanoTime) t0) 1e6)]
+              (respond! ex 200 (pr-str {:rows rows :n (count rows) :server-ms ms})))
+
+            :else
+            (respond! ex 404 (pr-str {:error :no-such-route :path path}))))
+        (catch clojure.lang.ExceptionInfo e
+          (respond! ex (or (:status (ex-data e)) 500)
+                    (pr-str {:error (ex-message e) :data (dissoc (ex-data e) :status)})))
+        (catch Throwable t
+          (respond! ex 500 (pr-str {:error (str (class t)) :message (ex-message t)})))))))
+
+(defn -main [& args]
+  (let [dir (or (first args)
+                (throw (ex-info "usage: clojure -M:ldbc-snb-net <ldbc-dynamic-dir> [posts] [port] [threads]" {})))
+        n-posts (parse-long (or (second args) "35000"))
+        port (parse-long (or (nth args 2 nil) "8090"))
+        threads (parse-long (or (nth args 3 nil) "8"))
+        t0 (System/nanoTime)
+        data (#'ldbc/load-subset dir n-posts)
+        load-ms (/ (- (System/nanoTime) t0) 1e6)
+        t1 (System/nanoTime)
+        {:keys [db quads]} (#'ldbc/build-kotobase data)
+        build-ms (/ (- (System/nanoTime) t1) 1e6)
+        max-date (+ 1 (reduce max 0 (keep first (vals (:messages data)))))
+        elements {:persons (count (:persons data))
+                  :knows-edges (count (:knows data))
+                  :messages (count (:messages data))
+                  :posts (count (:post-ids data))
+                  :comments (count (:comment-ids data))
+                  :has-creator (count (:creator data))
+                  :reply-of (count (:reply-of data))
+                  :likes (count (:likes data))}
+        meta {:ready true
+              :implementation "kotobase-peer.ldbc-snb-net over kotobase-peer.ldbc-snb-bench"
+              :dataset "LDBC SNB Interactive v1, SF1, Datagen v1.0.0, CsvComposite/LongDateFormatter"
+              :subset-rule (str "all persons + all knows; " n-posts
+                                " most recent Posts + full transitive reply trees; "
+                                "hasCreator for included Messages; likes onto included Messages")
+              :elements elements
+              :quads quads
+              :max-date max-date
+              :load-ms load-ms
+              :build-ms build-ms
+              :threads threads
+              :warm-persons (#'ldbc/pick-persons data 5)}
+        server (HttpServer/create (InetSocketAddress. "127.0.0.1" (int port)) 0)]
+    ;; warm the engine on the same five high-degree persons the in-JVM
+    ;; harness warms on, so the first scheduled operation is not a JIT sample
+    (doseq [p (:warm-persons meta)]
+      (#'ldbc/kb-ic02 db p max-date) (#'ldbc/kb-ic07 db p)
+      (#'ldbc/kb-ic08 db p) (#'ldbc/kb-ic09 db p max-date))
+    (.createContext server "/" (handler meta db max-date))
+    (.setExecutor server (Executors/newFixedThreadPool (int threads)))
+    (.start server)
+    (println (pr-str (assoc meta :listening (str "http://127.0.0.1:" port))))
+    (flush)
+    @(promise)))

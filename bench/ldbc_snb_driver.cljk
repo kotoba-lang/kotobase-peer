@@ -1,0 +1,245 @@
+#!/usr/bin/env nbb
+;; bench/ldbc_snb_driver.cljk — an open-loop, scheduled driver for the four
+;; LDBC SNB Interactive complex reads served by `kotobase-peer.ldbc-snb-net`,
+;; measured the way the benchmark defines its metric and not the way an
+;; in-JVM harness does.
+;;
+;; LDBC SNB Interactive scores ONE number, throughput (ops/s), obtained by
+;; running the operation stream at a schedule (the time-compression ratio
+;; sets the rate) and accepting the run only if 95% of operations STARTED
+;; within 1 second of their scheduled start (spec §"95% on-time
+;; requirement", results_log.csv rule `actual_start - scheduled_start <
+;; 1 s`). A closed-loop "as fast as N clients can go" number is not that
+;; metric; it hides queueing. So this driver:
+;;
+;;   * schedules operation k at t0 + k/rate, round-robin over the op mix,
+;;     each op cycling its OFFICIAL substitution parameters
+;;     (substitution_parameters-sf1/interactive_{2,7,8,9}_param.txt);
+;;   * dispatches when the schedule says, bounded by --inflight slots (the
+;;     analogue of driver threads) -- an op that finds no free slot waits,
+;;     and that wait is exactly what the on-time rule measures;
+;;   * records scheduled vs actual start, client latency, HTTP status, rows;
+;;   * sweeps --rates upward and reports the highest rate whose run had
+;;     >= 95% on-time starts and zero failed operations.
+;;
+;; What it is NOT: the certified LDBC driver. The mix is four complex reads
+;; (no short reads, no updates, no dependency tracking), the data is the
+;; stated SF1 subset, and there is no auditor. The receipt says so.
+;;
+;; Every op's row count is recorded and the share of EMPTY answers is
+;; printed. An empty answer is fast for the wrong reason (root
+;; ADR-2609109900 found the join hazard this way), and a subset can make
+;; official parameters empty; the number is there so nobody reads a fast
+;; run of empty answers as growth.
+;;
+;;   nbb bench/ldbc_snb_driver.cljk --origin http://127.0.0.1:8090 \
+;;     --params ~/.cache/ldbc-snb/sf1/substitution_parameters-sf1 \
+;;     --rates 5,10,20,40,80,160 --seconds 20 --inflight 64 [--out file.edn]
+;;
+;; Exit 0 = receipt written. 2 = REFUSED (server not ready, params missing,
+;; or a run had failed operations at the FIRST rate -- nothing was measured).
+
+(ns ldbc-snb-driver
+  (:require [clojure.string :as str]
+            [clojure.edn :as edn]
+            ["fs" :as fs]
+            ["os" :as os]
+            ["path" :as path]
+            ["perf_hooks" :refer [performance]]))
+
+(defn- arg [args k default]
+  (let [i (.indexOf args k)]
+    (if (neg? i) default (nth args (inc i)))))
+
+(defn- now [] (.now performance))
+
+(defn- read-params [dir n]
+  (let [f (path/join dir (str "interactive_" n "_param.txt"))
+        _ (when-not (fs/existsSync f)
+            (println "REFUSED: params missing" f) (js/process.exit 2))
+        lines (rest (str/split-lines (fs/readFileSync f "utf8")))]
+    (vec (for [l lines :when (seq l)
+               :let [[pid md] (str/split l #"\|")]]
+           (cond-> {:person pid} md (assoc :max-date (parse-long md)))))))
+
+(defn- percentile [xs q]
+  (if (empty? xs) nil
+      (let [s (vec (sort xs))]
+        (nth s (min (dec (count s)) (js/Math.floor (* q (count s))))))))
+
+(defn- stats [xs]
+  {:n (count xs)
+   :p50 (percentile xs 0.5) :p95 (percentile xs 0.95) :p99 (percentile xs 0.99)
+   :max (when (seq xs) (reduce max xs))})
+
+(defn- fetch-edn [origin path body]
+  (-> (js/fetch (str origin path)
+                (if body
+                  #js {:method "POST"
+                       :headers #js {"content-type" "application/edn"}
+                       :body (pr-str body)}
+                  #js {:method "GET"}))
+      (.then (fn [res]
+               (-> (.text res)
+                   (.then (fn [txt] {:status (.-status res) :body txt})))))))
+
+(defn- run-rate!
+  "One scheduled run at `rate` ops/s for `seconds`. Resolves to the run's
+   record. Open loop: dispatch times come from the schedule, not from
+   completions; `inflight` bounds concurrency like driver threads would."
+  [{:keys [origin rate seconds inflight ops]}]
+  (js/Promise.
+   (fn [resolve _]
+     (let [total (long (* rate seconds))
+           interval (/ 1000.0 rate)
+           t0 (+ (now) 50)
+           records (atom [])
+           in-flight (atom 0)
+           next-k (atom 0)
+           done (atom 0)
+           finish! (fn []
+                     (let [rs @records
+                           t-end (reduce max t0 (map :end rs))
+                           delays (map :delay rs)
+                           ok (filter #(= 200 (:status %)) rs)
+                           failed (remove #(= 200 (:status %)) rs)
+                           on-time (count (filter #(< % 1000) delays))
+                           by-op (group-by :op rs)]
+                       (resolve
+                        {:rate rate :seconds seconds :inflight inflight
+                         :scheduled total :completed (count rs)
+                         :failed (count failed)
+                         :failed-sample (vec (take 3 (map #(select-keys % [:op :status :body]) failed)))
+                         :on-time on-time
+                         :on-time-pct (* 100.0 (/ on-time (max 1 (count rs))))
+                         :throughput (/ (count ok) (/ (- t-end t0) 1000.0))
+                         :start-delay-ms (stats (vec delays))
+                         :empty-answers (count (filter #(zero? (or (:n %) 0)) ok))
+                         :rows-mean (if (seq ok) (/ (reduce + (map :n ok)) (double (count ok))) 0)
+                         :latency-ms (into {} (for [[op rs] by-op]
+                                                [op (stats (mapv :latency rs))]))
+                         :server-ms (into {} (for [[op rs] by-op]
+                                               [op (stats (mapv #(or (:server-ms %) 0) rs))]))})))
+           dispatch! (fn dispatch! []
+                       ;; start every op whose scheduled time has come, while a slot is free
+                       (loop []
+                         (let [k @next-k]
+                           (when (and (< k total) (< @in-flight inflight))
+                             (let [sched (+ t0 (* k interval))
+                                   t (now)]
+                               (when (>= t sched)
+                                 (swap! next-k inc)
+                                 (swap! in-flight inc)
+                                 (let [{:keys [op params]} (nth ops (mod k (count ops)))
+                                       p (nth params (mod (quot k (count ops)) (count params)))
+                                       start (now)]
+                                   (-> (fetch-edn origin "/ldbc/ic" (assoc p :op op))
+                                       (.then (fn [{:keys [status body]}]
+                                                (let [end (now)
+                                                      ;; a 200 is an answer only if it has the answer's shape;
+                                                      ;; `not edn` reads as a symbol and would otherwise count
+                                                      ;; as an empty answer (control C, 2026-09-11)
+                                                      parsed (when (= status 200)
+                                                               (let [v (try (edn/read-string body) (catch :default _ nil))]
+                                                                 (when (and (map? v) (vector? (:rows v)) (integer? (:n v))) v)))]
+                                                  (swap! records conj
+                                                         {:op op :scheduled sched :start start :end end
+                                                          :delay (- start sched) :latency (- end start)
+                                                          :status (if (and (= status 200) (nil? parsed)) 590 status)
+                                                          :body (when (or (not= status 200) (nil? parsed)) (subs body 0 (min 120 (count body))))
+                                                          :n (:n parsed) :server-ms (:server-ms parsed)}))))
+                                       (.catch (fn [e]
+                                                 (swap! records conj
+                                                        {:op op :scheduled sched :start start :end (now)
+                                                         :delay (- start sched) :latency (- (now) start)
+                                                         :status 599 :body (str e)})))
+                                       (.finally (fn []
+                                                   (swap! in-flight dec)
+                                                   (swap! done inc)
+                                                   (if (= @done total) (finish!) (dispatch!))))))
+                                 (recur)))))))
+           tick (fn tick []
+                  (dispatch!)
+                  (when (< @next-k total)
+                    (let [sched (+ t0 (* @next-k interval))
+                          wait (max 0 (- sched (now)))]
+                      (js/setTimeout tick (min wait 5)))))]
+       (js/setTimeout tick 0)))))
+
+(defn -main [& args]
+  (let [args (vec args)
+        origin (arg args "--origin" "http://127.0.0.1:8090")
+        pdir (arg args "--params" (path/join (os/homedir) ".cache/ldbc-snb/sf1/substitution_parameters-sf1"))
+        rates (mapv parse-long (str/split (arg args "--rates" "5,10,20,40,80,160") #","))
+        seconds (parse-long (arg args "--seconds" "20"))
+        inflight (parse-long (arg args "--inflight" "64"))
+        mix (str/split (arg args "--mix" "ic02,ic07,ic08,ic09") #",")
+        out (arg args "--out" nil)
+        param-file {"ic02" 2 "ic07" 7 "ic08" 8 "ic09" 9}
+        ops (mapv (fn [op] {:op (keyword op) :params (read-params pdir (param-file op))}) mix)]
+    (-> (fetch-edn origin "/ldbc/meta" nil)
+        (.then (fn [{:keys [status body]}]
+                 (when-not (= 200 status)
+                   (println "REFUSED: server not ready" status body) (js/process.exit 2))
+                 (let [meta (edn/read-string body)]
+                   (println "SUT" (pr-str (select-keys meta [:elements :quads :threads :subset-rule])))
+                   (println "load" (pr-str (mapv #(.toFixed % 2) (os/loadavg))) "origin" origin
+                            "mix" (pr-str mix) "inflight" inflight "seconds" seconds)
+                   (println)
+                   (println "  rate  sched  done  fail  on-time%  thru/s  delay-p95  empty  rows  ic02-p50  ic07-p50  ic08-p50  ic09-p50")
+                   (letfn [(go [remaining acc]
+                             (if (empty? remaining)
+                               (js/Promise.resolve acc)
+                               (-> (run-rate! {:origin origin :rate (first remaining) :seconds seconds
+                                               :inflight inflight :ops ops})
+                                   (.then (fn [r]
+                                            (let [l (:latency-ms r)
+                                                  p50 (fn [op] (or (some-> (get-in l [op :p50]) (.toFixed 1)) "-"))]
+                                              (println (str "  " (.padStart (str (:rate r)) 4)
+                                                            "  " (.padStart (str (:scheduled r)) 5)
+                                                            "  " (.padStart (str (:completed r)) 4)
+                                                            "  " (.padStart (str (:failed r)) 4)
+                                                            "  " (.padStart (.toFixed (:on-time-pct r) 2) 8)
+                                                            "  " (.padStart (.toFixed (:throughput r) 1) 6)
+                                                            "  " (.padStart (.toFixed (or (get-in r [:start-delay-ms :p95]) 0) 0) 9)
+                                                            "  " (.padStart (str (:empty-answers r)) 5)
+                                                            "  " (.padStart (.toFixed (:rows-mean r) 1) 4)
+                                                            "  " (.padStart (p50 :ic02) 8)
+                                                            "  " (.padStart (p50 :ic07) 8)
+                                                            "  " (.padStart (p50 :ic08) 8)
+                                                            "  " (.padStart (p50 :ic09) 8))))
+                                            (let [pass (and (zero? (:failed r)) (>= (:on-time-pct r) 95.0))
+                                                  acc (conj acc (assoc r :pass pass))]
+                                              (if pass (go (rest remaining) acc) (js/Promise.resolve acc))))))))]
+                     (-> (go rates [])
+                         (.then (fn [runs]
+                                  (let [passing (filter :pass runs)
+                                        best (last passing)
+                                        receipt {:schema 1
+                                                 :receipt/type :ldbc-snb-interactive-network
+                                                 :date (.slice (.toISOString (js/Date.)) 0 10)
+                                                 :sut (dissoc meta :warm-persons)
+                                                 :driver {:implementation "bench/ldbc_snb_driver.cljk (nbb, open-loop scheduled)"
+                                                          :origin origin :mix mix :inflight inflight :seconds seconds
+                                                          :rule "95% of operations start within 1 s of schedule; zero failed operations"
+                                                          :params "official substitution_parameters-sf1 interactive_{2,7,8,9}_param.txt, cycled"
+                                                          :load-avg (mapv #(.toFixed % 2) (os/loadavg))}
+                                                 :runs runs
+                                                 :throughput-ops-s (when best (:throughput best))
+                                                 :highest-passing-rate (when best (:rate best))
+                                                 :not-an-ldbc-score "four complex reads on a stated SF1 subset, no updates, no short reads, no auditor"}]
+                                    (when (and (seq runs) (pos? (:failed (first runs))))
+                                      (println "REFUSED: failed operations at the first rate; nothing measured")
+                                      (println (pr-str (:failed-sample (first runs))))
+                                      (js/process.exit 2))
+                                    (println)
+                                    (println "throughput" (if best (.toFixed (:throughput best) 1) "none")
+                                             "ops/s at rate" (:highest-passing-rate receipt)
+                                             "(highest rate with >= 95% on-time starts and 0 failures)")
+                                    (when out
+                                      (fs/writeFileSync out (pr-str receipt))
+                                      (println "wrote" out))
+                                    (js/process.exit 0)))))))))
+        (.catch (fn [e] (println "REFUSED:" (str e)) (js/process.exit 2))))))
+
+(apply -main *command-line-args*)
