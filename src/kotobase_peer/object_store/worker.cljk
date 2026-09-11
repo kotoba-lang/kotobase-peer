@@ -518,7 +518,7 @@
    measured 2026-08-25, `ipld/encode` rejects `{:cid \"x\"}` on the JVM too.
    The JVM suite is green because this repository's `.cljc` tests never reach
    these lines, and its two `.cljs` tests -- the only ones that do -- were
-   discovered by no runner (`run-nbb-tests.cljs` finds `_test.cljc` only).
+   discovered by no runner (`run-nbb-tests.cljk` finds `_test.cljc` only).
 
    One helper rather than three hand-rewritten maps, because the mistake is the
    same one three times: a Clojure map is not a Data Model map."

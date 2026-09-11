@@ -3,7 +3,7 @@
   (`hot-datoms`), and compaction (`fold!`, both unbounded and the new
   `max-novelty`-bounded form) paths against a growing novelty backlog.
 
-  This is NOT a correctness test (see `test/kotobase_peer/core_test.cljc`
+  This is NOT a correctness test (see `test/kotobase_peer/core_test.cljk`
   for that) -- it exists to answer, with real numbers instead of static
   reasoning, the question that came up investigating gftdcojp/app-aozora#78
   (`getRecord`/`listRecords` timing out / getting platform-canceled against
