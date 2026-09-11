@@ -177,21 +177,35 @@
 
 (def ^:private everything (constantly true))
 
+(defn- top20-before
+  "The date bound and the top-20 written INTO the query (ayatori iteration
+  18): `[(< ?date max)]` is fused by the engine into a range on
+  creationDate -- a keyed scan per bound message since datalog da95b877 --
+  and `:order-by`/`:limit` do the ordering. The bound is the STRING form of
+  max-date because creationDate is stored as a string here and the range
+  compares like with like; every stored value is a 13-digit epoch-ms, so
+  string order is date order. Rows come back `[x msg date-string]` and are
+  returned as `[x msg date-long]`, the shape the Neo4j gate compares.
+  The planner refuses to reorder a query with a predicate clause, so the
+  clause order written here is the plan."
+  [db where person max-date]
+  (->> (eng/query db
+                  {:find '[?x ?msg ?date]
+                   :in '[?person]
+                   :where (conj where [(list '< '?date (str max-date))])
+                   :order-by '[[?date :desc] [?msg :asc]]
+                   :limit 20}
+                  everything [person])
+       (mapv (fn [[x m d]] [x m (parse-long d)]))))
+
 (defn- kb-ic02
   "IC02: the 20 most recent Messages by the start person's direct friends,
-  created before max-date. Datalog join, then harness top-20 (no ORDER BY in
-  arrangement.datalog)."
+  created before max-date. Date bound and top-20 inside the query."
   [db person max-date]
-  (->> (eng/query db
-                  '{:find [?friend ?msg ?date]
-                    :in [?person]
-                    :where [[?person "knows" ?friend]
-                            [?msg "hasCreator" ?friend]
-                            [?msg "message/creationDate" ?date]]}
-                  everything [person])
-       (keep (fn [[f m d]] (let [dl (parse-long d)] (when (< dl max-date) [f m dl]))))
-       (sort-by (juxt (comp - #(nth % 2)) second))
-       (take 20) vec))
+  (top20-before db '[[?person "knows" ?x]
+                     [?msg "hasCreator" ?x]
+                     [?msg "message/creationDate" ?date]]
+                person max-date))
 
 (defn- kb-ic09
   "IC09: same as IC02 but over friends AND friends-of-friends, excluding the
@@ -200,22 +214,21 @@
   and issuing 1,300 point queries would measure the harness's loop rather
   than the engine's join."
   [db person max-date]
-  (let [one (eng/query db '{:find [?f ?msg ?date]
-                            :in [?person]
-                            :where [[?person "knows" ?f]
-                                    [?msg "hasCreator" ?f]
-                                    [?msg "message/creationDate" ?date]]}
-                       everything [person])
-        two (eng/query db '{:find [?f2 ?msg ?date]
-                            :in [?person]
-                            :where [[?person "knows" ?f1]
-                                    [?f1 "knows" ?f2]
-                                    [?msg "hasCreator" ?f2]
-                                    [?msg "message/creationDate" ?date]]}
-                       everything [person])]
+  (let [one (top20-before db '[[?person "knows" ?x]
+                               [?msg "hasCreator" ?x]
+                               [?msg "message/creationDate" ?date]]
+                          person max-date)
+        ;; the two-hop half may reach the start person and messages the
+        ;; one-hop half already has; the union's top 20 is a subset of the
+        ;; union of the two top-20s, so limiting each is exact
+        two (top20-before db '[[?person "knows" ?f1]
+                               [?f1 "knows" ?x]
+                               [?msg "hasCreator" ?x]
+                               [?msg "message/creationDate" ?date]]
+                          person max-date)]
     (->> (into one two)
          (remove (fn [[f _ _]] (= f person)))
-         (keep (fn [[f m d]] (let [dl (parse-long d)] (when (< dl max-date) [f m dl]))))
+         distinct
          (sort-by (juxt (comp - #(nth % 2)) second))
          (take 20) vec)))
 

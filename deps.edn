@@ -21,6 +21,13 @@
         io.github.kotoba-lang/security
         {:git/sha "d87f334235bef7229bf8b8231c200612f824cbc2"}
         io.github.kotoba-lang/text {:git/sha "73bdb13ae7a3d004b44bca08be03a3191157a38f"}
+        ;; Explicit floor (ADR-2609051700: a base library's fix does not reach a
+        ;; deployer unless someone names the sha). da95b877 is the range branch
+        ;; that treats a bound entity as a keyed scan (ayatori iteration 18);
+        ;; before it, fusing `[(< ?date max)]` walked all 86,932 creationDate
+        ;; values per bound message. main is .cljk from 8645651 on, so this
+        ;; classpath loads only through scripts/cljk-classpath.cljk.
+        io.github.kotoba-lang/datalog {:git/sha "da95b8772c1a7160df1b0a38a6e2d3235300862c"}
        ;; formerly two deps here (kqe + quad-store) -- kqe merged into
         ;; arrangement (ADR-2607050700), so this is the one coordinate now.
         io.github.kotoba-lang/arrangement {:git/sha "9c9f45d4cd043873cd5c5ea65fa3af8a8ead5e6d"}
