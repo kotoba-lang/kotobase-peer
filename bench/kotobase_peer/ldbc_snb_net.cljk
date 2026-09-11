@@ -113,6 +113,12 @@
       [:datalog :is4] (#'ldbc/kb-is4 db message)
       [:datalog :is5] (#'ldbc/kb-is5 db message)
       [:datalog :is7] (#'ldbc/kb-is7 db message)
+      [:datalog :is1] (#'ldbc/kb-is1 db person)
+      [:datalog :is3] (#'ldbc/kb-is3 db person)
+      [:datalog :is6] (#'ldbc/kb-is6 db message)
+      [:index :is1] (#'ldbc/kb-is1-index db person)
+      [:index :is3] (#'ldbc/kb-is3-index db person)
+      [:index :is6] (#'ldbc/kb-is6-index db message)
       [:index :is2] (#'ldbc/kb-is2-index db person)
       [:index :is4] (#'ldbc/kb-is4-index db message)
       [:index :is5] (#'ldbc/kb-is5-index db message)
@@ -196,7 +202,10 @@
                          (concat (for [line (rest (clojure.string/split-lines (slurp (str params-dir "/interactive_7_param.txt"))))
                                        :when (seq line)]
                                    {:op :is2 :person line})
-                                 (for [op [:is4 :is5 :is7] m msgs] {:op op :message m})))))
+                                 (for [line (rest (clojure.string/split-lines (slurp (str params-dir "/interactive_7_param.txt"))))
+                                       :when (seq line) op [:is1 :is3]]
+                                   {:op op :person line})
+                                 (for [op [:is4 :is5 :is6 :is7] m msgs] {:op op :message m})))))
         agreement (when params (#'ldbc/index-path-agrees? db max-date params))
         index-ok? (boolean (and agreement (zero? (count (:disagreements agreement)))))
         meta (assoc meta :index-path {:enabled index-ok?

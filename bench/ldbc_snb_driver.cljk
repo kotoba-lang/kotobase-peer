@@ -204,7 +204,7 @@
         impl (keyword (arg args "--impl" "datalog"))
         max-swap-pct (parse-double (arg args "--max-swap-pct" "90"))
         mem (host-memory)
-        param-file {"ic02" 2 "ic07" 7 "ic08" 8 "ic09" 9 "is2" 7 "is4" :message "is5" :message "is7" :message}
+        param-file {"ic02" 2 "ic07" 7 "ic08" 8 "ic09" 9 "is1" 7 "is2" 7 "is3" 7 "is4" :message "is5" :message "is6" :message "is7" :message}
         ops (mapv (fn [op] {:op (keyword op) :params (read-params pdir (param-file op))}) mix)]
     (-> (fetch-edn origin "/ldbc/meta" nil)
         (.then (fn [{:keys [status body]}]
