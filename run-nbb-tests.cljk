@@ -6,7 +6,7 @@
 ;; -test$-suffix convention shadow-cljs.edn's `:ns-regexp "-test$"` already
 ;; assumes) and resolves the classpath from `clojure -Spath`, filtered to
 ;; directories only (jars are JVM-only; nbb can't load them) -- the same
-;; approach gen-shadow-cljs-edn.cljs already uses for the cljs build, so nbb
+;; approach gen-shadow-cljs-edn.cljk already uses for the cljs build, so nbb
 ;; tests against the exact pinned deps.edn dependencies too, not a
 ;; hand-duplicated list that can drift.
 ;;
@@ -26,7 +26,7 @@
 ;; here as it was in bb, not a leftover of the old host.
 ;; ## Why the string calls here are JS interop and not `kotoba.lang.text`
 ;;
-;; npm invokes this as bare `nbb run-nbb-tests.cljs`, with NO classpath --
+;; npm invokes this as bare `nbb run-nbb-tests.cljk`, with NO classpath --
 ;; because THIS SCRIPT is what computes the classpath (below) for the inner
 ;; process. It therefore cannot require a library to do it; the bootstrap is
 ;; circular. Measured 2026-09-09, requiring `kotoba.lang.text` here made

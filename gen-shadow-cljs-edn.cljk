@@ -12,7 +12,7 @@
 ;;
 ;; ## Why the string calls here are JS interop and not `kotoba.lang.text`
 ;;
-;; npm invokes this as bare `nbb gen-shadow-cljs-edn.cljs`, with NO classpath --
+;; npm invokes this as bare `nbb gen-shadow-cljs-edn.cljk`, with NO classpath --
 ;; because THIS SCRIPT is what computes the classpath. So it cannot require a
 ;; library to do it: the bootstrap is circular. Measured 2026-09-09, requiring
 ;; `kotoba.lang.text` here made `npm run test:cljs` and `npm run build:view-e2e`
