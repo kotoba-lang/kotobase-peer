@@ -49,6 +49,7 @@
   every served read is also compared with Neo4j over every official parameter
   -- the reference the network rows cite."
   (:require [kotobase-peer.core :as eng]
+            [arrangement.core :as qs]
             [kotoba.lang.text :as str]
             [clojure.java.io :as io])
   (:import [org.neo4j.dbms.api DatabaseManagementServiceBuilder]
@@ -328,9 +329,29 @@
 ;; net server refuses to serve the index path if it does not.
 
 (defn- by-avet
-  "Subjects with `[s p o]` -- the AVET point lookup through the public API."
+  "Subjects with `[s p o]` -- the AVET point lookup. Straight off the index
+  (arrangement.core/by-predicate-value, a set of subjects): the public
+  `eng/datoms` route built one `{:e :a :v_edn :added}` map per subject and
+  wire-encoded the value, which was 20-30% of the IC09 twin on 80k messages
+  (ayatori iteration 26)."
   [db p o]
-  (map :e (eng/datoms db {:index :avet :components [p o]} everything)))
+  (qs/by-predicate-value db p o))
+
+(defn- top-k-by
+  "The `k` smallest rows under `cmp`, kept in a bounded sorted set as rows
+  stream by -- so a twin that sees 80k candidate rows sorts 20, not 80k."
+  [k cmp rows]
+  (vec (reduce (fn [acc r]
+                 (let [acc (conj acc r)]
+                   (if (> (count acc) k) (disj acc (first (rseq acc))) acc)))
+               (sorted-set-by cmp)
+               rows)))
+
+(def ^:private newest-first-then-msg
+  "creationDate desc, message id asc -- the LDBC tie rule, as a comparator on
+  `[x msg date]` rows; distinct rows never compare equal (msg is a key)."
+  (fn [[xa ma da] [xb mb db2]]
+    (let [c (compare db2 da)] (if (zero? c) (let [c2 (compare ma mb)] (if (zero? c2) (compare xa xb) c2)) c))))
 
 (defn- attr1 [db s a] (first (get (eng/entity db s) a)))
 
@@ -344,16 +365,14 @@
 (defn- kb-ic02-index [db person max-date]
   (->> (get (eng/entity db person) "knows")
        (mapcat #(msg-rows db % max-date))
-       (sort-by (juxt (comp - #(nth % 2)) second))
-       (take 20) vec))
+       (top-k-by 20 newest-first-then-msg)))
 
 (defn- kb-ic09-index [db person max-date]
   (let [friends (get (eng/entity db person) "knows" #{})
         fof (into friends (mapcat #(get (eng/entity db %) "knows")) friends)]
     (->> (disj fof person)
          (mapcat #(msg-rows db % max-date))
-         (sort-by (juxt (comp - #(nth % 2)) second))
-         (take 20) vec)))
+         (top-k-by 20 newest-first-then-msg))))
 
 (defn- kb-ic07-index [db person]
   (->> (by-avet db "hasCreator" person)
