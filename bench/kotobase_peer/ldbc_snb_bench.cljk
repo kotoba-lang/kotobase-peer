@@ -44,7 +44,10 @@
       reported -- but the work is not distributed the same way, and that is
       itself a finding about kotobase's query surface.
 
-  Usage: clojure -M:ldbc-snb-bench <ldbc-dynamic-dir> [posts] [samples]"
+  Usage: clojure -M:ldbc-snb-bench <ldbc-dynamic-dir> [posts] [samples] [params-dir]
+  With `params-dir` (substitution_parameters-sf<N> plus short_message_param.txt)
+  every served read is also compared with Neo4j over every official parameter
+  -- the reference the network rows cite."
   (:require [kotobase-peer.core :as eng]
             [kotoba.lang.text :as str]
             [clojure.java.io :as io])
@@ -464,6 +467,30 @@
    RETURN a.pid AS author, r.pid AS reply, r.creationDate AS date
    ORDER BY date DESC, reply ASC LIMIT 20")
 
+(def ^:private cy-is2
+  "MATCH (p:Person {pid:$pid})<-[:HAS_CREATOR]-(m:Message)
+   WITH m ORDER BY m.creationDate DESC, m.pid DESC LIMIT 10
+   MATCH (m)-[:REPLY_OF*0..]->(root:Message) WHERE NOT (root)-[:REPLY_OF]->()
+   MATCH (root)-[:HAS_CREATOR]->(a:Person)
+   RETURN m.pid AS msg, m.content AS content, m.creationDate AS date,
+          root.pid AS root, a.pid AS author, a.firstName AS f, a.lastName AS l
+   ORDER BY date DESC, msg DESC")
+
+(def ^:private cy-is4
+  "MATCH (m:Message {pid:$mid}) RETURN m.creationDate AS date, m.content AS content")
+
+(def ^:private cy-is5
+  "MATCH (m:Message {pid:$mid})-[:HAS_CREATOR]->(p:Person)
+   RETURN p.pid AS person, p.firstName AS f, p.lastName AS l")
+
+(def ^:private cy-is7
+  "MATCH (m:Message {pid:$mid})<-[:REPLY_OF]-(r:Message)-[:HAS_CREATOR]->(a:Person)
+   MATCH (m)-[:HAS_CREATOR]->(ma:Person)
+   RETURN r.pid AS reply, r.content AS content, r.creationDate AS date,
+          a.pid AS author, a.firstName AS f, a.lastName AS l,
+          EXISTS { (a)-[:KNOWS]-(ma) } AS knows
+   ORDER BY date DESC, author ASC")
+
 (defn- batched!
   "Run one parameterised write per chunk, each in its OWN transaction --
   a single transaction holding half a million relationship creates is a
@@ -549,11 +576,47 @@
   (let [deg (reduce (fn [m [a b]] (-> m (update a (fnil inc 0)) (update b (fnil inc 0)))) {} knows)]
     (->> deg (sort-by (juxt (comp - val) key)) (take n) (mapv key) sort vec)))
 
+(defn- read-param-lines [params-dir file]
+  (->> (str/split-lines (slurp (str params-dir "/" file))) rest (remove empty?) vec))
+
+(defn reference-agreement
+  "Every served read against Neo4j on the OFFICIAL parameters (and this
+  subset's short-read message ids), not only on the first start person:
+  `{op {:checked n :disagreements [...]}}`. IC02/IC08/IS2/IS4/IS5/IS7 compare
+  ordered rows; IC07 liker sets and IC09 message sets (creationDate ties at
+  the limit boundary, as the first-person gate already does). A count per
+  op, so one disagreement and a broken run are different answers."
+  [db tx max-date params-dir]
+  (let [split (fn [line] (str/split line #"\|"))
+        norm-kb (fn [rows] (mapv (fn [r] [(str (first r)) (str (second r)) (nth r 2)]) rows))
+        norm-neo (fn [rows ka kb] (mapv (fn [r] [(str (get r ka)) (str (get r kb)) (:date r)]) rows))
+        ic (fn [n f] (let [lines (read-param-lines params-dir (str "interactive_" n "_param.txt"))
+                           bad (remove (fn [line] (let [[p md] (split line)] (f p (if md (parse-long md) max-date)))) lines)]
+                       {:checked (count lines) :disagreements (vec bad)}))
+        msgs (read-param-lines params-dir "short_message_param.txt")
+        is (fn [f] (let [bad (remove f msgs)] {:checked (count msgs) :disagreements (vec bad)}))
+        is2-persons (read-param-lines params-dir "interactive_7_param.txt")]
+    {:ic02 (ic 2 (fn [p md] (= (norm-kb (kb-ic02 db p md)) (norm-neo (neo4j-rows tx cy-ic02 {"pid" p "maxDate" md}) :friend :msg))))
+     :ic07 (ic 7 (fn [p _] (= (set (map first (kb-ic07 db p))) (set (map (comp str :liker) (neo4j-rows tx cy-ic07 {"pid" p}))))))
+     :ic08 (ic 8 (fn [p _] (= (norm-kb (kb-ic08 db p)) (norm-neo (neo4j-rows tx cy-ic08 {"pid" p}) :author :reply))))
+     :ic09 (ic 9 (fn [p md] (= (set (map second (kb-ic09 db p md))) (set (map (comp str :msg) (neo4j-rows tx cy-ic09 {"pid" p "maxDate" md}))))))
+     :is2 (let [bad (remove (fn [p] (= (kb-is2 db p)
+                                       (mapv (fn [r] [(str (:msg r)) (:content r) (:date r) (str (:root r)) (str (:author r)) (:f r) (:l r)])
+                                             (neo4j-rows tx cy-is2 {"pid" p}))))
+                            is2-persons)]
+            {:checked (count is2-persons) :disagreements (vec bad)})
+     :is4 (is (fn [m] (= (kb-is4 db m) (mapv (fn [r] [(:date r) (:content r)]) (neo4j-rows tx cy-is4 {"mid" m})))))
+     :is5 (is (fn [m] (= (kb-is5 db m) (mapv (fn [r] [(str (:person r)) (:f r) (:l r)]) (neo4j-rows tx cy-is5 {"mid" m})))))
+     :is7 (is (fn [m] (= (kb-is7 db m)
+                         (mapv (fn [r] [(str (:reply r)) (:content r) (:date r) (str (:author r)) (:f r) (:l r) (boolean (:knows r))])
+                               (neo4j-rows tx cy-is7 {"mid" m})))))}))
+
 (defn -main [& args]
   (let [dir (or (first args)
                 (throw (ex-info "usage: clojure -M:ldbc-snb-bench <ldbc-dynamic-dir> [posts] [samples]" {})))
         n-posts (parse-long (or (second args) "35000"))
         samples (parse-long (or (nth args 2 nil) "30"))
+        params-dir (nth args 3 nil)
         load-t (elapsed-ms #(load-subset dir n-posts))
         data (:result load-t)
         max-date (+ 1 (reduce max 0 (keep first (vals (:messages data)))))
@@ -587,6 +650,12 @@
                       (norm-neo (neo4j-rows tx cy-ic08 {"pid" p}) :author :reply))
              :ic09 (= (set (map second (kb-ic09 db p max-date)))
                       (set (map (comp str :msg) (neo4j-rows tx cy-ic09 {"pid" p "maxDate" max-date}))))}))
+        ;; ---- the same, over every official parameter (and the subset's
+        ;; short-read messages) when a params dir is given -- the reference
+        ;; the network rows cite (ayatori iteration 23)
+        official-agreement (when params-dir
+                             (with-open [tx (.beginTx gdb)]
+                               (reference-agreement db tx max-date params-dir)))
         ;; ---- warm both engines
         _ (with-open [tx (.beginTx gdb)]
             (doseq [p (take 5 starts)]
@@ -654,6 +723,10 @@
                        :ic02 (stats (:ic02 neo-times)) :ic07 (stats (:ic07 neo-times))
                        :ic08 (stats (:ic08 neo-times)) :ic09 (stats (:ic09 neo-times))}
       :answers-agree agreement
+      :answers-agree-official (when official-agreement
+                                (into {} (map (fn [[op v]] [op (assoc v :disagreements (count (:disagreements v))
+                                                                          :first-disagreement (first (:disagreements v)))]))
+                                      official-agreement))
       :paired-ratio
       (assoc paired-ratios
              :note "kotobase-ms / neo4j-ms computed PER SAMPLE with the two engines run back to back, then summarised. This is the column to compare across runs; a quotient of two separately-summarised medians is not, which is what every receipt before 2026-08-02 used.")
