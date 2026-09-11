@@ -128,6 +128,14 @@
                    :extra-deps {org.neo4j/neo4j {:mvn/version "2025.03.0"}}
                    :jvm-opts ["-Xmx12g"]
                    :main-opts ["-m" "kotobase-peer.ldbc-snb-bench"]}
+  ;; The same four IC reads served over HTTP on loopback so a driver in
+  ;; another process can measure LDBC's own metric (scheduled throughput,
+  ;; 95% on-time). Reuses ldbc-snb-bench's loader/queries through their vars,
+  ;; so Neo4j is on the classpath for the ns to resolve and is never opened.
+  :ldbc-snb-net {:extra-paths ["bench"]
+                 :extra-deps {org.neo4j/neo4j {:mvn/version "2025.03.0"}}
+                 :jvm-opts ["-Xmx12g"]
+                 :main-opts ["-m" "kotobase-peer.ldbc-snb-net"]}
   :dag-shape-bench {:extra-paths ["bench"]
                     :jvm-opts ["-Xmx8g"]
                     :main-opts ["-m" "kotobase-peer.dag-shape-bench"]}

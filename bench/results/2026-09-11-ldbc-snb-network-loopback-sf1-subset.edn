@@ -1,0 +1,330 @@
+{:schema 1,
+ :date "2026-09-11",
+ :throughput-ops-s 7.762485851478958,
+ :what-this-is-not
+ ["Not an LDBC score: 4 of 29 operations, our own driver, a stated SF1 subset, no updates, no auditor."
+  "Not a hardware-normalised comparison: 8 threads on a 10-core workstation at load 12-21 against a 160-core node; the number is reported raw."],
+ :benchmark
+ "kotoba-lang/ayatori bench/benchmark.edn :ldbc-snb-interactive-network-v2 (rung SF1, origin :loopback)",
+ :host
+ {:cores 10,
+  :performance-cores 8,
+  :ram-gib 32,
+  :note
+  "load average at the driver start is in :driver :load-avg; other agents were running"},
+ :receipt/type :ldbc-snb-interactive-network,
+ :highest-passing-rate 8,
+ :not-an-ldbc-score
+ "four complex reads on a stated SF1 subset, no updates, no short reads, no auditor",
+ :sut
+ {:quads 810221,
+  :ready true,
+  :max-date 1347528903591,
+  :load-ms 39817.962083,
+  :elements
+  {:persons 9892,
+   :knows-edges 180623,
+   :messages 86932,
+   :posts 35000,
+   :comments 51932,
+   :has-creator 86932,
+   :reply-of 51932,
+   :likes 38821},
+  :build-ms 2600.651667,
+  :threads 8,
+  :subset-rule
+  "all persons + all knows; 35000 most recent Posts + full transitive reply trees; hasCreator for included Messages; likes onto included Messages",
+  :implementation
+  "kotobase-peer.ldbc-snb-net over kotobase-peer.ldbc-snb-bench",
+  :dataset
+  "LDBC SNB Interactive v1, SF1, Datagen v1.0.0, CsvComposite/LongDateFormatter"},
+ :runs
+ [{:on-time 40,
+   :server-ms
+   {:ic02
+    {:n 10,
+     :p50 48.233083,
+     :p95 1510.220625,
+     :p99 1510.220625,
+     :max 1510.220625},
+    :ic07
+    {:n 10,
+     :p50 28.850833,
+     :p95 788.448459,
+     :p99 788.448459,
+     :max 788.448459},
+    :ic08
+    {:n 10,
+     :p50 150.966208,
+     :p95 1932.905541,
+     :p99 1932.905541,
+     :max 1932.905541},
+    :ic09
+    {:n 10,
+     :p50 572.489666,
+     :p95 3409.450292,
+     :p99 3409.450292,
+     :max 3409.450292}},
+   :completed 40,
+   :latency-ms
+   {:ic02
+    {:n 10,
+     :p50 62.81475000000137,
+     :p95 1659.601291,
+     :p99 1659.601291,
+     :max 1659.601291},
+    :ic07
+    {:n 10,
+     :p50 43.194250000000466,
+     :p95 805.485042,
+     :p99 805.485042,
+     :max 805.485042},
+    :ic08
+    {:n 10,
+     :p50 153.29212499999994,
+     :p95 1939.4825839999999,
+     :p99 1939.4825839999999,
+     :max 1939.4825839999999},
+    :ic09
+    {:n 10,
+     :p50 598.8308749999997,
+     :p95 3413.542708,
+     :p99 3413.542708,
+     :max 3413.542708}},
+   :empty-answers 22,
+   :throughput 1.9526801248344716,
+   :inflight 8,
+   :rate 2,
+   :seconds 20,
+   :rows-mean 6.35,
+   :scheduled 40,
+   :pass true,
+   :on-time-pct 100,
+   :start-delay-ms
+   {:n 40,
+    :p50 0.8318749999998545,
+    :p95 1.8867499999978463,
+    :p99 2.035207999999784,
+    :max 2.035207999999784},
+   :failed 0}
+  {:on-time 80,
+   :server-ms
+   {:ic02
+    {:n 20,
+     :p50 31.28675,
+     :p95 70.732167,
+     :p99 70.732167,
+     :max 70.732167},
+    :ic07
+    {:n 20,
+     :p50 17.198334,
+     :p95 49.747959,
+     :p99 49.747959,
+     :max 49.747959},
+    :ic08
+    {:n 20,
+     :p50 242.614833,
+     :p95 838.627208,
+     :p99 838.627208,
+     :max 838.627208},
+    :ic09
+    {:n 20,
+     :p50 706.80175,
+     :p95 2026.655958,
+     :p99 2026.655958,
+     :max 2026.655958}},
+   :completed 80,
+   :latency-ms
+   {:ic02
+    {:n 20,
+     :p50 34.47708400000192,
+     :p95 78.88862499999959,
+     :p99 78.88862499999959,
+     :max 78.88862499999959},
+    :ic07
+    {:n 20,
+     :p50 19.987292000001617,
+     :p95 53.514540999996825,
+     :p99 53.514540999996825,
+     :max 53.514540999996825},
+    :ic08
+    {:n 20,
+     :p50 244.55995800000164,
+     :p95 844.5648749999964,
+     :p99 844.5648749999964,
+     :max 844.5648749999964},
+    :ic09
+    {:n 20,
+     :p50 710.4754579999972,
+     :p95 2030.8477500000008,
+     :p99 2030.8477500000008,
+     :max 2030.8477500000008}},
+   :empty-answers 47,
+   :throughput 3.7947794050268904,
+   :inflight 8,
+   :rate 4,
+   :seconds 20,
+   :rows-mean 5.8,
+   :scheduled 80,
+   :pass true,
+   :on-time-pct 100,
+   :start-delay-ms
+   {:n 80,
+    :p50 0.6800409999996191,
+    :p95 1.3608749999984866,
+    :p99 4.138415999994322,
+    :max 4.138415999994322},
+   :failed 0}
+  {:on-time 160,
+   :server-ms
+   {:ic02
+    {:n 40,
+     :p50 28.363,
+     :p95 152.898042,
+     :p99 1747.299042,
+     :max 1747.299042},
+    :ic07
+    {:n 40,
+     :p50 22.066959,
+     :p95 66.201125,
+     :p99 107.714375,
+     :max 107.714375},
+    :ic08
+    {:n 40,
+     :p50 234.304084,
+     :p95 806.678875,
+     :p99 835.68975,
+     :max 835.68975},
+    :ic09
+    {:n 40,
+     :p50 998.325709,
+     :p95 1940.48425,
+     :p99 3410.986333,
+     :max 3410.986333}},
+   :completed 160,
+   :latency-ms
+   {:ic02
+    {:n 40,
+     :p50 32.635167000000365,
+     :p95 171.75666700000147,
+     :p99 1750.5279169999994,
+     :max 1750.5279169999994},
+    :ic07
+    {:n 40,
+     :p50 24.848540999999386,
+     :p95 106.2403340000019,
+     :p99 111.4910830000008,
+     :max 111.4910830000008},
+    :ic08
+    {:n 40,
+     :p50 236.43983400000434,
+     :p95 816.005333000001,
+     :p99 838.3447909999959,
+     :max 838.3447909999959},
+    :ic09
+    {:n 40,
+     :p50 1001.4922080000033,
+     :p95 1943.9010419999977,
+     :p99 3419.3515000000043,
+     :max 3419.3515000000043}},
+   :empty-answers 83,
+   :throughput 7.762485851478958,
+   :inflight 8,
+   :rate 8,
+   :seconds 20,
+   :rows-mean 6.96875,
+   :scheduled 160,
+   :pass true,
+   :on-time-pct 100,
+   :start-delay-ms
+   {:n 160,
+    :p50 0.7791660000002594,
+    :p95 2.020749999996042,
+    :p99 5.5946249999979045,
+    :max 5.631582999994862},
+   :failed 0}
+  {:on-time 73,
+   :server-ms
+   {:ic02
+    {:n 80,
+     :p50 41.441625,
+     :p95 2045.551542,
+     :p99 3371.923708,
+     :max 3371.923708},
+    :ic07
+    {:n 80,
+     :p50 18.6945,
+     :p95 82.518291,
+     :p99 128.104875,
+     :max 128.104875},
+    :ic08
+    {:n 80,
+     :p50 431.381125,
+     :p95 1103.444667,
+     :p99 1331.48925,
+     :max 1331.48925},
+    :ic09
+    {:n 80,
+     :p50 1842.84575,
+     :p95 2632.170458,
+     :p99 6241.364416,
+     :max 6241.364416}},
+   :completed 320,
+   :latency-ms
+   {:ic02
+    {:n 80,
+     :p50 46.07204199999978,
+     :p95 2047.7957920000044,
+     :p99 3381.9639590000006,
+     :max 3381.9639590000006},
+    :ic07
+    {:n 80,
+     :p50 22.335499999986496,
+     :p95 90.70395900000585,
+     :p99 132.0818750000035,
+     :max 132.0818750000035},
+    :ic08
+    {:n 80,
+     :p50 434.7237920000043,
+     :p95 1107.981415999995,
+     :p99 1335.9611670000013,
+     :max 1335.9611670000013},
+    :ic09
+    {:n 80,
+     :p50 1877.4232920000068,
+     :p95 2636.956083000012,
+     :p99 6244.741832999993,
+     :max 6244.741832999993}},
+   :empty-answers 139,
+   :throughput 11.349221287649831,
+   :inflight 8,
+   :rate 16,
+   :seconds 20,
+   :rows-mean 8.165625,
+   :scheduled 320,
+   :pass false,
+   :on-time-pct 22.8125,
+   :start-delay-ms
+   {:n 320,
+    :p50 2831.389624999996,
+    :p95 5632.270250000001,
+    :p99 6197.894,
+    :max 6243.968332999997},
+   :failed 0}],
+ :driver
+ {:implementation
+  "bench/ldbc_snb_driver.cljk (nbb, open-loop scheduled)",
+  :origin "http://127.0.0.1:8090",
+  :mix ["ic02" "ic07" "ic08" "ic09"],
+  :inflight 8,
+  :seconds 20,
+  :rule
+  "95% of operations start within 1 s of schedule; zero failed operations",
+  :params
+  "official substitution_parameters-sf1 interactive_{2,7,8,9}_param.txt, cycled",
+  :load-avg ["27.00" "20.95" "21.49"]},
+ :reading
+ ["Highest passing rate 8 ops/s (100% on-time), rate 16 fails the 95% rule outright (22.8% on-time, start-delay p95 5.6 s): between 8 and 16 the 8-slot server saturates and the queue, not the network, sets the number."
+  "Empty answers are 52% of completed operations (83/160 at rate 8). The subset keeps the 35,000 MOST RECENT posts (about the last month of a 3-year simulation) while the official parameters carry maxDate values across 2011-2012, so IC02/IC09 with an early maxDate find nothing and IC07/IC08 for a person with no kept message find nothing. Half the throughput is empty answers; this is a subset rung and the row says so."
+  "Per-operation client p50 at rate 8: IC02 32.6 ms, IC07 24.8 ms, IC08 236 ms, IC09 1002 ms. IC08 is two orders above its in-JVM harness p50 (0.77 ms, 2026-08-14 receipt) on the same query -- different start persons (official parameters vs highest-degree), a 10x larger subset, and 8 concurrent operations on a loaded host; which of the three it is has not been separated and is the first seed for the next iteration."
+  "Against the target (Huawei GES SF300 139,411 ops/s) the raw ratio is 1.8e4; SF1 is not on the audited table and the ratio is written only so the axis has a scale."]}
