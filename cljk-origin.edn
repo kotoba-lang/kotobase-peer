@@ -11,6 +11,7 @@
   "bench/kotobase_peer/head_to_head_neo4j.cljk" ".clj"
   "bench/kotobase_peer/ic02_diag.cljk" ".clj"
   "bench/kotobase_peer/ic02_scale_diag.cljk" ".clj"
+  "bench/kotobase_peer/ic09_scale_diag.cljk" ".clj"
   "bench/kotobase_peer/ic09_diag.cljk" ".clj"
   "bench/kotobase_peer/ldbc_snb_bench.cljk" ".clj"
   "bench/kotobase_peer/ldbc_snb_net.cljk" ".clj"
