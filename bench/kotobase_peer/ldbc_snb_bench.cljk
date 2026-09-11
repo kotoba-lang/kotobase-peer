@@ -85,7 +85,13 @@
   [dir n-posts]
   (let [persons (into {} (map (fn [[id fname lname & _]] [id [fname lname]]))
                       (rows dir "person_0_0.csv"))
-        knows (mapv (fn [[a b & _]] [a b]) (rows dir "person_knows_person_0_0.csv"))
+        ;; profile fields (IS1) and friendship dates (IS3), ayatori iteration 24
+        profiles (into {} (map (fn [[id _ _ gender birthday cd ip browser & _]]
+                                 [id {:gender gender :birthday (parse-long birthday) :creationDate (parse-long cd)
+                                      :locationIP ip :browserUsed browser}]))
+                       (rows dir "person_0_0.csv"))
+        city (into {} (map (fn [[p place]] [p place])) (rows dir "person_isLocatedIn_place_0_0.csv"))
+        knows (mapv (fn [[a b cd]] [a b (parse-long cd)]) (rows dir "person_knows_person_0_0.csv"))
         ;; posts: keep the n-posts most recent by creationDate
         kept-posts (->> (reduce-rows dir "post_0_0.csv"
                                      (fn [acc [id _img cd _ip _br _lang content _len]]
@@ -143,7 +149,26 @@
                      (filter (fn [[c p]] (and (kept-comments c) (kept-comments p))))
                      reply-comment)
      :likes (into (keep-likes "person_likes_post_0_0.csv" post-ids)
-                  (keep-likes "person_likes_comment_0_0.csv" kept-comments))}))
+                  (keep-likes "person_likes_comment_0_0.csv" kept-comments))
+     :profiles profiles
+     :city city
+     ;; forums (IS6): the forum of every kept Post, its title, creationDate
+     ;; and moderator -- only forums that contain a kept post are loaded
+     :forums (let [post->forum (persistent!
+                                (reduce-rows dir "forum_containerOf_post_0_0.csv"
+                                             (fn [acc [f post]] (if (post-ids post) (assoc! acc post f) acc))
+                                             (transient {})))
+                   wanted (set (vals post->forum))
+                   moderator (persistent!
+                              (reduce-rows dir "forum_hasModerator_person_0_0.csv"
+                                           (fn [acc [f p]] (if (wanted f) (assoc! acc f p) acc))
+                                           (transient {})))
+                   meta (persistent!
+                         (reduce-rows dir "forum_0_0.csv"
+                                      (fn [acc [f title cd]] (if (wanted f) (assoc! acc f [title (parse-long cd)]) acc))
+                                      (transient {})))]
+               {:post->forum post->forum
+                :forums (into {} (map (fn [[f [title cd]]] [f {:title title :creationDate cd :moderator (get moderator f)}])) meta)})}))
 
 ;; ── kotobase side ──────────────────────────────────────────────────────────
 
@@ -155,15 +180,35 @@
   separately in the merkle-lsm receipts and is not what an IC query's
   latency depends on. Stated, not hidden: no crypto and no persistence in
   THIS number."
-  [{:keys [persons knows messages creator reply-of likes]}]
+  [{:keys [persons knows messages creator reply-of likes profiles city forums]}]
   (let [quads (transient [])
         add! (fn [s p o] (conj! quads {:s s :p p :o o}))]
     (doseq [[id [fname lname]] persons]
       (add! id "person/firstName" fname)
       (add! id "person/lastName" lname))
-    (doseq [[a b] knows]                      ; undirected -> both directions
+    (doseq [[id {:keys [gender birthday creationDate locationIP browserUsed]}] profiles]
+      (add! id "person/gender" gender)
+      (add! id "person/birthday" (str birthday))
+      (add! id "person/creationDate" (str creationDate))
+      (add! id "person/locationIP" locationIP)
+      (add! id "person/browserUsed" browserUsed))
+    (doseq [[p place] city] (add! p "person/city" place))
+    (doseq [[a b cd] knows]                   ; undirected -> both directions
       (add! a "knows" b)
-      (add! b "knows" a))
+      (add! b "knows" a)
+      ;; the friendship date, reified per direction (no edge properties):
+      ;; 3 datoms x 2 directions per edge -- the data-model cost IS3 pays,
+      ;; stated like `likes` below
+      (doseq [[x y] [[a b] [b a]]]
+        (let [kid (str "kn:" x ":" y)]
+          (add! kid "knows/person" x)
+          (add! kid "knows/friend" y)
+          (add! kid "knows/creationDate" (str cd)))))
+    (doseq [[post f] (:post->forum forums)] (add! post "post/forum" f))
+    (doseq [[f {:keys [title creationDate moderator]}] (:forums forums)]
+      (add! f "forum/title" title)
+      (add! f "forum/creationDate" (str creationDate))
+      (when moderator (add! f "forum/moderator" moderator)))
     (doseq [[id [cd content]] messages]
       (add! id "message/creationDate" (str cd))
       (add! id "message/content" (or content "")))
@@ -419,6 +464,60 @@
          (sort-by (juxt (comp - #(nth % 2)) #(nth % 3)))
          vec)))
 
+(defn- kb-is1
+  "IS1: a person's profile -- [first last birthday locationIP browserUsed
+  city gender creationDate] or []."
+  [db person]
+  (->> (eng/query db {:find '[?f ?l ?b ?ip ?br ?c ?g ?cd] :in '[?p]
+                      :where '[[?p "person/firstName" ?f] [?p "person/lastName" ?l] [?p "person/birthday" ?b]
+                               [?p "person/locationIP" ?ip] [?p "person/browserUsed" ?br] [?p "person/city" ?c]
+                               [?p "person/gender" ?g] [?p "person/creationDate" ?cd]]}
+                  everything [person])
+       (mapv (fn [[f l b ip br c g cd]] [f l (parse-long b) ip br c g (parse-long cd)]))))
+
+(defn- kb-is1-index [db person]
+  (let [e (eng/entity db person) one (fn [a] (first (get e a)))]
+    (if (one "person/firstName")
+      [[(one "person/firstName") (one "person/lastName") (parse-long (one "person/birthday")) (one "person/locationIP")
+        (one "person/browserUsed") (one "person/city") (one "person/gender") (parse-long (one "person/creationDate"))]]
+      [])))
+
+(defn- kb-is3
+  "IS3: a person's friends -- [friend first last friendshipDate], newest
+  friendship first, friend id asc on ties."
+  [db person]
+  (->> (eng/query db {:find '[?f ?fn ?ln ?d] :in '[?p]
+                      :where '[[?k "knows/person" ?p] [?k "knows/friend" ?f] [?k "knows/creationDate" ?d]
+                               [?f "person/firstName" ?fn] [?f "person/lastName" ?ln]]}
+                  everything [person])
+       (map (fn [[f fn ln d]] [f fn ln (parse-long d)]))
+       (sort-by (juxt (comp - #(nth % 3)) first))
+       vec))
+
+(defn- kb-is3-index [db person]
+  (->> (by-avet db "knows/person" person)
+       (map (fn [k] (let [f (attr1 db k "knows/friend") [fn ln] (person-name db f)]
+                      [f fn ln (parse-long (attr1 db k "knows/creationDate"))])))
+       (sort-by (juxt (comp - #(nth % 3)) first))
+       vec))
+
+(defn- kb-is6
+  "IS6: the forum of a message (of its root post) -- [forum title
+  moderator first last] or []."
+  [db message]
+  (let [root (root-post db message)]
+    (->> (eng/query db {:find '[?f ?t ?m ?fn ?ln] :in '[?post]
+                        :where '[[?post "post/forum" ?f] [?f "forum/title" ?t] [?f "forum/moderator" ?m]
+                                 [?m "person/firstName" ?fn] [?m "person/lastName" ?ln]]}
+                    everything [root])
+         vec)))
+
+(defn- kb-is6-index [db message]
+  (let [root (root-post db message) f (attr1 db root "post/forum")]
+    (if-let [m (and f (attr1 db f "forum/moderator"))]
+      (let [[fn ln] (person-name db m)] [[f (attr1 db f "forum/title") m fn ln]])
+      [])))
+
 (defn index-path-agrees?
   "For every `{:op :person :max-date}` in `params`, the index path returns the
   rows the Datalog path returns (ordered rows for IC02/IC08; IC07 compares
@@ -436,7 +535,10 @@
                   :is2 (= (kb-is2 db person) (kb-is2-index db person))
                   :is4 (= (kb-is4 db (:message p)) (kb-is4-index db (:message p)))
                   :is5 (= (kb-is5 db (:message p)) (kb-is5-index db (:message p)))
-                  :is7 (= (kb-is7 db (:message p)) (kb-is7-index db (:message p))))))]
+                  :is7 (= (kb-is7 db (:message p)) (kb-is7-index db (:message p)))
+                  :is1 (= (kb-is1 db person) (kb-is1-index db person))
+                  :is3 (= (kb-is3 db person) (kb-is3-index db person))
+                  :is6 (= (kb-is6 db (:message p)) (kb-is6-index db (:message p))))))]
     {:checked (count params)
      :disagreements (vec (remove one params))}))
 
@@ -491,6 +593,21 @@
           EXISTS { (a)-[:KNOWS]-(ma) } AS knows
    ORDER BY date DESC, author ASC")
 
+(def ^:private cy-is1
+  "MATCH (p:Person {pid:$pid})
+   RETURN p.firstName AS f, p.lastName AS l, p.birthday AS b, p.locationIP AS ip,
+          p.browserUsed AS br, p.city AS c, p.gender AS g, p.creationDate AS cd")
+
+(def ^:private cy-is3
+  "MATCH (p:Person {pid:$pid})-[k:KNOWS]-(f:Person)
+   RETURN f.pid AS friend, f.firstName AS fn, f.lastName AS ln, k.creationDate AS d
+   ORDER BY d DESC, friend ASC")
+
+(def ^:private cy-is6
+  "MATCH (m:Message {pid:$mid})-[:REPLY_OF*0..]->(root:Message) WHERE NOT (root)-[:REPLY_OF]->()
+   MATCH (fo:Forum)-[:CONTAINER_OF]->(root) MATCH (fo)-[:HAS_MODERATOR]->(mod:Person)
+   RETURN fo.pid AS forum, fo.title AS title, mod.pid AS mod, mod.firstName AS fn, mod.lastName AS ln")
+
 (defn- batched!
   "Run one parameterised write per chunk, each in its OWN transaction --
   a single transaction holding half a million relationship creates is a
@@ -519,9 +636,15 @@
   relationship phase ran for tens of minutes at ~20% of one core with the
   store file not growing at all. Two separate MATCH clauses give the planner
   no cartesian option to choose."
-  [gdb {:keys [persons knows messages creator reply-of likes]}]
-  (batched! gdb "UNWIND $rows AS r CREATE (:Person {pid:r.pid, firstName:r.f, lastName:r.l})"
-            (mapv (fn [[id [f l]]] {"pid" id "f" f "l" l}) persons))
+  [gdb {:keys [persons knows messages creator reply-of likes profiles city forums]}]
+  (batched! gdb (str "UNWIND $rows AS r CREATE (:Person {pid:r.pid, firstName:r.f, lastName:r.l, "
+                     "gender:r.g, birthday:r.b, creationDate:r.cd, locationIP:r.ip, browserUsed:r.br, city:r.city})")
+            (mapv (fn [[id [f l]]] (let [pr (get profiles id)]
+                                     {"pid" id "f" f "l" l "g" (:gender pr) "b" (:birthday pr) "cd" (:creationDate pr)
+                                      "ip" (:locationIP pr) "br" (:browserUsed pr) "city" (get city id)}))
+                  persons))
+  (batched! gdb "UNWIND $rows AS r CREATE (:Forum {pid:r.pid, title:r.t, creationDate:r.cd})"
+            (mapv (fn [[f {:keys [title creationDate]}]] {"pid" f "t" title "cd" creationDate}) (:forums forums)))
   (batched! gdb "UNWIND $rows AS r CREATE (:Message {pid:r.pid, creationDate:r.d, content:r.c})"
             (mapv (fn [[id [d c]]] {"pid" id "d" d "c" (or c "")}) messages))
   (with-open [tx (.beginTx gdb)]
@@ -532,8 +655,21 @@
     (-> (.schema tx) (.awaitIndexesOnline 600 TimeUnit/SECONDS)))
   (batched! gdb (str "UNWIND $rows AS r "
                      "MATCH (a:Person {pid:r.a}) MATCH (b:Person {pid:r.b}) "
-                     "CREATE (a)-[:KNOWS]->(b)")
-            (mapv (fn [[a b]] {"a" a "b" b}) knows))
+                     "CREATE (a)-[:KNOWS {creationDate:r.d}]->(b)")
+            (mapv (fn [[a b d]] {"a" a "b" b "d" d}) knows))
+  (with-open [tx (.beginTx gdb)]
+    (-> (.schema tx) (.constraintFor (Label/label "Forum")) (.assertPropertyIsUnique "pid") (.create))
+    (.commit tx))
+  (with-open [tx (.beginTx gdb)]
+    (-> (.schema tx) (.awaitIndexesOnline 600 TimeUnit/SECONDS)))
+  (batched! gdb (str "UNWIND $rows AS r "
+                     "MATCH (f:Forum {pid:r.f}) MATCH (m:Message {pid:r.m}) "
+                     "CREATE (f)-[:CONTAINER_OF]->(m)")
+            (mapv (fn [[post f]] {"f" f "m" post}) (:post->forum forums)))
+  (batched! gdb (str "UNWIND $rows AS r "
+                     "MATCH (f:Forum {pid:r.f}) MATCH (p:Person {pid:r.p}) "
+                     "CREATE (f)-[:HAS_MODERATOR]->(p)")
+            (vec (for [[f {:keys [moderator]}] (:forums forums) :when moderator] {"f" f "p" moderator})))
   (batched! gdb (str "UNWIND $rows AS r "
                      "MATCH (m:Message {pid:r.m}) MATCH (p:Person {pid:r.p}) "
                      "CREATE (m)-[:HAS_CREATOR]->(p)")
@@ -607,6 +743,19 @@
             {:checked (count is2-persons) :disagreements (vec bad)})
      :is4 (is (fn [m] (= (kb-is4 db m) (mapv (fn [r] [(:date r) (:content r)]) (neo4j-rows tx cy-is4 {"mid" m})))))
      :is5 (is (fn [m] (= (kb-is5 db m) (mapv (fn [r] [(str (:person r)) (:f r) (:l r)]) (neo4j-rows tx cy-is5 {"mid" m})))))
+     :is1 (let [bad (remove (fn [p] (= (kb-is1 db p)
+                                       (mapv (fn [r] [(:f r) (:l r) (:b r) (:ip r) (:br r) (str (:c r)) (:g r) (:cd r)])
+                                             (neo4j-rows tx cy-is1 {"pid" p}))))
+                            is2-persons)]
+            {:checked (count is2-persons) :disagreements (vec bad)})
+     :is3 (let [bad (remove (fn [p] (= (kb-is3 db p)
+                                       (mapv (fn [r] [(str (:friend r)) (:fn r) (:ln r) (:d r)])
+                                             (neo4j-rows tx cy-is3 {"pid" p}))))
+                            is2-persons)]
+            {:checked (count is2-persons) :disagreements (vec bad)})
+     :is6 (is (fn [m] (= (kb-is6 db m)
+                         (mapv (fn [r] [(str (:forum r)) (:title r) (str (:mod r)) (:fn r) (:ln r)])
+                               (neo4j-rows tx cy-is6 {"mid" m})))))
      :is7 (is (fn [m] (= (kb-is7 db m)
                          (mapv (fn [r] [(str (:reply r)) (:content r) (:date r) (str (:author r)) (:f r) (:l r) (boolean (:knows r))])
                                (neo4j-rows tx cy-is7 {"mid" m})))))}))
