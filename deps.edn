@@ -28,7 +28,10 @@
         ;; value index with the independent half of the join run once
         ;; (iteration 19). main is .cljk from 8645651 on, so this classpath
         ;; loads only through scripts/cljk-classpath.cljk.
-        io.github.kotoba-lang/datalog {:git/sha "e75df8c282739b1b045c41d3965a1f37aa1f3f9b"}
+        ;; 645c9e58 (iteration 34): a one-value counterpart set costs one
+        ;; object, not a hash set -- the full LDBC SF1 (20.6M quads) serves
+        ;; resident in 4.4 GB used heap where 10.9 GB did not fit before.
+        io.github.kotoba-lang/datalog {:git/sha "645c9e587870eef8a037315c24ad108407b4a506"}
        ;; formerly two deps here (kqe + quad-store) -- kqe merged into
         ;; arrangement (ADR-2607050700), so this is the one coordinate now.
         io.github.kotoba-lang/arrangement {:git/sha "9c9f45d4cd043873cd5c5ea65fa3af8a8ead5e6d"}
