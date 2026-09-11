@@ -690,6 +690,32 @@
                 (or (get statistic "rows") (:rows statistic))))
             clauses))))
 
+(def ^:private relation-size-cache
+  "attr -> {:index <the :aevt inner map the count was taken from> :n count}.
+  The planner estimates every clause of every query, and for a clause with
+  nothing bound but the attribute the estimate is the whole relation's size:
+  a reduce over every subject bucket of `(get (:aevt db) attr)`. Measured
+  2026-09-11 on simeon (ayatori iteration 20, LDBC SF1 subset, 810k quads):
+  replyOf 2.9 ms, hasCreator 4.6 ms, creationDate 0.7 ms -- 9.2 ms of
+  planning for an IC08 whose execution then took under a millisecond. The
+  inner map is an immutable value that a transaction touching the attribute
+  replaces and one not touching it keeps, so IDENTITY of that map is the
+  version: a hit is exact, a miss recounts. One entry per attribute."
+  (atom {}))
+
+(defn- relation-size
+  "`kqe/estimate-cardinality` for `[nil attr nil]`, cached per (attr, version
+  of the attribute's index). Every other pattern shape is a point lookup or a
+  single bucket and is not cached."
+  [db attr]
+  (let [inner (get (:aevt db) attr)
+        hit (get @relation-size-cache attr)]
+    (if (and hit (identical? (:index hit) inner))
+      (:n hit)
+      (let [n (kqe/estimate-cardinality db [nil attr nil])]
+        (swap! relation-size-cache assoc attr {:index inner :n n})
+        n))))
+
 (defn datalog-query-plan
   "Compile a safe cost-ordered plan for a plain conjunctive Datalog query.
    Positive triple clauses commute, so their visible cardinalities can drive
@@ -745,9 +771,11 @@
                                 ;; larger `:clause-cardinality` as a reason to
                                 ;; stay on the keyed path, which is already its
                                 ;; default when it has no hint at all.
-                                :estimated-rows (if (some? supplied)
-                                                  supplied
-                                                  (kqe/estimate-cardinality db pattern))
+                                :estimated-rows (cond
+                                                  (some? supplied) supplied
+                                                  (and (nil? (nth pattern 0)) (some? (nth pattern 1)) (nil? (nth pattern 2)))
+                                                  (relation-size db (nth pattern 1))
+                                                  :else (kqe/estimate-cardinality db pattern))
                                 :estimate-source (if (some? supplied)
                                                    :materialized-statistics
                                                    :index-estimate)

@@ -59,6 +59,29 @@
       (is (= #{} (eng/query (db) query everything ["p9"])))
       (is (= 6 (count (eng/query (db) query everything ["p1"])))))))
 
+(deftest the-relation-size-is-cached-per-index-version-and-never-stale
+  ;; The whole-relation estimate is the planner's cost (9 ms of a 9 ms IC08,
+  ;; measured 2026-09-11); it is cached by identity of the attribute's :aevt
+  ;; inner map. The cache must be exact across versions: a transaction that
+  ;; touches the attribute must be seen, one that does not must hit.
+  (let [d1 (db)
+        query '{:find [?m ?d] :where [[?m "creator" ?p] [?m "date" ?d]]}
+        est (fn [d] (get-in (eng/datalog-query-plan d query everything) [:query :clause-cardinality '[?m "creator" ?p]]))
+        _ (est d1)
+        entry-after-first (get @@#'eng/relation-size-cache "creator")]
+    (is (= 30 (est d1)))
+    (testing "a second plan on the same db hits the same entry"
+      (est d1)
+      (is (identical? entry-after-first (get @@#'eng/relation-size-cache "creator"))))
+    (testing "a transaction on another attribute keeps the hit"
+      (let [d2 (eng/transact d1 [{:s "p0" :p "role" :o "editor"}])]
+        (is (= 30 (est d2)))
+        (is (identical? entry-after-first (get @@#'eng/relation-size-cache "creator")))))
+    (testing "a transaction on the attribute is seen: the count moves and the entry is replaced"
+      (let [d3 (eng/transact d1 [{:s "m99" :p "creator" :o "p0"}])]
+        (is (= 31 (est d3)))
+        (is (not (identical? entry-after-first (get @@#'eng/relation-size-cache "creator"))))))))
+
 (deftest an-unoptimized-plan-emits-no-hint
   ;; Queries with functions/negation keep source order and are not estimated,
   ;; so there is nothing to hand over. A hint that is absent leaves the

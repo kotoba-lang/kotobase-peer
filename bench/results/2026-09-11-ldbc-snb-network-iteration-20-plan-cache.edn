@@ -1,0 +1,361 @@
+{:in-process-official-params
+ {:plan-ms {:before 9.193, :after 0.019},
+  :ic08-ms {:before 8.982, :after 0.167},
+  :after
+  {:ic02 {:empty 0.1, :nonempty 2.5},
+   :ic07 0.4,
+   :ic08 0.1,
+   :ic09-empty 2.8},
+  :note
+  "IC02 non-empty and IC09 are the ordered drive's walk / independent half, not the plan"},
+ :schema 1,
+ :date "2026-09-11",
+ :prediction-before-network-run
+ "8 slots unchanged (the wire); 64 slots 1533 -> >= 2500 with 2048 passing",
+ :question
+ "with every read at the wire at 8 slots, the SUT's own capacity is what the wider slot columns measure (1533 ops/s at 64 slots, 2048 failing). What does the SUT spend per operation?",
+ :what-this-is-not ["Not an LDBC score." "Not hardware-normalised."],
+ :iteration 20,
+ :benchmark
+ "kotoba-lang/ayatori bench/benchmark.edn :ldbc-snb-interactive-network-v2 (rung SF1 subset 35k posts, origin :cross-host, mix IC02/07/08/09, impl :datalog)",
+ :result
+ {:datalog-8-slots
+  {:throughput-ops-s 255.9,
+   :rate 256,
+   :p50-ms {:ic02 12.2, :ic07 10.4, :ic08 9.9, :ic09 15.4}},
+  :datalog-64-slots
+  {:throughput-ops-s 2027,
+   :rate 2048,
+   :on-time-pct 98.65,
+   :previous 1533.2,
+   :p50-ms {:ic02 16.4, :ic07 15.6, :ic08 15.2, :ic09 19.9},
+   :next-failed
+   {:rate 3072, :on-time-pct 89.4, :throughput-at-failure 2903.8}},
+  :datalog-128-slots
+  {:refused
+   "80 of 40,960 operations at rate 2048 failed with fetch failed (connection errors under 128 concurrent connections); the driver refused the run (exit 2) -- nothing measured at 128 slots"}},
+ :receipt/type :ldbc-snb-interactive-network,
+ :found
+ "the planner. datalog-query-plan estimates every clause of every query; for a clause with only the attribute bound the estimate is the relation size -- a reduce over every subject bucket of the :aevt inner map. Measured in-process on simeon: replyOf 2.9 ms, hasCreator 4.6 ms, creationDate 0.7 ms; plan total 9.2 ms for an IC08 whose whole execution took 9.0 ms. The query was free; the plan was the query.",
+ :origin
+ {:kind :cross-host,
+  :sut
+  "simeon (fleet mac-mini, 10 cores, 16 GiB, swap off, load 3-6), JDK 26, -Xmx8g, 8 threads",
+  :driver
+  "this workstation over Tailscale, rtt ~10-14 ms, load 20-30"},
+ :sut
+ {:quads 810221,
+  :ready true,
+  :max-date 1347528903591,
+  :load-ms 7183.012042,
+  :host-memory
+  {:heap-used-mb 750,
+   :heap-max-mb 8192,
+   :rss-mb 4515,
+   :swap-total-mib 0,
+   :swap-used-mib 0,
+   :swap-used-pct 0,
+   :host "simeonnoMac-mini.local"},
+  :elements
+  {:persons 9892,
+   :knows-edges 180623,
+   :messages 86932,
+   :posts 35000,
+   :comments 51932,
+   :has-creator 86932,
+   :reply-of 51932,
+   :likes 38821},
+  :build-ms 761.685834,
+  :threads 8,
+  :index-path
+  {:enabled true,
+   :checked 392,
+   :disagreements 0,
+   :first-disagreement nil},
+  :subset-rule
+  "all persons + all knows; 35000 most recent Posts + full transitive reply trees; hasCreator for included Messages; likes onto included Messages",
+  :implementation
+  "kotobase-peer.ldbc-snb-net over kotobase-peer.ldbc-snb-bench",
+  :dataset
+  "LDBC SNB Interactive v1, SF1, Datagen v1.0.0, CsvComposite/LongDateFormatter"},
+ :change
+ {:repo "kotoba-lang/kotobase-peer",
+  :what
+  "relation-size: the [nil attr nil] estimate cached per attribute, keyed by IDENTITY of the attribute's :aevt inner map (an immutable value a transaction touching the attribute replaces and one not touching it keeps) -- a hit is exact, a miss recounts. Other pattern shapes are point lookups and are not cached.",
+  :test
+  "plan_cardinality_test/the-relation-size-is-cached-per-index-version-and-never-stale: same db hits the same entry; a transaction on another attribute keeps the hit; a transaction on the attribute moves the count and replaces the entry. A cache that never invalidates fails it at 2 assertions. Suite 262/804/0."},
+ :reading
+ ["Prediction held on direction and on 2048 passing (98.65%), short on size: 2027 ops/s at 64 slots, 1.32x, with 3072 delivering 2904 ops/s but 89% on-time -- 64 slots over a ~17 ms latency is ~3,800 in flight capacity, and start-delay p95 of 1 s says the driver's slots, not the SUT, were the queue. 128 slots hit connection failures and were refused."
+  "Per operation the SUT now spends well under a millisecond in the engine for IC07/IC08 and ~3 ms for IC02/IC09 (the drive). The next ceiling is the driver and the wire, not the planner."
+  "Ratio to the audited No.1: 69 at 64 slots, raw."],
+ :arms
+ {:datalog-8-slots
+  [{:on-time 5120,
+    :server-ms
+    {:ic02
+     {:n 1280,
+      :p50 1.989833,
+      :p95 5.089917,
+      :p99 12.473875,
+      :max 19.756041},
+     :ic07
+     {:n 1280,
+      :p50 0.304334,
+      :p95 1.59275,
+      :p99 3.983667,
+      :max 14.837917},
+     :ic08
+     {:n 1280,
+      :p50 0.079709,
+      :p95 0.243208,
+      :p99 0.425,
+      :max 2.167583},
+     :ic09
+     {:n 1280,
+      :p50 5.004208,
+      :p95 10.176583,
+      :p99 18.927792,
+      :max 25.518375}},
+    :completed 5120,
+    :latency-ms
+    {:ic02
+     {:n 1280,
+      :p50 12.162834000000657,
+      :p95 40.26474999999846,
+      :p99 110.56366700000217,
+      :max 253.80916699999943},
+     :ic07
+     {:n 1280,
+      :p50 10.401957999998558,
+      :p95 37.21779199999946,
+      :p99 92.0535830000008,
+      :max 266.3259170000001},
+     :ic08
+     {:n 1280,
+      :p50 9.866542000000663,
+      :p95 36.42099999999846,
+      :p99 90.42779099999825,
+      :max 264.8774170000015},
+     :ic09
+     {:n 1280,
+      :p50 15.42083300000013,
+      :p95 45.49116700000013,
+      :p99 129.86654200000066,
+      :max 261.81287500000144}},
+    :empty-answers 2222,
+    :throughput 255.8622789300874,
+    :inflight 8,
+    :rate 256,
+    :seconds 20,
+    :rows-mean 8.272265625,
+    :scheduled 5120,
+    :pass true,
+    :on-time-pct 100,
+    :start-delay-ms
+    {:n 5120,
+     :p50 0.7884160000012344,
+     :p95 225.02987500000017,
+     :p99 353.7472079999998,
+     :max 427.3435830000017},
+    :failed 0}],
+  :datalog-64-slots
+  [{:on-time 30720,
+    :server-ms
+    {:ic02
+     {:n 7680,
+      :p50 1.651875,
+      :p95 4.3905,
+      :p99 6.762667,
+      :max 20.001833},
+     :ic07
+     {:n 7680, :p50 0.285042, :p95 1.373417, :p99 2.664, :max 7.13725},
+     :ic08
+     {:n 7680,
+      :p50 0.063917,
+      :p95 0.215584,
+      :p99 0.302584,
+      :max 2.216125},
+     :ic09
+     {:n 7680,
+      :p50 4.387375,
+      :p95 8.079958,
+      :p99 11.292,
+      :max 30.157875}},
+    :completed 30720,
+    :latency-ms
+    {:ic02
+     {:n 7680,
+      :p50 13.450167000000874,
+      :p95 45.78862499999923,
+      :p99 94.46450000000004,
+      :max 1128.1765},
+     :ic07
+     {:n 7680,
+      :p50 12.412833000000319,
+      :p95 44.25575000000026,
+      :p99 92.0877089999999,
+      :max 1375.550375},
+     :ic08
+     {:n 7680,
+      :p50 12.040165999999772,
+      :p95 43.93687499999942,
+      :p99 91.52316600000017,
+      :max 1372.655875},
+     :ic09
+     {:n 7680,
+      :p50 16.001540999997815,
+      :p95 50.68025000000125,
+      :p99 100.25412499999993,
+      :max 1386.142416}},
+    :empty-answers 13340,
+    :throughput 1531.9188946856425,
+    :inflight 64,
+    :rate 1536,
+    :seconds 20,
+    :rows-mean 8.269108072916667,
+    :scheduled 30720,
+    :pass true,
+    :on-time-pct 100,
+    :start-delay-ms
+    {:n 30720,
+     :p50 0.5398329999989073,
+     :p95 60.42208266666785,
+     :p99 305.65745833333335,
+     :max 402.35974966666663},
+    :failed 0}
+   {:on-time 40406,
+    :server-ms
+    {:ic02
+     {:n 10240,
+      :p50 1.843542,
+      :p95 5.869792,
+      :p99 7.689667,
+      :max 22.996333},
+     :ic07
+     {:n 10240,
+      :p50 0.318291,
+      :p95 1.699292,
+      :p99 3.368584,
+      :max 18.74425},
+     :ic08
+     {:n 10240,
+      :p50 0.073291,
+      :p95 0.222167,
+      :p99 0.310667,
+      :max 3.909709},
+     :ic09
+     {:n 10240,
+      :p50 5.095584,
+      :p95 10.281166,
+      :p99 13.951292,
+      :max 33.750583}},
+    :completed 40960,
+    :latency-ms
+    {:ic02
+     {:n 10240,
+      :p50 16.444209000001138,
+      :p95 69.52887499999997,
+      :p99 197.47179100000358,
+      :max 437.40691700000025},
+     :ic07
+     {:n 10240,
+      :p50 15.568624999999884,
+      :p95 67.06412499999715,
+      :p99 197.21487499999785,
+      :max 432.8919590000005},
+     :ic08
+     {:n 10240,
+      :p50 15.23058399999718,
+      :p95 66.40812499999811,
+      :p99 195.29012499999953,
+      :max 432.13004100000035},
+     :ic09
+     {:n 10240,
+      :p50 19.865582999998878,
+      :p95 74.44466599999942,
+      :p99 213.28224999999657,
+      :max 440.033875000001}},
+    :empty-answers 17775,
+    :throughput 2026.9599571045271,
+    :inflight 64,
+    :rate 2048,
+    :seconds 20,
+    :rows-mean 8.272607421875,
+    :scheduled 40960,
+    :pass true,
+    :on-time-pct 98.6474609375,
+    :start-delay-ms
+    {:n 40960,
+     :p50 57.99313575000269,
+     :p95 815.0736875000002,
+     :p99 1010.7444902500065,
+     :max 1085.4089590000076},
+    :failed 0}
+   {:on-time 54928,
+    :server-ms
+    {:ic02
+     {:n 15360,
+      :p50 1.948625,
+      :p95 6.506041,
+      :p99 8.1385,
+      :max 20.771458},
+     :ic07
+     {:n 15360,
+      :p50 0.323333,
+      :p95 1.902542,
+      :p99 3.803958,
+      :max 18.275625},
+     :ic08
+     {:n 15360,
+      :p50 0.068291,
+      :p95 0.219375,
+      :p99 0.305667,
+      :max 8.775084},
+     :ic09
+     {:n 15360,
+      :p50 5.646542,
+      :p95 10.987084,
+      :p99 14.247958,
+      :max 28.305917}},
+    :completed 61440,
+    :latency-ms
+    {:ic02
+     {:n 15360,
+      :p50 17.856250000004366,
+      :p95 37.296957999998995,
+      :p99 99.88691599999584,
+      :max 261.38579200000095},
+     :ic07
+     {:n 15360,
+      :p50 16.585165999997116,
+      :p95 34.54954100000032,
+      :p99 96.9989160000041,
+      :max 261.73845900000015},
+     :ic08
+     {:n 15360,
+      :p50 16.25029199999699,
+      :p95 33.815709000002244,
+      :p99 95.66804200000479,
+      :max 260.9083329999994},
+     :ic09
+     {:n 15360,
+      :p50 21.610207999998238,
+      :p95 42.51312499999767,
+      :p99 111.3336249999993,
+      :max 312.5339160000003}},
+    :empty-answers 26648,
+    :throughput 2903.8064831331626,
+    :inflight 64,
+    :rate 3072,
+    :seconds 20,
+    :rows-mean 8.276448567708334,
+    :scheduled 61440,
+    :pass false,
+    :on-time-pct 89.40104166666667,
+    :start-delay-ms
+    {:n 61440,
+     :p50 741.0516454999961,
+     :p95 1068.325374666667,
+     :p99 1127.2927083333343, 
+     :max 1143.480103833339}, 
+    :failed 0}]}}
