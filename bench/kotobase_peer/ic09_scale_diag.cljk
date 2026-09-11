@@ -1,0 +1,63 @@
+(ns kotobase-peer.ic09-scale-diag
+  "Where do IC09's milliseconds go on the full SF1? (ayatori iteration 37)
+
+  After the grouped drive (iteration 35) IC09 serves at ~12 ms p50 against
+  IC02's 0.2 -- same shape one hop further. This times, in one process on
+  the full SF1 and the official IC09 parameters, interleaved:
+
+    :engine        kb-ic09 as served (one-hop query + two-hop query, unioned)
+    :two-hop       the two-hop query alone
+    :expansion     the two-hop person set alone (the drive's independent half)
+    :twin          the hand-written index path
+    :engine-plain  kb-ic09 with the drive off
+
+  and reports the two-hop set size, so the per-group cost of the merge is a
+  number.
+
+  Usage: kbb -M:ic09-scale-diag <ldbc-dynamic-dir> <params-dir> [posts] [n-params]"
+  (:require [kotoba.lang.text :as str]
+            [kotobase-peer.core :as eng]
+            [kotobase-peer.ldbc-snb-bench :as ldbc]
+            [datalog.core :as dl]))
+
+(def ^:private everything (constantly true))
+
+(defn- ms [f]
+  (let [t (System/nanoTime) r (f)]
+    [(/ (- (System/nanoTime) t) 1e6) r]))
+
+(defn- median [xs] (let [s (vec (sort xs))] (nth s (quot (count s) 2))))
+
+(defn -main [& args]
+  (let [[dir params-dir posts n] args
+        n-posts (parse-long (or posts "2000000"))
+        n (parse-long (or n "40"))
+        data (#'ldbc/load-subset dir n-posts)
+        {:keys [db quads]} (#'ldbc/build-kotobase data)
+        params (->> (#'ldbc/read-param-lines params-dir "interactive_9_param.txt")
+                    (map #(str/split % #"\|")) (map (fn [[p d]] [p (parse-long d)])) (take n) vec)
+        two-hop '[[?person "knows" ?f1] [?f1 "knows" ?x] [(not= ?x ?person)]
+                  [?msg "hasCreator" ?x] [?msg "message/creationDate" ?date]]
+        one (fn [[p d]]
+              (let [[t-e r-e] (ms #(#'ldbc/kb-ic09 db p d))
+                    [t-2 _] (ms #(#'ldbc/top20-before db two-hop p d))
+                    [t-x xs] (ms #(eng/query db {:find '[?x] :in '[?person]
+                                                :where '[[?person "knows" ?f1] [?f1 "knows" ?x] [(not= ?x ?person)]]}
+                                             everything [p]))
+                    [t-t r-t] (ms #(#'ldbc/kb-ic09-index db p d))
+                    [t-p r-p] (ms #(binding [dl/*ordered-drive* false] (#'ldbc/kb-ic09 db p d)))]
+                {:person p :engine-ms t-e :two-hop-ms t-2 :expansion-ms t-x :two-hop-persons (count xs)
+                 :twin-ms t-t :engine-plain-ms t-p
+                 :agree {:engine-vs-twin (= r-e r-t) :engine-vs-plain (= r-e r-p)}}))]
+    (dotimes [_ 3] (doseq [pd (take 5 params)] (one pd)))
+    (let [results (mapv one params)
+          med (fn [k] (median (map k results)))]
+      (prn {:schema 1 :receipt/type :ic09-scale-diagnosis :date "2026-09-11"
+            :dataset {:posts n-posts :quads quads :messages (count (:messages data))}
+            :params (count results)
+            :median-ms {:engine (med :engine-ms) :two-hop (med :two-hop-ms) :expansion (med :expansion-ms)
+                        :twin (med :twin-ms) :engine-plain (med :engine-plain-ms)}
+            :median-two-hop-persons (med :two-hop-persons)
+            :max-two-hop-persons (apply max (map :two-hop-persons results))
+            :disagreements (count (remove (fn [r] (every? true? (vals (:agree r)))) results))
+            :per-param (mapv #(select-keys % [:person :engine-ms :two-hop-ms :expansion-ms :two-hop-persons :twin-ms]) results)}))))

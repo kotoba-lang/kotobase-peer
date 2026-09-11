@@ -34,7 +34,8 @@
         ;; d4cb417b (iteration 35): the grouped ordered drive -- IC02 on the
         ;; full SF1 82 -> 0.4 ms; tracked order versions 16 -> 1024.
         ;; 3ab273e4 (iteration 36): order versions as a conj/trim ring.
-        io.github.kotoba-lang/datalog {:git/sha "3ab273e44d7c766314c25fbe8c416541699fe1a0"}
+        ;; dc7100c2 (iteration 37): PriorityQueue heap for the group merge.
+        io.github.kotoba-lang/datalog {:git/sha "dc7100c27c37e62e1a0739a609afe7ec2b17293d"}
        ;; formerly two deps here (kqe + quad-store) -- kqe merged into
         ;; arrangement (ADR-2607050700), so this is the one coordinate now.
         io.github.kotoba-lang/arrangement {:git/sha "9c9f45d4cd043873cd5c5ea65fa3af8a8ead5e6d"}
@@ -135,6 +136,10 @@
                     :extra-deps {org.neo4j/neo4j {:mvn/version "2025.03.0"}}
                     :jvm-opts ["-Xmx10g"]
                     :main-opts ["-m" "kotobase-peer.ic02-scale-diag"]}
+  :ic09-scale-diag {:extra-paths ["bench"]
+                    :extra-deps {org.neo4j/neo4j {:mvn/version "2025.03.0"}}
+                    :jvm-opts ["-Xmx10g"]
+                    :main-opts ["-m" "kotobase-peer.ic09-scale-diag"]}
   :ic09-diag {:extra-paths ["bench"]
               ;; ldbc-snb-bench imports Neo4j classes at ns load; this
               ;; diagnostic only reuses its loader, but the ns still has to
