@@ -13,8 +13,8 @@
   condition; a slope means something still co-resides.
 
   Run:
-    clojure -M:chunk-bench
-    clojure -M:chunk-bench 50000 200000"
+    kbb -M:chunk-bench
+    kbb -M:chunk-bench 50000 200000"
   (:require [clojure.java.io :as io]
             [clojure.java.shell]
             [kotoba.lang.text]

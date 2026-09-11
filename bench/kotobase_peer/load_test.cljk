@@ -24,8 +24,8 @@
   test-helper duplication convention across repos) -- so encrypt/decrypt
   cost is included in every number below, not hidden.
 
-  Run: clojure -M:bench (see bb.edn's `loadtest` task / deps.edn's `:bench`
-  alias) or `bb loadtest [novelty-sizes...]` (defaults to a preset sweep)."
+  Run: kbb -M:bench (see bb.edn's `loadtest` task / deps.edn's `:bench`
+  alias) or `kbb -M:loadtest [novelty-sizes...]` (defaults to a preset sweep)."
   (:require [ipld.core :as ipld]
             [kotobase-peer.core :as eng])
   (:import [javax.crypto Cipher Mac]

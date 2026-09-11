@@ -19,7 +19,7 @@
     - Datomic's transactor path here is the in-memory dev protocol -- its
       durable-storage write path would be slower; kotobase's numbers are
       its real engine write path (content-addressed blocks in an atom).
-  Usage: clojure -M:h2h  (writes nothing; prints receipt EDN to stdout)"
+  Usage: kbb -M:h2h  (writes nothing; prints receipt EDN to stdout)"
   (:require [datomic.api :as d]
             [kotobase-peer.core :as eng])
   (:import [javax.crypto Cipher Mac]

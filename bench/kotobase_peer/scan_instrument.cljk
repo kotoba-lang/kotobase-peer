@@ -16,7 +16,7 @@
   Counts are the product. A call count does not move when the host is busy, so
   running this against two arrangement pins on different days still compares.
 
-  Usage: clojure -M:scan-instrument <ldbc-dynamic-dir> [posts]"
+  Usage: kbb -M:scan-instrument <ldbc-dynamic-dir> [posts]"
   (:require [kotobase-peer.core :as eng]
             [kotobase-peer.ldbc-snb-bench :as ldbc]
             [arrangement.datalog :as datalog]))

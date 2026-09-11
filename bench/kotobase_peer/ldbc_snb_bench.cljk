@@ -44,7 +44,7 @@
       reported -- but the work is not distributed the same way, and that is
       itself a finding about kotobase's query surface.
 
-  Usage: clojure -M:ldbc-snb-bench <ldbc-dynamic-dir> [posts] [samples] [params-dir]
+  Usage: kbb -M:ldbc-snb-bench <ldbc-dynamic-dir> [posts] [samples] [params-dir]
   With `params-dir` (substitution_parameters-sf<N> plus short_message_param.txt)
   every served read is also compared with Neo4j over every official parameter
   -- the reference the network rows cite."
@@ -763,7 +763,7 @@
 
 (defn -main [& args]
   (let [dir (or (first args)
-                (throw (ex-info "usage: clojure -M:ldbc-snb-bench <ldbc-dynamic-dir> [posts] [samples]" {})))
+                (throw (ex-info "usage: kbb -M:ldbc-snb-bench <ldbc-dynamic-dir> [posts] [samples]" {})))
         n-posts (parse-long (or (second args) "35000"))
         samples (parse-long (or (nth args 2 nil) "30"))
         params-dir (nth args 3 nil)

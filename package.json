@@ -2,13 +2,13 @@
   "name": "kotobase-peer",
   "private": true,
   "scripts": {
-    "test": "clojure -M:test",
+    "test": "kbb -M:test",
     "ci:local": "node scripts/ci-local.mjs",
     "bench:merkle-scale": "node scripts/merkle-scale-sweep.mjs",
     "test:r2-gateway": "node bench/r2_view_bench_worker_test.mjs",
-    "build:view-e2e": "nbb gen-shadow-cljs-edn.cljk && shadow-cljs release view-e2e",
-    "test:cljs": "nbb gen-shadow-cljs-edn.cljk && shadow-cljs compile test && node out/test.js",
-    "test:nbb": "nbb run-nbb-tests.cljk"
+    "build:view-e2e": "kbb --backend sci gen-shadow-cljs-edn.cljk && amu compile --target wasm32-browser view-e2e",
+    "test:cljs": "kbb --backend sci gen-shadow-cljs-edn.cljk && amu compile --target wasm32-browser test && node out/test.js",
+    "test:nbb": "kbb --backend sci run-nbb-tests.cljk"
   },
   "dependencies": {},
   "devDependencies": {

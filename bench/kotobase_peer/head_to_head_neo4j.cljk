@@ -11,7 +11,7 @@
   favors kotobase on writes and is stated in the receipt, not averaged
   away; reads run against the page cache after warmup.
 
-  Usage: clojure -M:h2h-neo4j"
+  Usage: kbb -M:h2h-neo4j"
   (:require [kotobase-peer.core :as eng])
   (:import [javax.crypto Cipher Mac]
            [javax.crypto.spec SecretKeySpec GCMParameterSpec]

@@ -1,4 +1,4 @@
-#!/usr/bin/env nbb
+#!/usr/bin/env kbb
 ;; bench/ldbc_snb_driver.cljk — an open-loop, scheduled driver for the four
 ;; LDBC SNB Interactive complex reads served by `kotobase-peer.ldbc-snb-net`,
 ;; measured the way the benchmark defines its metric and not the way an
@@ -32,7 +32,7 @@
 ;; official parameters empty; the number is there so nobody reads a fast
 ;; run of empty answers as growth.
 ;;
-;;   nbb bench/ldbc_snb_driver.cljk --origin http://127.0.0.1:8090 \
+;;   kbb --backend sci bench/ldbc_snb_driver.cljk --origin http://127.0.0.1:8090 \
 ;;     --params ~/.cache/ldbc-snb/sf1/substitution_parameters-sf1 \
 ;;     --rates 5,10,20,40,80,160 --seconds 20 --inflight 64 [--out file.edn]
 ;;

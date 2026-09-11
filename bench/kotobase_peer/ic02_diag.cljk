@@ -23,7 +23,7 @@
   the batching win is exactly bindings/distinct-patterns, and a step where that
   ratio is 1 pays for grouping and collects nothing.
 
-  Usage: clojure -M:ic02-diag <ldbc-dynamic-dir> [posts]"
+  Usage: kbb -M:ic02-diag <ldbc-dynamic-dir> [posts]"
   (:require [kotoba.lang.text :as str]
             [kotobase-peer.core :as eng]
             [kotobase-peer.ldbc-snb-bench :as ldbc]

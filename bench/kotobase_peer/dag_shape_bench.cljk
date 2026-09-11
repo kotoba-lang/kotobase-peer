@@ -34,7 +34,7 @@
   the ADR attributes to the production path) -- projection, labelled as such,
   never presented as an end-to-end measurement.
 
-  Usage: clojure -M:dag-shape-bench [docs] [novelty-tx]"
+  Usage: kbb -M:dag-shape-bench [docs] [novelty-tx]"
   (:require [kotobase-peer.core :as eng]
             [kotoba.lang.text :as str]
             [ipld.core :as ipld]

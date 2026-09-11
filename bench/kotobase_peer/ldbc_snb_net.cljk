@@ -37,7 +37,7 @@
   looks like, the driver refuses on the SUT's swap, not the driver's, and a
   cross-host run is judged by the right machine.
 
-  Usage: clojure -M:ldbc-snb-net <ldbc-dynamic-dir> [posts] [port] [threads] [bind-host] [params-dir]
+  Usage: kbb -M:ldbc-snb-net <ldbc-dynamic-dir> [posts] [port] [threads] [bind-host] [params-dir]
   `params-dir` (substitution_parameters-sf<N>) enables the `:impl :index`
   path: at startup every official parameter for IC02/07/08/09 is answered
   both ways and the index path is served only if all of them agree."
@@ -152,7 +152,7 @@
 
 (defn -main [& args]
   (let [dir (or (first args)
-                (throw (ex-info "usage: clojure -M:ldbc-snb-net <ldbc-dynamic-dir> [posts] [port] [threads]" {})))
+                (throw (ex-info "usage: kbb -M:ldbc-snb-net <ldbc-dynamic-dir> [posts] [port] [threads]" {})))
         n-posts (parse-long (or (second args) "35000"))
         port (parse-long (or (nth args 2 nil) "8090"))
         threads (parse-long (or (nth args 3 nil) "8"))
