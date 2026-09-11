@@ -37,7 +37,8 @@
         ;; dc7100c2 (iteration 37): PriorityQueue heap for the group merge.
         ;; 4921e8b7a559c01db29cdc80172cfcfd196c51ac (iteration 39): grouped merge or global walk by expected steps.
         ;; 8dc45c75ab5e3f04b333b4545e55ca893f6cb389 (iteration 41): an index scan as an eager vector (query-vec).
-        io.github.kotoba-lang/datalog {:git/sha "8dc45c75ab5e3f04b333b4545e55ca893f6cb389"}
+        ;; 3ebd67ddd5ac176416076f368b25378f4ccd5ca9 (iteration 42): the two keyed clause shapes straight to the index.
+        io.github.kotoba-lang/datalog {:git/sha "3ebd67ddd5ac176416076f368b25378f4ccd5ca9"}
        ;; formerly two deps here (kqe + quad-store) -- kqe merged into
         ;; arrangement (ADR-2607050700), so this is the one coordinate now.
         io.github.kotoba-lang/arrangement {:git/sha "9c9f45d4cd043873cd5c5ea65fa3af8a8ead5e6d"}
