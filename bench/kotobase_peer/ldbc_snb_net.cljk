@@ -183,7 +183,10 @@
                                       :checked (:checked agreement)
                                       :disagreements (count (:disagreements agreement))
                                       :first-disagreement (first (:disagreements agreement))})
-        server (HttpServer/create (InetSocketAddress. ^String bind-host (int port)) 0)]
+        ;; backlog 1024, not the system default: at 128 driver slots the
+        ;; default dropped connections under the burst (iteration 20, 80 of
+        ;; 40,960 operations failed with fetch failed; the driver refused)
+        server (HttpServer/create (InetSocketAddress. ^String bind-host (int port)) 1024)]
     ;; warm the engine on the same five high-degree persons the in-JVM
     ;; harness warms on, so the first scheduled operation is not a JIT sample
     (doseq [p (:warm-persons meta)]
