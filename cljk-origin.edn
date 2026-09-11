@@ -14,6 +14,7 @@
   "bench/kotobase_peer/ldbc_snb_bench.cljk" ".clj"
   "bench/kotobase_peer/ldbc_snb_net.cljk" ".clj"
   "bench/ldbc_snb_driver.cljk" ".cljs"
+  "bench/ldbc_short_params.cljk" ".cljs"
   "bench/kotobase_peer/load_test.cljk" ".clj"
   "bench/kotobase_peer/m456_bench.cljk" ".clj"
   "bench/kotobase_peer/materialized_view_bench.cljk" ".clj"
