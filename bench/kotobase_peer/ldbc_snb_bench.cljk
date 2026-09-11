@@ -324,6 +324,98 @@
        (sort-by (juxt (comp - #(nth % 2)) second))
        (take 20) vec))
 
+;; ── short reads IS2 / IS4 / IS5 / IS7 (ayatori iteration 22) ─────────────
+;; LDBC SNB Interactive v1 short reads on the attributes this subset loads
+;; (names, message content and creationDate, hasCreator, replyOf, knows).
+;; IS1 (profile), IS3 (friends with friendship date) and IS6 (forum) need
+;; attributes the subset does not load and are not served. Each read is
+;; written twice, Datalog and index path, and gated like the complex reads.
+
+(defn- root-post
+  "Follow replyOf up to the message with no replyOf (the original Post)."
+  [db m]
+  (loop [m m n 0]
+    (let [parent (attr1 db m "replyOf")]
+      (if (or (nil? parent) (> n 64)) m (recur parent (inc n))))))
+
+(defn- person-name [db p]
+  (let [e (eng/entity db p)]
+    [(first (get e "person/firstName")) (first (get e "person/lastName"))]))
+
+(defn- kb-is2
+  "IS2: the 10 most recent Messages by the person -- [msg content date
+  root-post root-author root-first root-last], newest first, id desc on ties."
+  [db person]
+  (->> (eng/query db {:find '[?m ?c ?d] :in '[?p]
+                      :where '[[?m "hasCreator" ?p] [?m "message/creationDate" ?d] [?m "message/content" ?c]]
+                      :order-by '[[?d :desc] [?m :desc]] :limit 10}
+                  everything [person])
+       (mapv (fn [[m c d]]
+               (let [root (root-post db m) author (attr1 db root "hasCreator")
+                     [f l] (person-name db author)]
+                 [m c (parse-long d) root author f l])))))
+
+(defn- kb-is2-index [db person]
+  (->> (by-avet db "hasCreator" person)
+       (map (fn [m] [m (attr1 db m "message/content") (parse-long (attr1 db m "message/creationDate"))]))
+       (sort-by (fn [[m _ d]] [(- d) m]) (fn [[da ma] [db2 mb]] (let [c (compare da db2)] (if (zero? c) (compare mb ma) c))))
+       (take 10)
+       (mapv (fn [[m c d]]
+               (let [root (root-post db m) author (attr1 db root "hasCreator")
+                     [f l] (person-name db author)]
+                 [m c d root author f l])))))
+
+(defn- kb-is4
+  "IS4: a message's creationDate and content -- [date content] or []."
+  [db message]
+  (->> (eng/query db {:find '[?d ?c] :in '[?m]
+                      :where '[[?m "message/creationDate" ?d] [?m "message/content" ?c]]}
+                  everything [message])
+       (mapv (fn [[d c]] [(parse-long d) c]))))
+
+(defn- kb-is4-index [db message]
+  (let [e (eng/entity db message)]
+    (if-let [d (first (get e "message/creationDate"))]
+      [[(parse-long d) (first (get e "message/content"))]]
+      [])))
+
+(defn- kb-is5
+  "IS5: a message's creator -- [person first last] or []."
+  [db message]
+  (->> (eng/query db {:find '[?p ?f ?l] :in '[?m]
+                      :where '[[?m "hasCreator" ?p] [?p "person/firstName" ?f] [?p "person/lastName" ?l]]}
+                  everything [message])
+       vec))
+
+(defn- kb-is5-index [db message]
+  (if-let [p (attr1 db message "hasCreator")]
+    (let [[f l] (person-name db p)] [[p f l]])
+    []))
+
+(defn- kb-is7
+  "IS7: the replies to a message -- [reply content date author first last
+  knows?], newest first, author asc on ties; knows? = the reply's author and
+  the message's author know each other."
+  [db message]
+  (let [author (attr1 db message "hasCreator")
+        friends (get (eng/entity db author) "knows" #{})]
+    (->> (eng/query db {:find '[?r ?c ?d ?a ?f ?l] :in '[?m]
+                        :where '[[?r "replyOf" ?m] [?r "hasCreator" ?a] [?r "message/creationDate" ?d]
+                                 [?r "message/content" ?c] [?a "person/firstName" ?f] [?a "person/lastName" ?l]]}
+                    everything [message])
+         (map (fn [[r c d a f l]] [r c (parse-long d) a f l (contains? friends a)]))
+         (sort-by (juxt (comp - #(nth % 2)) #(nth % 3)))
+         vec)))
+
+(defn- kb-is7-index [db message]
+  (let [author (attr1 db message "hasCreator")
+        friends (get (eng/entity db author) "knows" #{})]
+    (->> (by-avet db "replyOf" message)
+         (map (fn [r] (let [e (eng/entity db r) a (first (get e "hasCreator")) [f l] (person-name db a)]
+                        [r (first (get e "message/content")) (parse-long (first (get e "message/creationDate"))) a f l (contains? friends a)])))
+         (sort-by (juxt (comp - #(nth % 2)) #(nth % 3)))
+         vec)))
+
 (defn index-path-agrees?
   "For every `{:op :person :max-date}` in `params`, the index path returns the
   rows the Datalog path returns (ordered rows for IC02/IC08; IC07 compares
@@ -337,7 +429,11 @@
                   :ic02 (= (kb-ic02 db person md) (kb-ic02-index db person md))
                   :ic07 (= (set (map first (kb-ic07 db person))) (set (map first (kb-ic07-index db person))))
                   :ic08 (= (kb-ic08 db person) (kb-ic08-index db person))
-                  :ic09 (= (set (map second (kb-ic09 db person md))) (set (map second (kb-ic09-index db person md)))))))]
+                  :ic09 (= (set (map second (kb-ic09 db person md))) (set (map second (kb-ic09-index db person md))))
+                  :is2 (= (kb-is2 db person) (kb-is2-index db person))
+                  :is4 (= (kb-is4 db (:message p)) (kb-is4-index db (:message p)))
+                  :is5 (= (kb-is5 db (:message p)) (kb-is5-index db (:message p)))
+                  :is7 (= (kb-is7 db (:message p)) (kb-is7-index db (:message p))))))]
     {:checked (count params)
      :disagreements (vec (remove one params))}))
 

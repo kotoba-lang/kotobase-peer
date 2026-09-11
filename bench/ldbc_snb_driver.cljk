@@ -71,14 +71,22 @@
 
 (defn- now [] (.now performance))
 
-(defn- read-params [dir n]
-  (let [f (path/join dir (str "interactive_" n "_param.txt"))
+(defn- read-params
+  "Complex reads take interactive_<n>_param.txt (personId|maxDate or
+   personId). Short reads: IS2 takes the IC07 persons; IS4/IS5/IS7 take
+   short_message_param.txt (one message id per line, written from the
+   subset by bench/ldbc_short_params.cljk -- LDBC's driver derives short-read
+   parameters from complex-read results, and this subset has its own)."
+  [dir n]
+  (let [f (path/join dir (if (= n :message) "short_message_param.txt" (str "interactive_" n "_param.txt")))
         _ (when-not (fs/existsSync f)
             (println "REFUSED: params missing" f) (js/process.exit 2))
         lines (rest (str/split-lines (fs/readFileSync f "utf8")))]
     (vec (for [l lines :when (seq l)
                :let [[pid md] (str/split l #"\|")]]
-           (cond-> {:person pid} md (assoc :max-date (parse-long md)))))))
+           (if (= n :message)
+             {:message pid}
+             (cond-> {:person pid} md (assoc :max-date (parse-long md))))))))
 
 (defn- percentile [xs q]
   (if (empty? xs) nil
@@ -196,7 +204,7 @@
         impl (keyword (arg args "--impl" "datalog"))
         max-swap-pct (parse-double (arg args "--max-swap-pct" "90"))
         mem (host-memory)
-        param-file {"ic02" 2 "ic07" 7 "ic08" 8 "ic09" 9}
+        param-file {"ic02" 2 "ic07" 7 "ic08" 8 "ic09" 9 "is2" 7 "is4" :message "is5" :message "is7" :message}
         ops (mapv (fn [op] {:op (keyword op) :params (read-params pdir (param-file op))}) mix)]
     (-> (fetch-edn origin "/ldbc/meta" nil)
         (.then (fn [{:keys [status body]}]
@@ -234,7 +242,9 @@
                                                :inflight inflight :ops ops :impl impl})
                                    (.then (fn [r]
                                             (let [l (:latency-ms r)
-                                                  p50 (fn [op] (or (some-> (get-in l [op :p50]) (.toFixed 1)) "-"))]
+                                                  p50 (fn [op] (or (some-> (get-in l [op :p50]) (.toFixed 1)) "-"))
+                                                  extra (apply str (for [op (map keyword mix) :when (not (#{:ic02 :ic07 :ic08 :ic09} op))]
+                                                                     (str "  " (.padStart (str (name op) " " (p50 op)) 9))))]
                                               (println (str "  " (.padStart (str (:rate r)) 4)
                                                             "  " (.padStart (str (:scheduled r)) 5)
                                                             "  " (.padStart (str (:completed r)) 4)
@@ -247,7 +257,8 @@
                                                             "  " (.padStart (p50 :ic02) 8)
                                                             "  " (.padStart (p50 :ic07) 8)
                                                             "  " (.padStart (p50 :ic08) 8)
-                                                            "  " (.padStart (p50 :ic09) 8))))
+                                                            "  " (.padStart (p50 :ic09) 8)
+                                                            extra)))
                                             (let [pass (and (zero? (:failed r)) (>= (:on-time-pct r) 95.0))
                                                   acc (conj acc (assoc r :pass pass))]
                                               (if pass (go (rest remaining) acc) (js/Promise.resolve acc))))))))]

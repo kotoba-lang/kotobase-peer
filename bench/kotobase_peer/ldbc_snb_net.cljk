@@ -43,7 +43,8 @@
   both ways and the index path is served only if all of them agree."
   (:require [kotobase-peer.ldbc-snb-bench :as ldbc]
             [clojure.edn :as edn]
-            [clojure.string])
+            [clojure.string]
+            [clojure.java.io])
   (:import [com.sun.net.httpserver HttpServer HttpHandler HttpExchange]
            [java.net InetSocketAddress]
            [java.util.concurrent Executors]
@@ -92,8 +93,9 @@
   `:impl :index` is the index-path twin (ldbc-snb-bench, iteration 16),
   served only if `index-path-agrees?` held at startup on the official
   parameters -- otherwise 409, never a different answer with a 200."
-  [db max-date index-ok? {:keys [op person impl] :as req}]
-  (let [person (str person)
+  [db max-date index-ok? {:keys [op person message impl] :as req}]
+  (let [person (some-> person str)
+        message (some-> message str)
         md (long (or (:max-date req) max-date))
         impl (keyword (name (or impl :datalog)))]
     (when (and (= impl :index) (not index-ok?))
@@ -107,6 +109,14 @@
       [:index :ic07] (#'ldbc/kb-ic07-index db person)
       [:index :ic08] (#'ldbc/kb-ic08-index db person)
       [:index :ic09] (#'ldbc/kb-ic09-index db person md)
+      [:datalog :is2] (#'ldbc/kb-is2 db person)
+      [:datalog :is4] (#'ldbc/kb-is4 db message)
+      [:datalog :is5] (#'ldbc/kb-is5 db message)
+      [:datalog :is7] (#'ldbc/kb-is7 db message)
+      [:index :is2] (#'ldbc/kb-is2-index db person)
+      [:index :is4] (#'ldbc/kb-is4-index db message)
+      [:index :is5] (#'ldbc/kb-is5-index db message)
+      [:index :is7] (#'ldbc/kb-is7-index db message)
       (throw (ex-info "unknown op or impl" {:status 400 :op op :impl impl})))))
 
 (defn- handler [meta db max-date index-ok?]
@@ -171,12 +181,22 @@
               :threads threads
               :warm-persons (#'ldbc/pick-persons data 5)}
         params (when params-dir
-                 (vec (for [[op n] {:ic02 2 :ic07 7 :ic08 8 :ic09 9}
-                            line (rest (clojure.string/split-lines
-                                        (slurp (str params-dir "/interactive_" n "_param.txt"))))
-                            :when (seq line)
-                            :let [[pid md] (clojure.string/split line #"\|")]]
-                        (cond-> {:op op :person pid} md (assoc :max-date (parse-long md))))))
+                 (into (vec (for [[op n] {:ic02 2 :ic07 7 :ic08 8 :ic09 9}
+                                 line (rest (clojure.string/split-lines
+                                             (slurp (str params-dir "/interactive_" n "_param.txt"))))
+                                 :when (seq line)
+                                 :let [[pid md] (clojure.string/split line #"\|")]]
+                             (cond-> {:op op :person pid} md (assoc :max-date (parse-long md)))))
+                       ;; short reads: IS2 takes the IC07 persons; IS4/5/7 take
+                       ;; short_message_param.txt (messages of this subset,
+                       ;; written by bench/ldbc_short_params.cljk) when present
+                       (let [mf (str params-dir "/short_message_param.txt")
+                             msgs (when (.exists (clojure.java.io/file mf))
+                                    (remove empty? (rest (clojure.string/split-lines (slurp mf)))))]
+                         (concat (for [line (rest (clojure.string/split-lines (slurp (str params-dir "/interactive_7_param.txt"))))
+                                       :when (seq line)]
+                                   {:op :is2 :person line})
+                                 (for [op [:is4 :is5 :is7] m msgs] {:op op :message m})))))
         agreement (when params (#'ldbc/index-path-agrees? db max-date params))
         index-ok? (boolean (and agreement (zero? (count (:disagreements agreement)))))
         meta (assoc meta :index-path {:enabled index-ok?
