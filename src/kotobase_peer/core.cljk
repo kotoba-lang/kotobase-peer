@@ -1158,15 +1158,19 @@
   the segment shape below."
   ([put! tx-cid rest-link] (novelty-node-cid! put! tx-cid rest-link nil))
   ([put! tx-cid rest-link subject-tokens]
+   (novelty-node-cid! put! tx-cid rest-link subject-tokens nil))
+  ([put! tx-cid rest-link subject-tokens attribute-tokens]
    (ipld/put-node! put! (cond-> {"e" (ipld/link tx-cid) "rest" rest-link}
-                          (seq subject-tokens) (assoc "subjects" (vec subject-tokens))))))
+                          (seq subject-tokens) (assoc "subjects" (vec subject-tokens))
+                          (seq attribute-tokens) (assoc "attributes" (vec attribute-tokens))))))
 
-(defn- entry->node-entry [{:keys [cid subjects]}]
+(defn- entry->node-entry [{:keys [cid subjects attributes]}]
   (cond-> {"e" (ipld/link cid)}
-    (seq subjects) (assoc "subjects" (vec subjects))))
+    (seq subjects) (assoc "subjects" (vec subjects))
+    (seq attributes) (assoc "attributes" (vec attributes))))
 
-(defn- node-entry->entry [{:strs [e subjects]}]
-  {:cid (ipld/link-cid e) :subjects subjects})
+(defn- node-entry->entry [{:strs [e subjects attributes]}]
+  {:cid (ipld/link-cid e) :subjects subjects :attributes attributes})
 
 (defn- novelty-segment-cid!
   "Puts one {\"es\" [entry ...] \"rest\" rest-link|nil} node. `entries` are in
@@ -1186,7 +1190,7 @@
   [node]
   (if (contains? node "es")
     (mapv node-entry->entry (get node "es"))
-    [{:cid (ipld/link-cid (get node "e")) :subjects (get node "subjects")}]))
+    [(node-entry->entry node)]))
 
 (defn- walk-novelty-entries [get-fn head-cid]
   (loop [cid head-cid acc []]
@@ -1259,12 +1263,12 @@
    metadata segments. Returns a state fragment, or {} when pre-existing
    unindexed novelty makes the directory incomplete (the reader then uses the
    conservative queue fallback)."
-  [put! get-fn state tx-cid subject-tokens]
+  [put! get-fn state tx-cid subject-tokens attribute-tokens]
   (let [root (some-> (get state "novelty-subject-index") ipld/link-cid)
         eligible? (or root (zero? (get state "novelty-count" 0)))]
     (if-not (and eligible? (seq subject-tokens))
       {}
-      (let [entry {"e" (ipld/link tx-cid) "subjects" (vec subject-tokens)}
+      (let [entry (entry->node-entry {:cid tx-cid :subjects subject-tokens :attributes attribute-tokens})
             current (when root (verified-node get-fn root))
             entries (get current "entries" [])
             node (if (< (count entries) novelty-index-segment-size)
@@ -1277,8 +1281,7 @@
     (loop [cid root segments []]
       (if-not cid
         (->> segments rseq (mapcat #(get % "entries"))
-             (mapv (fn [{:strs [e subjects]}]
-                     {:cid (ipld/link-cid e) :subjects subjects})))
+             (mapv node-entry->entry))
         (let [segment (verified-node get-fn cid)]
           (recur (some-> (get segment "rest") ipld/link-cid)
                  (conj segments segment)))))))
@@ -1294,8 +1297,7 @@
                  (if-not cid
                    (js/Promise.resolve
                     (->> segments rseq (mapcat #(get % "entries"))
-                         (mapv (fn [{:strs [e subjects]}]
-                                 {:cid (ipld/link-cid e) :subjects subjects}))))
+                         (mapv node-entry->entry)))
                    (-> (verified-node-async async-get-fn cid)
                        (.then (fn [segment]
                                 (step (some-> (get segment "rest") ipld/link-cid)
@@ -1311,9 +1313,7 @@
     (reduce (fn [rest-link segment]
               (ipld/link
                (ipld/put-node!
-                put! {"entries" (mapv (fn [{:keys [cid subjects]}]
-                                         {"e" (ipld/link cid) "subjects" (vec subjects)})
-                                       segment)
+                put! {"entries" (mapv entry->node-entry segment)
                       "rest" rest-link})))
             nil (partition-all novelty-index-segment-size entries))))
 
@@ -1347,93 +1347,51 @@
      (-> (novelty-entries-async async-get-fn state)
          (.then (fn [entries] (mapv :cid entries))))))
 
+(defn- scan-selector
+  "Select a bound entity or attribute in the index's actual component order."
+  [{:keys [index components]}]
+  (let [[entity-position attribute-position]
+        (case (or index :eavt)
+          :eavt [0 1] :aevt [1 0] :avet [2 0] :vaet [2 1] [nil nil])
+        entity (when (some? entity-position) (nth components entity-position nil))
+        attribute (when (some? attribute-position) (nth components attribute-position nil))]
+    (cond (some? entity) [:subjects entity]
+          (some? attribute) [:attributes attribute])))
+
+(defn- matching-novelty-cids [entries axis token]
+  (mapv :cid
+        (filter (fn [entry]
+                  (let [tokens (get entry axis)]
+                    ;; Missing metadata (including entity-wide retractions on
+                    ;; the attribute axis) is never evidence of absence.
+                    (or (not (seq tokens)) (some #{token} tokens))))
+                entries)))
+
 (defn- prune-novelty-cids
-  "Subject-index prune for COMPONENT-scoped novelty reads (hot-datoms).
-
-  The novelty-subject-index carries, per tx-block, the exact subject tokens
-  that block asserts (written at commit time from the tx's own subjects via
-  blind-fn). A scan whose `:components` name specific subjects can therefore
-  SKIP every block whose subject list does not intersect the scan's subject
-  tokens -- without fetching or decrypting it. This is EXACT metadata, not a
-  heuristic: a block absent from the prune-kept set cannot contain a quad
-  with those subjects. Fallbacks preserve today's semantics bit-for-bit:
-  legacy states (no subject index), incomplete directories, or nil/blank
-  subject tokens return the full `novelty-cids` list unchanged.
-
-  Why this exists (measured 2026-09-03, hyakka production deadlock): every
-  Client API write runs a policy scan (hot-datoms, components
-  [policy-entity]) over snapshot+novelty. With the subject index unexploited,
-  that scan decrypted the ENTIRE novelty backlog per write attempt; once the
-  tenant graph's novelty outgrew the Worker CPU budget, every transact 502'd,
-  and since auto-fold only schedules after a SUCCESSFUL write, nothing could
-  ever shrink the backlog -- a self-reinforcing write outage. Skipping
-  unrelated blocks by exact subject metadata bounds the policy scan to the
-  blocks that can actually matter, without changing which rows any scan can
-  return."
-  [get-fn state {:keys [components]} blind-fn]
-  (let [cids (novelty-cids get-fn state)]
-    (if-not (and (seq components)
-                 (some-> (get state "novelty-subject-index") ipld/link-cid))
-      cids
-      (let [entries (indexed-novelty-entries get-fn state)
-            indexed? (and (seq entries) (every? (comp seq :subjects) entries))]
-        (if-not indexed?
-          cids
-          ;; components are stored value strings; the index tokens are the
-          ;; WRITE path's blind-fn(subject) encodings. Resolve the scan's
-          ;; subject tokens through the same blind-fn so the two encodings are
-          ;; comparable. Blind-fn is async on cljs (the whole hot-datoms body
-          ;; is async there), sync on JVM.
-          #?(:clj
-             (let [wanted (into #{} (map (fn [c] (blind-fn (str c)))) components)]
-               (mapv :cid
-                     (filter (fn [{:keys [subjects]}]
-                               (some wanted subjects))
-                             entries)))
-             :cljs
-             (-> (js/Promise.all
-                  (clj->js (map (fn [c] (blind-fn (str c))) components)))
-                 (.then (fn [tokens]
-                          (let [wanted (into #{} (map str) (js->clj tokens))]
-                            (mapv :cid
-                                  (filter (fn [{:keys [subjects]}]
-                                            (some wanted subjects))
-                                          entries))))))))))))
-
+  "Use exact metadata when the selected index prefix binds an entity or
+   attribute. Mixed legacy backlogs retain unknown entries conservatively."
+  [get-fn state opts blind-fn]
+  (if-let [[axis value] (scan-selector opts)]
+    (let [entries (or (indexed-novelty-entries get-fn state)
+                      (novelty-entries get-fn state))]
+      #?(:clj (matching-novelty-cids entries axis (blind-fn (str value)))
+         :cljs (-> (js/Promise.resolve (blind-fn (str value)))
+                   (.then #(matching-novelty-cids entries axis %)))))
+    (novelty-cids get-fn state)))
 
 #?(:cljs
    (defn- prune-novelty-cids-async
-     "`prune-novelty-cids` over `async-get-fn`, with one behavioural
-     difference that is a strict improvement and worth naming: the sync form
-     computes the FULL `novelty-cids` walk FIRST and only then decides whether
-     the subject index made it unnecessary. Here that walk is deferred, so a
-     component-scoped scan the index can answer never pays it at all.
-
-     The 2026-09-03 prune bounded how much novelty a component-scoped scan
-     DECRYPTS. It did not bound how much of the novelty STRUCTURE that scan
-     WALKS: `novelty-cids` ran unconditionally, on `get-fn`, which on a Worker
-     is the host's `with-blocks` trampoline -- one miss restarts the whole
-     `hot-datoms` body, so walking S novelty nodes costs O(S^2). The hoisting
-     comment in `hot-datoms` measures the same effect from the other side
-     (3.00x duplicate transfer at 4 novelty nodes) and mitigates the duplicate
-     FETCHES; it cannot remove the restarts. Root ADR-2609100100."
-     [async-get-fn state {:keys [components]} blind-fn]
-     (let [indexed-root (some-> (get state "novelty-subject-index") ipld/link-cid)
-           full (fn [] (novelty-cids-async async-get-fn state))]
-       (if-not (and (seq components) indexed-root)
-         (full)
-         (-> (indexed-novelty-entries-async async-get-fn state)
-             (.then (fn [entries]
-                      (if-not (and (seq entries) (every? (comp seq :subjects) entries))
-                        (full)
-                        (-> (js/Promise.all
-                             (clj->js (map (fn [c] (blind-fn (str c))) components)))
-                            (.then (fn [tokens]
-                                     (let [wanted (into #{} (map str) (js->clj tokens))]
-                                       (mapv :cid
-                                             (filter (fn [{:keys [subjects]}]
-                                                       (some wanted subjects))
-                                                     entries))))))))))))))
+     "Async metadata traversal avoids handler restarts. A bound scan
+      prunes known unrelated payloads even before legacy novelty fully drains."
+     [async-get-fn state opts blind-fn]
+     (if-let [[axis value] (scan-selector opts)]
+       (-> (if (get state "novelty-subject-index")
+             (indexed-novelty-entries-async async-get-fn state)
+             (novelty-entries-async async-get-fn state))
+           (.then (fn [entries]
+                    (-> (js/Promise.resolve (blind-fn (str value)))
+                        (.then #(matching-novelty-cids entries axis %))))))
+       (novelty-cids-async async-get-fn state))))
 
 (defn- newest-novelty-cid
   "The single most-recently-pushed tx-cid, or nil if novelty is empty. O(1)
@@ -1475,15 +1433,17 @@
   no migration step and no rewrite of history."
   ([put! get-fn state tx-cid] (push-novelty! put! get-fn state tx-cid nil))
   ([put! get-fn state tx-cid subject-tokens]
+   (push-novelty! put! get-fn state tx-cid subject-tokens nil))
+  ([put! get-fn state tx-cid subject-tokens attribute-tokens]
   (if (legacy-novelty-state? state)
     (let [legacy-cids (mapv ipld/link-cid (get state "novelty" []))]
       {"novelty-front" (build-novelty-chain! put! legacy-cids)
-       "novelty-back" (ipld/link (novelty-node-cid! put! tx-cid nil subject-tokens))
+       "novelty-back" (ipld/link (novelty-node-cid! put! tx-cid nil subject-tokens attribute-tokens))
        "novelty-count" (inc (count legacy-cids))})
     (let [back-link (get state "novelty-back")
           head (when back-link (ipld/get-node get-fn (ipld/link-cid back-link)))
           head-entries (when (and head (contains? head "es")) (get head "es"))
-          entry (entry->node-entry {:cid tx-cid :subjects subject-tokens})
+          entry (entry->node-entry {:cid tx-cid :subjects subject-tokens :attributes attribute-tokens})
           ;; `back` walks newest-first, so a new entry goes at the FRONT of the
           ;; head segment's walk-order vector. A full segment (or a legacy
           ;; single-entry head, which is not a segment and is never rewritten)
@@ -1732,7 +1692,7 @@
    contract, including the sync-JVM/Promise-cljs platform split (`put-tx-
    block!` is itself a `js/Promise` of the tx CID on cljs; `push-novelty!`
    itself is synchronous on BOTH platforms — it touches only cids/links,
-   no crypto). Optional `blind-fn` adds keyed subject tokens to the novelty
+   no crypto). Optional `blind-fn` adds keyed subject and attribute tokens to the novelty
    queue node so transaction-slice reads can skip unrelated encrypted blocks;
    the original arity remains wire-compatible and emits an unindexed node."
   ([put! get-fn tx-data prev-chain-cid encrypt-fn]
@@ -1740,23 +1700,30 @@
   ([put! get-fn tx-data prev-chain-cid encrypt-fn blind-fn]
    (let [quads (mapv ->quad tx-data)
          subjects (->> quads (map :s) distinct sort vec)
+         ;; Entity deletion can affect attributes absent from the submitted
+         ;; transaction. Omit this axis for the entire block in that case.
+         attributes (when-not (some #(= :retract-entity (:op %)) quads)
+                      (->> quads (map (comp str :p)) distinct sort vec))
          state (state-at get-fn prev-chain-cid)]
     #?(:clj
        (let [tokens (when blind-fn (mapv blind-fn subjects))
+             attribute-tokens (when (and blind-fn (seq attributes)) (mapv blind-fn attributes))
              tx-cid (put-tx-block! put! quads encrypt-fn)
              new-state (merge (dissoc state "novelty" "novelty-subject-index")
-                              (push-novelty! put! get-fn state tx-cid tokens)
-                              (append-novelty-index! put! get-fn state tx-cid tokens))]
+                              (push-novelty! put! get-fn state tx-cid tokens attribute-tokens)
+                              (append-novelty-index! put! get-fn state tx-cid tokens attribute-tokens))]
          (cd/commit! put! get-fn new-state prev-chain-cid))
        :cljs
        (-> (js/Promise.all
             #js [(put-tx-block! put! quads encrypt-fn)
-                 (if blind-fn (pmap-async blind-fn subjects) (js/Promise.resolve nil))])
+                 (if blind-fn (pmap-async blind-fn subjects) (js/Promise.resolve nil))
+                 (if (and blind-fn (seq attributes))
+                   (pmap-async blind-fn attributes) (js/Promise.resolve nil))])
            (.then (fn [results]
-                    (let [[tx-cid tokens] (vec results)
+                    (let [[tx-cid tokens attribute-tokens] (vec results)
                           new-state (merge (dissoc state "novelty" "novelty-subject-index")
-                                           (push-novelty! put! get-fn state tx-cid tokens)
-                                           (append-novelty-index! put! get-fn state tx-cid tokens))]
+                                           (push-novelty! put! get-fn state tx-cid tokens attribute-tokens)
+                                           (append-novelty-index! put! get-fn state tx-cid tokens attribute-tokens))]
                       (cd/commit! put! get-fn new-state prev-chain-cid)))))))))
 
 (defn commit-with-report!

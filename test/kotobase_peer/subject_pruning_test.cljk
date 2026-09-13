@@ -1,0 +1,100 @@
+(ns kotobase-peer.subject-pruning-test
+  (:require #?(:cljs [cljs.test :refer-macros [deftest is async]])
+            [kotobase-peer.core :as eng]
+            [kotobase-peer.core-test :as fixture]
+            [ipld.core :as ipld]))
+
+#?(:cljs
+(do
+(defn store []
+  (let [blocks (atom {}) decrypts (atom 0)]
+    {:put! #(swap! blocks assoc %1 %2)
+     :get-fn #(get @blocks %) :decrypts decrypts
+     :decrypt (fn [bytes] (swap! decrypts inc) (fixture/test-decrypt-fn bytes))}))
+(defn rows! [s head opts async?]
+  (eng/hot-datoms (:get-fn s) head opts (constantly true) fixture/test-blind-fn (:decrypt s)
+                   (when async? #(js/Promise.resolve ((:get-fn s) %)))))
+
+(deftest subject-pruning-respects-the-component-position-of-every-index
+  (async done
+    (let [s (store) {:keys [put! get-fn]} s
+          bob (ipld/link "bafyreiaakutsdtndrl7e7emcmkp5hjsaaq2vu6prfelbgaglprvtdon63m")
+          quads [{:s "alice" :p "role" :o "admin"} {:s "alice" :p "knows" :o bob}
+                 {:s "other" :p "noise" :o "unrelated"}]
+          scans [{:index :eavt :components ["alice"]}
+                 {:index :aevt :components ["role"]}
+                 {:index :aevt :components ["role" "alice"]}
+                 {:index :avet :components ["role"]}
+                 {:index :avet :components ["role" "admin"]}
+                 {:index :avet :components ["role" "admin" "alice"]}
+                 {:index :vaet :components [bob]}
+                 {:index :vaet :components [bob "knows"]}
+                 {:index :vaet :components [bob "knows" "alice"]}]]
+      (-> (eng/commit! put! get-fn quads nil fixture/test-encrypt-fn)
+          (.then (fn [reference]
+                   (-> (eng/commit! put! get-fn quads nil fixture/test-encrypt-fn fixture/test-blind-fn)
+                       (.then (fn [indexed]
+                                (reduce
+                                 (fn [p [opts async?]]
+                                   (.then p (fn [_]
+                                              (-> (rows! s reference opts async?)
+                                                  (.then (fn [expected]
+                                                           (-> (rows! s indexed opts async?)
+                                                               (.then #(is (= (set expected) (set %))
+                                                                           (pr-str [opts async?]))))))))))
+                                 (js/Promise.resolve nil)
+                                 (for [opts scans async? [false true]] [opts async?])))))))
+          (.catch #(is false (str %))) (.finally done)))))
+
+(deftest mixed-legacy-backlog-skips-known-unrelated-payloads
+  (async done
+    (let [s (store) {:keys [put! get-fn decrypts]} s]
+      (-> (eng/commit! put! get-fn [{:s "legacy" :p "value" :o "old"}] nil fixture/test-encrypt-fn)
+          (.then (fn [head]
+                   (reduce (fn [p i]
+                             (.then p #(eng/commit! put! get-fn [{:s (str "other-" i) :p "value" :o i}]
+                                                    % fixture/test-encrypt-fn fixture/test-blind-fn)))
+                           (js/Promise.resolve head) (range 40))))
+          (.then #(eng/commit! put! get-fn [{:s "wanted" :p "value" :o "found"}]
+                               % fixture/test-encrypt-fn fixture/test-blind-fn))
+          (.then (fn [head]
+                   (reset! decrypts 0)
+                   (-> (rows! s head {:index :eavt :components ["wanted"]} true)
+                       (.then (fn [rows]
+                                (is (= ["wanted"] (mapv :e rows)))
+                                (is (= 2 @decrypts) "unknown legacy block plus the matching indexed block"))))))
+          (.catch #(is false (str %))) (.finally done)))))
+(deftest attribute-pruning-retains-entity-deletions-through-bounded-fold
+  (async done
+    (let [s (store) {:keys [put! get-fn decrypts]} s
+          check! (fn [head expected-decrypts]
+                   (reduce (fn [p async?]
+                             (.then p (fn [_]
+                                        (reset! decrypts 0)
+                                        (-> (rows! s head {:index :aevt :components ["role"]} async?)
+                                            (.then (fn [rows]
+                                                     (is (empty? rows) "entity deletion still removes every attribute")
+                                                     (is (= expected-decrypts @decrypts)
+                                                         "known unrelated attributes are not decrypted")))))))
+                           (js/Promise.resolve nil) [false true]))]
+      (-> (eng/commit! put! get-fn [{:s "alice" :p "role" :o "admin"}] nil
+                      fixture/test-encrypt-fn fixture/test-blind-fn)
+          (.then (fn [head]
+                   (reduce (fn [p i]
+                             (.then p #(eng/commit! put! get-fn [{:s (str "noise-" i) :p "noise" :o i}]
+                                                    % fixture/test-encrypt-fn fixture/test-blind-fn)))
+                           (js/Promise.resolve head) (range 40))))
+          (.then #(eng/commit! put! get-fn [{:s "alice" :op :retract-entity}
+                                           {:s "mixed" :p "noise" :o "keep"}]
+                               % fixture/test-encrypt-fn fixture/test-blind-fn))
+          (.then (fn [head]
+                   (-> (check! head 2)
+                       (.then #(eng/fold! put! get-fn head ipld/link? 1 fixture/test-blind-fn
+                                          fixture/test-encrypt-fn fixture/test-decrypt-fn nil nil
+                                          (fn [cid] (js/Promise.resolve (get-fn cid))) nil))
+                       (.then (fn [folded]
+                                (is (= 41 (eng/novelty-size get-fn folded)))
+                                ;; One snapshot leaf plus the unknown deletion block.
+                                (check! folded 2))))))
+          (.catch #(is false (str %))) (.finally done)))))
+))

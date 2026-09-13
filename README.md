@@ -659,6 +659,28 @@ for mixed operations and view changes, and counts reads and crypto operations
 with unrelated indexed data present. These local work measurements do not
 establish production CPU time, memory limits, or an availability SLO.
 
+## Selective novelty reads
+
+`commit!` accepts the store's `blind-fn` to record keyed subject and attribute
+membership for each encrypted transaction block. Consumers must pass it at
+both ordinary and knowledge-graph write entry points. Reads use the bound
+entity's actual position in EAVT/AEVT/AVET/VAET, or a bound attribute when no
+entity is given. A value-only VAET prefix conservatively keeps all blocks.
+
+Legacy entries without metadata remain readable and are never excluded by
+absence. A transaction containing `retract-entity` omits attribute metadata for
+the whole block, including mixed transactions: deletion can affect attributes
+not named in the submitted transaction. Bounded compaction preserves metadata
+on the remaining entries. Existing unindexed backlog gets cheaper as it drains;
+metadata does not retroactively rewrite immutable history.
+
+`subject-pruning-test` compares all four index orders against unindexed reads,
+checks mixed legacy queues, and checks entity deletion before and after a
+bounded fold. Consumer compatibility build: 113 tests / 312 assertions pass.
+This qualification uses Shadow CLJS, not the currently unavailable native
+compiler path. Metadata traversal still scales with unreflected transactions;
+queue drainage remains required.
+
 ## Test
 
 ```bash
