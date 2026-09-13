@@ -1,0 +1,134 @@
+(ns kotobase-peer.incremental-fold-test
+  (:require #?(:cljs [cljs.test :refer-macros [deftest is async]]
+               :clj [clojure.test :refer [deftest is]])
+            [kotobase-peer.core :as eng]
+            [kotobase-peer.core-test :as fixture]
+            [ipld.core :as ipld]))
+
+#?(:cljs
+(do
+
+(defn store []
+  (let [blocks (atom {}) counts (atom {:gets 0 :bytes 0 :decrypts 0 :encrypts 0})]
+    {:blocks blocks :counts counts
+     :put! (fn [cid bytes] (swap! blocks assoc cid bytes) cid)
+     :get-fn (fn [cid]
+               (let [bytes (get @blocks cid)]
+                 (swap! counts #(-> % (update :gets inc) (update :bytes + (if bytes (.-length bytes) 0))))
+                 bytes))
+     :encrypt (fn [bytes] (swap! counts update :encrypts inc) (fixture/test-encrypt-fn bytes))
+     :decrypt (fn [bytes] (swap! counts update :decrypts inc) (fixture/test-decrypt-fn bytes))}))
+
+(defn reset-counts! [s]
+  (reset! (:counts s) {:gets 0 :bytes 0 :decrypts 0 :encrypts 0}))
+
+(defn folded-base! [s size views]
+  (let [{:keys [put! get-fn encrypt decrypt]} s
+        initial (vec (concat (for [i (range size)] {:s (str "entity-" i) :p "noise" :o i})
+                             [{:s "wanted" :p "value" :o "old"}
+                              {:s "wanted" :p "link" :o (ipld/link "bafyreiaakutsdtndrl7e7emcmkp5hjsaaq2vu6prfelbgaglprvtdon63m")}
+                              {:s "other" :p "value" :o {:nested [true nil 42]}}]))]
+    (-> (eng/commit! put! get-fn initial nil encrypt)
+        (.then #(eng/fold-rebuild! put! get-fn % ipld/link? nil fixture/test-blind-fn
+                                  encrypt decrypt nil nil
+                                  (fn [cid] (js/Promise.resolve (get-fn cid))) views)))))
+
+(deftest ordered-mixed-fold-is-identical-to-full-rebuild
+  (async done
+    (let [s (store) {:keys [put! get-fn encrypt decrypt]} s
+          views {"values" {"attrs" ["value"]}}
+          quads [{:s "wanted" :p "value" :o "first"}
+                 {:s "wanted" :op :retract-entity}
+                 {:s "wanted" :p "value" :o "temporary"}
+                 {:s "wanted" :p "value" :o "temporary" :op :retract}
+                 {:s "wanted" :p "value" :o "final"}
+                 {:s "other" :p "value" :o {:nested [true nil 42]} :op :retract}
+                 {:s "other" :p "link" :o (ipld/link "bafyreiaakutsdtndrl7e7emcmkp5hjsaaq2vu6prfelbgaglprvtdon63m")}
+                 {:s "absent" :op :retract-entity}]]
+      (-> (folded-base! s 1000 views)
+          (.then #(eng/commit! put! get-fn quads % encrypt))
+          (.then
+           (fn [head]
+             (-> (eng/fold-rebuild! put! get-fn head ipld/link? nil fixture/test-blind-fn
+                                    encrypt decrypt nil nil #(js/Promise.resolve (get-fn %)) views)
+                 (.then
+                  (fn [reference]
+                    (reset-counts! s)
+                    (-> (eng/fold! put! get-fn head ipld/link? nil fixture/test-blind-fn
+                                   encrypt decrypt nil nil #(js/Promise.resolve (get-fn %)) views)
+                        (.then
+                         (fn [actual]
+                           (is (= reference actual) "whole chain CID, including all four indexes and view data")
+                           (is (< (:decrypts @(:counts s)) 12) "unrelated indexed entities are never decrypted")
+                           (is (< (:encrypts @(:counts s)) 32) "unchanged leaves are not re-encrypted")
+                           (-> (eng/view-rows get-fn actual "values" (constantly true) decrypt)
+                               (.then #(is (= [{:e "wanted" :a "value" :v_edn "\"final\"" :added true}]
+                                              (:rows %)))))))))))))
+          (.catch #(is false (str %)))
+          (.finally done)))))
+
+(deftest bounded-fold-and-view-spec-changes-match-full-rebuild
+  (async done
+    (let [s (store) {:keys [put! get-fn encrypt decrypt]} s
+          views {"values" {"attrs" ["value"]}}]
+      (-> (folded-base! s 100 views)
+          (.then #(eng/commit! put! get-fn [{:s "wanted" :op :retract-entity}] % encrypt))
+          (.then #(eng/commit! put! get-fn [{:s "wanted" :p "value" :o "restored"}] % encrypt))
+          (.then
+           (fn [head]
+             (let [new-specs {"values" nil "links" {"attrs" ["link"]}}]
+               (-> (eng/fold-rebuild! put! get-fn head ipld/link? 1 fixture/test-blind-fn
+                                      encrypt decrypt nil nil #(js/Promise.resolve (get-fn %)) new-specs)
+                   (.then
+                    (fn [reference]
+                      (-> (eng/fold! put! get-fn head ipld/link? 1 fixture/test-blind-fn
+                                     encrypt decrypt nil nil #(js/Promise.resolve (get-fn %)) new-specs)
+                          (.then
+                           (fn [actual]
+                             (is (= reference actual))
+                             (is (= 1 (eng/novelty-size get-fn actual)))
+                             (-> (eng/hot-datoms get-fn actual {:index :eavt :components ["wanted"]}
+                                                 (constantly true) fixture/test-blind-fn decrypt
+                                                 #(js/Promise.resolve (get-fn %)))
+                                 (.then #(is (= [{:e "wanted" :a "value" :v_edn "\"restored\"" :added true}] %)))))))))))))
+          (.catch #(is false (str %)))
+          (.finally done)))))
+
+
+(defn measured-delta! [size fold-fn]
+  (let [s (store) {:keys [put! get-fn encrypt decrypt]} s]
+    (-> (folded-base! s size nil)
+        (.then #(eng/commit! put! get-fn [{:s "new" :p "value" :o "added"}] % encrypt))
+        (.then
+         (fn [head]
+           (reset-counts! s)
+           (let [start (js/performance.now)]
+             (-> (fold-fn put! get-fn head ipld/link? nil fixture/test-blind-fn
+                            encrypt decrypt nil nil #(js/Promise.resolve (get-fn %)) nil)
+                 (.then (fn [_] (assoc @(:counts s) :size size :ms (- (js/performance.now) start)))))))))))
+
+(deftest one-change-work-does-not-scale-with-total-indexed-rows
+  (async done
+    (-> (measured-delta! 1000 eng/fold!)
+        (.then (fn [small]
+                 (-> (measured-delta! 10000 eng/fold!)
+                     (.then (fn [large]
+                              (println "incremental-fold-work" (pr-str {:small small :large large}))
+                              (is (= (:decrypts small) (:decrypts large) 1))
+                              (is (= (:encrypts small) (:encrypts large) 3))
+                              (is (< (:gets large) 300) "only internal metadata and affected leaf windows")
+                              (is (< (:bytes large) 500000) "does not fetch the entire indexed graph"))))))
+        (.catch #(is false (str %)))
+        (.finally done))))
+
+(deftest rebuild-reference-demonstrates-full-index-work
+  (async done
+    (-> (measured-delta! 1000 eng/fold-rebuild!)
+        (.then (fn [result]
+                 (println "rebuild-fold-work" (pr-str result))
+                 (is (> (:decrypts result) 1000))
+                 (is (> (:encrypts result) 3000))))
+        (.catch #(is false (str %)))
+        (.finally done))))
+
+))

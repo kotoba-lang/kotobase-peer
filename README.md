@@ -627,6 +627,38 @@ entirely chain's job. Neither library needed to change.
   or cron wires the policy (e.g. fold after every write past a threshold,
   or on a timer) using its own storage/scheduling.
 
+## Incremental edge compaction
+
+On ClojureScript, `fold!` applies the oldest selected novelty transactions to
+existing Prolly indexes through `arrangement/commit-changes!`. It does not
+hydrate the indexed database and rebuild all four indexes for every fold.
+A transaction-count limit alone cannot bound that older full-rebuild cost.
+
+Operations retain log order. Assertions and explicit retractions collapse to
+the final operation for each triple. Entity retractions read only that entity's
+indexed EAVT range and also cancel preceding pending assertions. All four index
+roots are updated together in one immutable snapshot; publishing its chain head
+remains the caller's existing durable-write and compare-and-swap responsibility.
+A competing writer must cause a retry against the winning head, never an
+unconditional head replacement.
+
+Existing materialized views apply the same ordered changes. A changed or new
+view specification backfills only its declared attributes. View rows now have
+canonical serialized order; old view blocks remain readable. This normalization
+can change a view block's CID even when its logical row set is unchanged.
+
+This is not a constant-memory compactor: Prolly internal-node metadata and a
+flat materialized-view block still scale with their respective structures.
+Entity deletion necessarily visits that entity's facts, and bounded compaction
+still maintains the remaining novelty subject index. Large view creation and
+legacy migrations need separate capacity qualification. JVM and legacy schema
+migration use the explicit `fold-rebuild!` compatibility implementation.
+
+`incremental-fold-test` compares complete chain CIDs with that rebuild reference
+for mixed operations and view changes, and counts reads and crypto operations
+with unrelated indexed data present. These local work measurements do not
+establish production CPU time, memory limits, or an availability SLO.
+
 ## Test
 
 ```bash
