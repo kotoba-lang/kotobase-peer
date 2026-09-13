@@ -1851,8 +1851,25 @@
                              (js->clj (js/JSON.parse value)))
                      :etag (gobj/get object "etag")})))
              {:lease nil :etag nil}))))
-    (js/Promise.reject
-     (js/Error. "Compaction scheduler currently requires an R2 binding"))))
+    (if-let [config (b2-config e)]
+      (-> (s3-request! config "GET" (compaction-lease-key e db-id))
+          (.then
+           (fn [response]
+             (cond
+               (= 404 (.-status response)) {:lease nil :etag nil}
+               (.-ok response)
+               (-> (.text response)
+                   (.then
+                    (fn [value]
+                      {:lease (compaction/validate-lease-node
+                               (js->clj (js/JSON.parse value)))
+                       :etag (.get (.-headers response) "etag")})))
+               :else
+               (js/Promise.reject
+                (ex-info "S3 compaction lease GET failed"
+                         {:db-id db-id :status (.-status response)}))))))
+      (js/Promise.reject
+       (js/Error. "No MERKLE_BUCKET or MERKLE_S3_* backend configured"))))
 
 (defn compaction-pressure!
   "Inspect a bounded newest-first window. Scheduling is warranted when either
@@ -1881,6 +1898,111 @@
             :l0-count l0-count
             :tail? (boolean tail)})))))
 
+(defn- claim-compaction-lease-r2!
+  "R2-binding branch of the compaction claim: ETag CAS on the lease key."
+  [e bucket db-id owner token now-ms window-size target-run-rows lease-ms
+   min-manifests l0-threshold]
+  (-> (get-head e db-id)
+      (.then
+       (fn [{expected-head :value}]
+         (if-not expected-head
+           {:claimed? false :reason :no-head}
+           (-> (compaction-pressure! e expected-head min-manifests l0-threshold)
+               (.then
+                (fn [{:keys [needed?] :as pressure}]
+                  (if-not needed?
+                    (assoc pressure :claimed? false :reason :no-pressure)
+                    (-> (get-compaction-lease! e db-id)
+                        (.then
+                         (fn [{current :lease :keys [etag]}]
+                           (if (and current
+                                    (compaction/lease-active? current now-ms))
+                             {:claimed? false :reason :leased
+                              :owner (get current "owner")
+                              :expires-at (get current "expires-at")}
+                             (let [task (compaction/scheduler-task
+                                         {:db-id db-id
+                                          :expected-head expected-head
+                                          :window-size window-size
+                                          :target-run-rows target-run-rows})
+                                   lease (compaction/lease-node
+                                          {:task task :owner owner :token token
+                                           :attempt (inc (or (get current "attempt") 0))
+                                           :acquired-at now-ms
+                                           :expires-at (+ now-ms lease-ms)})
+                                   condition (if etag
+                                               #js {:etagMatches etag}
+                                               #js {:etagDoesNotMatch "*"})]
+                               (-> (.put bucket (compaction-lease-key e db-id)
+                                         (js/JSON.stringify (clj->js lease))
+                                         #js {:onlyIf condition})
+                                   (.then
+                                    (fn [result]
+                                      (if result
+                                        {:claimed? true
+                                         :task task
+                                         :lease lease
+                                         :pressure pressure
+                                         :lease-etag (gobj/get result "etag")}
+                                        {:claimed? false
+                                         :reason :cas-lost}))))))))))))))))))
+
+(defn- claim-compaction-lease-s3!
+  "Signed-S3 branch of the compaction claim: If-Match/If-None-Match CAS on the
+  lease key. 409/412 mean the lease moved under us — the same :cas-lost the R2
+  ETag path reports, not an error."
+  [e config db-id owner token now-ms window-size target-run-rows lease-ms
+   min-manifests l0-threshold]
+  (-> (get-head e db-id)
+      (.then
+       (fn [{expected-head :value}]
+         (if-not expected-head
+           {:claimed? false :reason :no-head}
+           (-> (compaction-pressure! e expected-head min-manifests l0-threshold)
+               (.then
+                (fn [{:keys [needed?] :as pressure}]
+                  (if-not needed?
+                    (assoc pressure :claimed? false :reason :no-pressure)
+                    (-> (get-compaction-lease! e db-id)
+                        (.then
+                         (fn [{current :lease :keys [etag]}]
+                           (if (and current
+                                    (compaction/lease-active? current now-ms))
+                             {:claimed? false :reason :leased
+                              :owner (get current "owner")
+                              :expires-at (get current "expires-at")}
+                             (let [task (compaction/scheduler-task
+                                         {:db-id db-id
+                                          :expected-head expected-head
+                                          :window-size window-size
+                                          :target-run-rows target-run-rows})
+                                   lease (compaction/lease-node
+                                          {:task task :owner owner :token token
+                                           :attempt (inc (or (get current "attempt") 0))
+                                           :acquired-at now-ms
+                                           :expires-at (+ now-ms lease-ms)})
+                                   condition (if etag
+                                               {"if-match" etag}
+                                               {"if-none-match" "*"})]
+                               (-> (s3-request! config "PUT" (compaction-lease-key e db-id)
+                                                {:body (js/JSON.stringify (clj->js lease))
+                                                 :headers condition})
+                                   (.then
+                                    (fn [response]
+                                      (cond
+                                        (.-ok response)
+                                        {:claimed? true
+                                         :task task
+                                         :lease lease
+                                         :pressure pressure
+                                         :lease-etag (.get (.-headers response) "etag")}
+                                        (contains? #{409 412} (.-status response))
+                                        {:claimed? false :reason :cas-lost}
+                                        :else
+                                        (js/Promise.reject
+                                         (ex-info "S3 compaction lease CAS failed"
+                                                  {:db-id db-id :status (.-status response)})))))))))))))))))))
+
 (defn claim-compaction-lease!
   "Claim one deterministic head task using R2 ETag CAS. An active lease is
   never stolen; an expired/completed lease increments attempt and may be
@@ -1896,50 +2018,18 @@
       (throw (ex-info "Compaction claim requires db-id, owner, and positive lease-ms"
                       {:db-id db-id :owner owner :lease-ms lease-ms})))
     (if-let [bucket (env e "MERKLE_BUCKET")]
-      (-> (get-head e db-id)
-          (.then
-           (fn [{expected-head :value}]
-             (if-not expected-head
-               {:claimed? false :reason :no-head}
-               (-> (compaction-pressure! e expected-head min-manifests l0-threshold)
-                   (.then
-                    (fn [{:keys [needed?] :as pressure}]
-                      (if-not needed?
-                        (assoc pressure :claimed? false :reason :no-pressure)
-                        (-> (get-compaction-lease! e db-id)
-                            (.then
-                             (fn [{current :lease :keys [etag]}]
-                               (if (and current
-                                        (compaction/lease-active? current now-ms))
-                                 {:claimed? false :reason :leased
-                                  :owner (get current "owner")
-                                  :expires-at (get current "expires-at")}
-                                 (let [task (compaction/scheduler-task
-                                             {:db-id db-id
-                                              :expected-head expected-head
-                                              :window-size window-size
-                                              :target-run-rows target-run-rows})
-                                       lease (compaction/lease-node
-                                              {:task task :owner owner :token token
-                                               :attempt (inc (or (get current "attempt") 0))
-                                               :acquired-at now-ms
-                                               :expires-at (+ now-ms lease-ms)})
-                                       condition (if etag
-                                                   #js {:etagMatches etag}
-                                                   #js {:etagDoesNotMatch "*"})]
-                                   (-> (.put bucket (compaction-lease-key e db-id)
-                                             (js/JSON.stringify (clj->js lease))
-                                             #js {:onlyIf condition})
-                                       (.then
-                                        (fn [result]
-                                          (if result
-                                            {:claimed? true
-                                             :task task
-                                             :lease lease
-                                             :pressure pressure
-                                             :lease-etag (gobj/get result "etag")}
-                                            {:claimed? false
-                                             :reason :cas-lost})))))))))))))))))
+      (claim-compaction-lease-r2! e bucket db-id owner token now-ms
+                                  window-size target-run-rows lease-ms
+                                  min-manifests l0-threshold)
+      (if-let [config (b2-config e)]
+        (if (= "true" (env e "MERKLE_S3_CONDITIONAL_HEAD"))
+          (claim-compaction-lease-s3! e config db-id owner token now-ms
+                                      window-size target-run-rows lease-ms
+                                      min-manifests l0-threshold)
+          (js/Promise.reject
+           (js/Error. "Set MERKLE_S3_CONDITIONAL_HEAD=true only for a backend with conditional PutObject")))
+        (js/Promise.reject
+         (js/Error. "No MERKLE_BUCKET or MERKLE_S3_* backend configured")))))))
       (js/Promise.reject
        (js/Error. "Compaction scheduler currently requires an R2 binding")))))
 
@@ -1967,8 +2057,27 @@
                    {:won? (boolean result)
                     :lease (when result renewed)
                     :etag (when result (gobj/get result "etag"))})))
-      (js/Promise.reject
-       (js/Error. "Compaction scheduler currently requires an R2 binding")))))
+      (if-let [config (b2-config e)]
+        (if (= "true" (env e "MERKLE_S3_CONDITIONAL_HEAD"))
+          (-> (s3-request! config "PUT" (compaction-lease-key e (get lease "db-id"))
+                           {:body (js/JSON.stringify (clj->js renewed))
+                            :headers {"if-match" etag}})
+              (.then (fn [response]
+                       (cond
+                         (.-ok response)
+                         {:won? true :lease renewed
+                          :etag (.get (.-headers response) "etag")}
+                         (contains? #{409 412} (.-status response))
+                         {:won? false :lease nil :etag nil}
+                         :else
+                         (js/Promise.reject
+                          (ex-info "S3 compaction lease renewal failed"
+                                   {:db-id (get lease "db-id")
+                                    :status (.-status response)}))))))
+          (js/Promise.reject
+           (js/Error. "Set MERKLE_S3_CONDITIONAL_HEAD=true only for a backend with conditional PutObject")))
+        (js/Promise.reject
+         (js/Error. "No MERKLE_BUCKET or MERKLE_S3_* backend configured"))))))
 
 (defn- finish-compaction-task!
   [e {:keys [task lease lease-etag]} outcome completed-at]
@@ -1997,8 +2106,28 @@
                           {:task-id (:id task) :outcome outcome
                            :checkpoint checkpoint
                            :lease-fenced? (not (boolean result))}))))))
-      (js/Promise.reject
-       (js/Error. "Compaction scheduler currently requires an R2 binding")))))
+      (if-let [config (b2-config e)]
+        (if (= "true" (env e "MERKLE_S3_CONDITIONAL_HEAD"))
+          (-> (s3-request! config "PUT" (compaction-checkpoint-key e db-id (:id task) token)
+                           {:body (js/JSON.stringify (clj->js checkpoint))
+                            :headers {"if-none-match" "*"}})
+              (.then
+               (fn [cp-response]
+                 (if-not (.-ok cp-response)
+                   (js/Promise.reject
+                    (ex-info "S3 compaction checkpoint PUT failed"
+                             {:db-id db-id :status (.-status cp-response)}))
+                   (-> (s3-request! config "PUT" (compaction-lease-key e db-id)
+                                    {:body (js/JSON.stringify (clj->js terminal))
+                                     :headers {"if-match" lease-etag}})
+                       (.then (fn [result]
+                                {:task-id (:id task) :outcome outcome
+                                 :checkpoint checkpoint
+                                 :lease-fenced? (not (.-ok result))}))))))))
+          (js/Promise.reject
+           (js/Error. "Set MERKLE_S3_CONDITIONAL_HEAD=true only for a backend with conditional PutObject")))
+        (js/Promise.reject
+         (js/Error. "No MERKLE_BUCKET or MERKLE_S3_* backend configured")))))
 
 (defn run-compaction-once!
   "Claim, execute, checkpoint, and terminally fence one database compaction.
@@ -2055,44 +2184,54 @@
                            (fn [checkpoint]
                              {:pointer pointer :checkpoint checkpoint
                               :etag (gobj/get object "etag")})))))))))))
-    (js/Promise.reject
-     (js/Error. "Resumable execution currently requires an R2 binding"))))
+    (if-let [config (b2-config e)]
+      (-> (s3-request! config "GET" (resumable-pointer-key e db-id task-id))
+          (.then
+           (fn [response]
+             (cond
+               (= 404 (.-status response)) {:pointer nil :checkpoint nil :etag nil}
+               (.-ok response)
+               (-> (.text response)
+                   (.then
+                    (fn [value]
+                      (let [pointer (js->clj (js/JSON.parse value))]
+                        (-> (get-node! e (get pointer "checkpoint"))
+                            (.then
+                             (fn [checkpoint]
+                               {:pointer pointer :checkpoint checkpoint
+                                :etag (.get (.-headers response) "etag")})))))))
+               :else
+               (js/Promise.reject
+                (ex-info "S3 resumable pointer GET failed"
+                         {:db-id db-id :task-id task-id
+                          :status (.-status response)}))))))
+      (js/Promise.reject
+       (js/Error. "No MERKLE_BUCKET or MERKLE_S3_* backend configured"))))
 
-(defn claim-resumable-execution!
-  "Claim or reclaim one deterministic snapshot-pinned task. Task and initial
-  checkpoint are immutable blocks written before the small R2 ETag-CAS pointer.
-  Active attempts are not stolen."
-  [e {:keys [task owner token now-ms lease-ms]
-      :or {lease-ms 60000}}]
-  (let [now-ms (or now-ms (js/Date.now))
-        token (or token (str (random-uuid)))
-        task-id (str (:cid task))
+(defn- claim-resumable-execution-r2!
+  "R2-binding branch of the resumable claim: ETag CAS on the pointer key."
+  [e bucket task owner token now-ms lease-ms]
+  (let [task-id (str (:cid task))
         db-id (get-in task [:node "db-id"])
         expected-head (get-in task [:node "expected-head"])]
-    (when-not (and (:bytes task) (string? owner) (seq owner)
-                   (string? token) (seq token) (integer? now-ms)
-                   (pos-int? lease-ms))
-      (throw (ex-info "Invalid resumable execution claim"
-                      {:owner owner :now-ms now-ms :lease-ms lease-ms})))
-    (if-let [bucket (env e "MERKLE_BUCKET")]
-      (-> (get-head e db-id)
-          (.then
-           (fn [{current-head :value}]
-             (if (not= expected-head current-head)
-               {:claimed? false :reason :stale-head
-                :expected-head expected-head :current-head current-head}
-               (-> (get-resumable-pointer! e db-id task-id)
-                   (.then
-                    (fn [{current :pointer :keys [etag]}]
+    (-> (get-head e db-id)
+        (.then
+         (fn [{current-head :value}]
+           (if (not= expected-head current-head)
+             {:claimed? false :reason :stale-head
+              :expected-head expected-head :current-head current-head}
+             (-> (get-resumable-pointer! e db-id task-id)
+                 (.then
+                  (fn [{current :pointer :keys [etag]}]
+                    (if (and current
+                             (not= "running" (get current "status")))
+                      {:claimed? false :reason :terminal
+                       :status (keyword (get current "status"))}
                       (if (and current
-                               (not= "running" (get current "status")))
-                        {:claimed? false :reason :terminal
-                         :status (keyword (get current "status"))}
-                        (if (and current
-                                 (> (get current "expires-at" 0) now-ms))
-                          {:claimed? false :reason :leased
-                           :owner (get current "owner")
-                           :expires-at (get current "expires-at")}
+                               (> (get current "expires-at" 0) now-ms))
+                        {:claimed? false :reason :leased
+                         :owner (get current "owner")
+                         :expires-at (get current "expires-at")}
                         (let [attempt (inc (or (get current "attempt") 0))
                               checkpoint
                               (resumable/initial-checkpoint
@@ -2129,7 +2268,102 @@
                                            :checkpoint (:node checkpoint)
                                            :etag (gobj/get result "etag")}
                                           {:claimed? false
-                                           :reason :cas-lost})))))))))))))))))
+                                           :reason :cas-lost}))))))))))))))))))
+
+(defn- claim-resumable-execution-s3!
+  "Signed-S3 branch of the resumable claim: If-Match/If-None-Match CAS on the
+  pointer key. 409/412 → :cas-lost, the same outcome the R2 ETag path reports."
+  [e config task owner token now-ms lease-ms]
+  (let [task-id (str (:cid task))
+        db-id (get-in task [:node "db-id"])
+        expected-head (get-in task [:node "expected-head"])]
+    (-> (get-head e db-id)
+        (.then
+         (fn [{current-head :value}]
+           (if (not= expected-head current-head)
+             {:claimed? false :reason :stale-head
+              :expected-head expected-head :current-head current-head}
+             (-> (get-resumable-pointer! e db-id task-id)
+                 (.then
+                  (fn [{current :pointer :keys [etag]}]
+                    (if (and current
+                             (not= "running" (get current "status")))
+                      {:claimed? false :reason :terminal
+                       :status (keyword (get current "status"))}
+                      (if (and current
+                               (> (get current "expires-at" 0) now-ms))
+                        {:claimed? false :reason :leased
+                         :owner (get current "owner")
+                         :expires-at (get current "expires-at")}
+                        (let [attempt (inc (or (get current "attempt") 0))
+                              checkpoint
+                              (resumable/initial-checkpoint
+                               {:task task :token token :attempt attempt})
+                              pointer
+                              {"format" "kotobase/resumable-pointer"
+                               "version" 1
+                               "task-id" task-id
+                               "db-id" db-id
+                               "expected-head" expected-head
+                               "checkpoint" (str (:cid checkpoint))
+                               "owner" owner "token" token
+                               "attempt" attempt
+                               "expires-at" (+ now-ms lease-ms)
+                               "status" "running"}
+                              condition (if etag
+                                          {"if-match" etag}
+                                          {"if-none-match" "*"})]
+                          (-> (js/Promise.all
+                               #js [(put-block! e (:cid task) (:bytes task))
+                                    (put-block! e (:cid checkpoint)
+                                                (:bytes checkpoint))])
+                              (.then
+                               (fn [_]
+                                 (-> (s3-request! config "PUT"
+                                                  (resumable-pointer-key e db-id task-id)
+                                                  {:body (js/JSON.stringify (clj->js pointer))
+                                                   :headers condition})
+                                     (.then
+                                      (fn [response]
+                                        (cond
+                                          (.-ok response)
+                                          {:claimed? true :task task
+                                           :pointer pointer
+                                           :checkpoint (:node checkpoint)
+                                           :etag (.get (.-headers response) "etag")}
+                                          (contains? #{409 412} (.-status response))
+                                          {:claimed? false :reason :cas-lost}
+                                          :else
+                                          (js/Promise.reject
+                                           (ex-info "S3 resumable pointer CAS failed"
+                                                    {:task-id task-id
+                                                     :status (.-status response)}))))))))))))))))))))
+
+(defn claim-resumable-execution!
+  "Claim or reclaim one deterministic snapshot-pinned task. Task and initial
+  checkpoint are immutable blocks written before the small R2 ETag-CAS pointer.
+  Active attempts are not stolen."
+  [e {:keys [task owner token now-ms lease-ms]
+      :or {lease-ms 60000}}]
+  (let [now-ms (or now-ms (js/Date.now))
+        token (or token (str (random-uuid)))
+        task-id (str (:cid task))
+        db-id (get-in task [:node "db-id"])
+        expected-head (get-in task [:node "expected-head"])]
+    (when-not (and (:bytes task) (string? owner) (seq owner)
+                   (string? token) (seq token) (integer? now-ms)
+                   (pos-int? lease-ms))
+      (throw (ex-info "Invalid resumable execution claim"
+                      {:owner owner :now-ms now-ms :lease-ms lease-ms})))
+    (if-let [bucket (env e "MERKLE_BUCKET")]
+      (claim-resumable-execution-r2! e bucket task owner token now-ms lease-ms)
+      (if-let [config (b2-config e)]
+        (if (= "true" (env e "MERKLE_S3_CONDITIONAL_HEAD"))
+          (claim-resumable-execution-s3! e config task owner token now-ms lease-ms)
+          (js/Promise.reject
+           (js/Error. "Set MERKLE_S3_CONDITIONAL_HEAD=true only for a backend with conditional PutObject")))
+        (js/Promise.reject
+         (js/Error. "No MERKLE_BUCKET or MERKLE_S3_* backend configured")))))))
       (js/Promise.reject
        (js/Error. "Resumable execution currently requires an R2 binding")))))
 
@@ -2191,8 +2425,51 @@
                                   :etag (gobj/get result "etag")}
                                  {:advanced? false
                                   :reason :pointer-fenced}))))))))))))
-      (js/Promise.reject
-       (js/Error. "Resumable execution currently requires an R2 binding")))))
+      (if-let [config (b2-config e)]
+        (if (= "true" (env e "MERKLE_S3_CONDITIONAL_HEAD"))
+          (-> (get-head e db-id)
+              (.then
+               (fn [{current-head :value}]
+                 (if (not= expected-head current-head)
+                   {:advanced? false :reason :stale-head
+                    :current-head current-head}
+                   (-> (js/Promise.all
+                        #js [(put-block! e (get-in advanced [:spill :cid])
+                                         (get-in advanced [:spill :bytes]))
+                             (put-block! e (get-in advanced [:checkpoint :cid])
+                                         (get-in advanced [:checkpoint :bytes]))])
+                       (.then
+                        (fn [_]
+                          (let [next-pointer
+                                (assoc pointer
+                                       "checkpoint"
+                                       (str (get-in advanced [:checkpoint :cid]))
+                                       "expires-at" (+ now-ms lease-ms))]
+                            (-> (s3-request! config "PUT"
+                                             (resumable-pointer-key e db-id task-id)
+                                             {:body (js/JSON.stringify (clj->js next-pointer))
+                                              :headers {"if-match" etag}})
+                                (.then
+                                 (fn [response]
+                                   (cond
+                                     (.-ok response)
+                                     {:advanced? true :task task
+                                      :pointer next-pointer
+                                      :checkpoint
+                                      (get-in advanced [:checkpoint :node])
+                                      :spill (get-in advanced [:spill :node])
+                                      :etag (.get (.-headers response) "etag")}
+                                     (contains? #{409 412} (.-status response))
+                                     {:advanced? false :reason :pointer-fenced}
+                                     :else
+                                     (js/Promise.reject
+                                      (ex-info "S3 resumable pointer advance failed"
+                                               {:task-id task-id
+                                                :status (.-status response)}))))))))))))))
+          (js/Promise.reject
+           (js/Error. "Set MERKLE_S3_CONDITIONAL_HEAD=true only for a backend with conditional PutObject")))
+        (js/Promise.reject
+         (js/Error. "No MERKLE_BUCKET or MERKLE_S3_* backend configured")))))
 
 (defn finish-resumable-execution!
   "Publish a terminal immutable checkpoint and CAS the pointer to terminal.
@@ -2238,8 +2515,43 @@
                                   :etag (gobj/get result "etag")}
                                  {:finished? false
                                   :reason :pointer-fenced}))))))))))))
-      (js/Promise.reject
-       (js/Error. "Resumable execution currently requires an R2 binding")))))
+      (if-let [config (b2-config e)]
+        (if (= "true" (env e "MERKLE_S3_CONDITIONAL_HEAD"))
+          (-> (get-head e db-id)
+              (.then
+               (fn [{current-head :value}]
+                 (if (not= expected-head current-head)
+                   {:finished? false :reason :stale-head
+                    :current-head current-head}
+                   (-> (put-block! e (:cid terminal) (:bytes terminal))
+                       (.then
+                        (fn [_]
+                          (let [next-pointer
+                                (assoc pointer
+                                       "checkpoint" (str (:cid terminal))
+                                       "status" (name status))]
+                            (-> (s3-request! config "PUT"
+                                             (resumable-pointer-key e db-id task-id)
+                                             {:body (js/JSON.stringify (clj->js next-pointer))
+                                              :headers {"if-match" etag}})
+                                (.then
+                                 (fn [response]
+                                   (cond
+                                     (.-ok response)
+                                     {:finished? true :pointer next-pointer
+                                      :checkpoint (:node terminal)
+                                      :etag (.get (.-headers response) "etag")}
+                                     (contains? #{409 412} (.-status response))
+                                     {:finished? false :reason :pointer-fenced}
+                                     :else
+                                     (js/Promise.reject
+                                      (ex-info "S3 resumable pointer finish failed"
+                                               {:task-id task-id
+                                                :status (.-status response)})))))))))))))
+          (js/Promise.reject
+           (js/Error. "Set MERKLE_S3_CONDITIONAL_HEAD=true only for a backend with conditional PutObject")))
+        (js/Promise.reject
+         (js/Error. "No MERKLE_BUCKET or MERKLE_S3_* backend configured")))))
 
 (defn cancel-resumable-execution!
   "Atomically fence a running resumable task with a terminal cancelled
@@ -2306,8 +2618,66 @@
                                          :etag (gobj/get result "etag")}
                                         {:cancelled? false
                                          :reason :pointer-fenced}))))))))))))))))
-    (js/Promise.reject
-     (js/Error. "Resumable execution currently requires an R2 binding"))))
+    (if-let [config (b2-config e)]
+      (if (= "true" (env e "MERKLE_S3_CONDITIONAL_HEAD"))
+        (-> (get-resumable-pointer! e db-id task-id)
+            (.then
+             (fn [{:keys [pointer checkpoint etag]}]
+               (cond
+                 (nil? pointer)
+                 {:cancelled? false :reason :not-found}
+
+                 (= "cancelled" (get pointer "status"))
+                 {:cancelled? true :idempotent? true
+                  :pointer pointer :checkpoint checkpoint :etag etag}
+
+                 (not= "running" (get pointer "status"))
+                 {:cancelled? false :reason :terminal
+                  :status (keyword (get pointer "status"))}
+
+                 :else
+                 (let [task-cid (ipld/link-cid (get checkpoint "task"))]
+                   (-> (get-node! e task-cid)
+                       (.then
+                        (fn [task-node]
+                          (let [task {:cid task-cid :node task-node}
+                                terminal
+                                (resumable/finish
+                                 {:task task :checkpoint checkpoint
+                                  :token (get pointer "token")
+                                  :attempt (get pointer "attempt")
+                                  :status :cancelled
+                                  :error {"reason" reason}})
+                                next-pointer
+                                (assoc pointer
+                                       "checkpoint" (str (:cid terminal))
+                                       "status" "cancelled")]
+                            (-> (put-block! e (:cid terminal) (:bytes terminal))
+                                (.then
+                                 (fn [_]
+                                   (-> (s3-request! config "PUT"
+                                                    (resumable-pointer-key e db-id task-id)
+                                                    {:body (js/JSON.stringify (clj->js next-pointer))
+                                                     :headers {"if-match" etag}})
+                                       (.then
+                                        (fn [response]
+                                          (cond
+                                            (.-ok response)
+                                            {:cancelled? true :idempotent? false
+                                             :pointer next-pointer
+                                             :checkpoint (:node terminal)
+                                             :etag (.get (.-headers response) "etag")}
+                                            (contains? #{409 412} (.-status response))
+                                            {:cancelled? false :reason :pointer-fenced}
+                                            :else
+                                            (js/Promise.reject
+                                             (ex-info "S3 resumable pointer cancel failed"
+                                                      {:task-id task-id
+                                                       :status (.-status response)}))))))))))))))))))
+        (js/Promise.reject
+         (js/Error. "Set MERKLE_S3_CONDITIONAL_HEAD=true only for a backend with conditional PutObject")))
+      (js/Promise.reject
+       (js/Error. "No MERKLE_BUCKET or MERKLE_S3_* backend configured"))))
 
 (defn- verify-reachability-bytes!
   "Verify BYTES against CID using the codec CID declares. Returns true when
