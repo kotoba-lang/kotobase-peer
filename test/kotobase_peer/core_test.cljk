@@ -2519,7 +2519,7 @@
 ;; ── ADR-2607120730 Part 1: memoized hydration (fold!'s cache-get/cache-put!) ──
 
 #?(:cljs
-   (deftest fold-bang-cache-get-cache-put-avoids-rehydrating-on-a-retry-against-the-same-snapshot
+   (deftest legacy-fold-cache-get-cache-put-avoids-rehydrating-on-a-retry-against-the-same-snapshot
      ;; ADR-2607120730 Part 1 (memoized hydration): a fold attempt that
      ;; hydrates the same still-current indexed snapshot twice (e.g. two cron
      ;; retries against a chain nothing new has folded into since) should pay
@@ -2533,11 +2533,11 @@
              cache-get (fn [k] (js/Promise.resolve (get @cache k)))
              cache-put! (fn [k v] (js/Promise.resolve (swap! cache assoc k v)))]
          (-> (eng/commit! put! get-fn [{:s "alice" :p "role" :o "admin"}] nil test-encrypt-fn)
-             (.then (fn [c0] (eng/fold! put! get-fn c0 test-blind-fn test-encrypt-fn counting-decrypt-fn)))
+             (.then (fn [c0] (eng/fold-rebuild! put! get-fn c0 test-blind-fn test-encrypt-fn counting-decrypt-fn)))
              (.then (fn [c1]
                       (is (= 0 (eng/novelty-size get-fn c1)) "nothing pending after the warm-up fold")
                       (reset! decrypt-calls 0)
-                      (-> (eng/fold! put! get-fn c1 ipld/link? nil test-blind-fn test-encrypt-fn counting-decrypt-fn
+                      (-> (eng/fold-rebuild! put! get-fn c1 ipld/link? nil test-blind-fn test-encrypt-fn counting-decrypt-fn
                                      cache-get cache-put!)
                           (.then (fn [attempt1]
                                    (let [attempt1-calls @decrypt-calls]
@@ -2545,7 +2545,7 @@
                                      (is (contains? @cache (eng/hydrate-cache-key (eng/latest-snapshot-cid get-fn c1)))
                                          "cache-put! populated the cache under the expected key")
                                      (reset! decrypt-calls 0)
-                                     (-> (eng/fold! put! get-fn c1 ipld/link? nil test-blind-fn test-encrypt-fn counting-decrypt-fn
+                                     (-> (eng/fold-rebuild! put! get-fn c1 ipld/link? nil test-blind-fn test-encrypt-fn counting-decrypt-fn
                                                     cache-get cache-put!)
                                          (.then (fn [attempt2]
                                                   (is (zero? @decrypt-calls)

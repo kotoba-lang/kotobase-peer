@@ -3061,7 +3061,9 @@
   (let [attrs (set (get spec "attrs"))]
     (->> (datoms db (constantly true))
          (filter #(and (:added % true) (contains? attrs (:a %))))
-         (mapv (fn [{:keys [e a v_edn]}] [e a v_edn])))))
+         (map (fn [{:keys [e a v_edn]}] [e a v_edn]))
+         (sort-by pr-str)
+         vec)))
 
 (defn- merge-view-specs
   "The spec set to materialize this fold: the previously-stored specs,
@@ -3149,7 +3151,7 @@
                         (finish (aget pair 0)
                                 (apply concat (array-seq (aget pair 1))))))))))))
 
-(defn fold!
+(defn fold-rebuild!
   "Compact `chain-cid`'s novelty into a fresh indexed snapshot: hydrate the
   current `indexed` snapshot, re-assert every novelty quad on top (append
   order), `qs/commit!` that as the new `indexed`, and append ONE new
@@ -3165,7 +3167,7 @@
   instead of always emptying it. Novelty is stored oldest-first (`commit!`
   `conj`s each new tx-block link onto the END), so `take max-novelty`/
   `drop max-novelty` folds strictly in chronological (append) order and the
-  remaining tail is exactly what a later `fold!` call would still need to
+  remaining tail is exactly what a later `fold-rebuild!` call would still need to
   process — correctness (retraction-vs-earlier-assertion resolution, which
   `apply-quad`'s reduce already handles by walking `indexed` then novelty
   in order) is identical whether one call folds everything or N calls each
@@ -3177,9 +3179,9 @@
   subrequest-concurrency collapse for a MODERATE novelty backlog, but a
   backlog large enough that even batched-but-still-sequential processing
   of the WHOLE thing exceeds one Worker invocation's CPU/wall-time budget
-  can leave `fold!` itself unable to ever complete — a runaway: novelty
+  can leave `fold-rebuild!` itself unable to ever complete — a runaway: novelty
   can only shrink via a successful fold, but the fold needed to shrink it
-  never finishes. `max-novelty` breaks that: a fold cron can call `fold!`
+  never finishes. `max-novelty` breaks that: a fold cron can call `fold-rebuild!`
   with a small bounded budget every cycle and make guaranteed forward
   progress (novelty strictly shrinks by up to `max-novelty` per successful
   call) even against a backlog too large to clear in one invocation,
@@ -3227,17 +3229,17 @@
   retry loop, and a novelty-block miss restarts the ENTIRE call (redoing
   the hydrate walk too, however fast it now is on its own). Routing BOTH
   read paths through a direct async fetch removes `with-blocks` from
-  `fold!`'s critical path entirely, not just from one half of it."
+  `fold-rebuild!`'s critical path entirely, not just from one half of it."
   ([put! get-fn chain-cid blind-fn encrypt-fn decrypt-fn]
-   (fold! put! get-fn chain-cid ipld/link? nil blind-fn encrypt-fn decrypt-fn))
+   (fold-rebuild! put! get-fn chain-cid ipld/link? nil blind-fn encrypt-fn decrypt-fn))
   ([put! get-fn chain-cid ref? blind-fn encrypt-fn decrypt-fn]
-   (fold! put! get-fn chain-cid ref? nil blind-fn encrypt-fn decrypt-fn))
+   (fold-rebuild! put! get-fn chain-cid ref? nil blind-fn encrypt-fn decrypt-fn))
   ([put! get-fn chain-cid ref? max-novelty blind-fn encrypt-fn decrypt-fn]
-   (fold! put! get-fn chain-cid ref? max-novelty blind-fn encrypt-fn decrypt-fn nil nil))
+   (fold-rebuild! put! get-fn chain-cid ref? max-novelty blind-fn encrypt-fn decrypt-fn nil nil))
   ([put! get-fn chain-cid ref? max-novelty blind-fn encrypt-fn decrypt-fn cache-get cache-put!]
-   (fold! put! get-fn chain-cid ref? max-novelty blind-fn encrypt-fn decrypt-fn cache-get cache-put! nil))
+   (fold-rebuild! put! get-fn chain-cid ref? max-novelty blind-fn encrypt-fn decrypt-fn cache-get cache-put! nil))
   ([put! get-fn chain-cid ref? max-novelty blind-fn encrypt-fn decrypt-fn cache-get cache-put! async-get-fn]
-   (fold! put! get-fn chain-cid ref? max-novelty blind-fn encrypt-fn decrypt-fn cache-get cache-put! async-get-fn nil))
+   (fold-rebuild! put! get-fn chain-cid ref? max-novelty blind-fn encrypt-fn decrypt-fn cache-get cache-put! async-get-fn nil))
   ([put! get-fn chain-cid ref? max-novelty blind-fn encrypt-fn decrypt-fn cache-get cache-put! async-get-fn views]
    (let [state (state-at get-fn chain-cid)
          bounded? (some? max-novelty)
@@ -3305,6 +3307,159 @@
                                            new-state (cond-> (merge {"indexed" (ipld/link new-snap-cid)} new-novelty-state)
                                                        views-link (assoc "views" views-link))]
                                        (cd/commit! put! get-fn new-state chain-cid))))))))))))))))
+
+
+(defn fold-changes
+  "Collapse chronological novelty into final triple operations. Indexed rows
+   are needed only for retract-entity; ordinary retracts name their own keys."
+  [quads indexed-entity-quads]
+  (let [by-subject (group-by :s indexed-entity-quads)
+        final (reduce
+               (fn [ops {:keys [s p o op]}]
+                 (case (or op :assert)
+                   :assert (assoc ops [s p o] :assert)
+                   :retract (assoc ops [s p o] :retract)
+                   :retract-entity
+                   (reduce #(assoc %1 %2 :retract) ops
+                           (concat (map (juxt :s :p :o) (get by-subject s))
+                                   (filter #(= s (first %)) (keys ops))))))
+               {} quads)
+        collect (fn [op]
+                  (into [] (keep (fn [[[s p o] action]]
+                                   (when (= action op) {:s s :p p :o o}))) final))]
+    {:assertions (collect :assert) :retractions (collect :retract)}))
+
+(defn- changed-view-rows [old-rows spec quads]
+  (let [attrs (set (get spec "attrs"))]
+    (->> (reduce
+          (fn [rows {:keys [s p o op]}]
+            (case (or op :assert)
+              :assert (if (contains? attrs p) (conj rows [s p (v->edn o)]) rows)
+              :retract (disj rows [s p (v->edn o)])
+              :retract-entity (into #{} (remove #(= s (first %))) rows)))
+          (set old-rows) quads)
+         (sort-by pr-str) vec)))
+
+#?(:cljs
+   (defn- incremental-views!
+     [put! fetch! state snapshot quads views-param blind-fn encrypt-fn decrypt-fn]
+     (-> (if-let [cid (some-> (get state "views") ipld/link-cid)]
+           (-> (fetch! cid) (.then ipld/decode)
+               (.then (fn [block] (decrypt-fn (get block "ct"))))
+               (.then (fn [bytes] (get (ipld/decode bytes) "views"))))
+           (js/Promise.resolve nil))
+         (.then
+          (fn [old-views]
+            (let [specs (merge-view-specs old-views views-param)]
+              (if-not (seq specs)
+                nil
+                (-> (pmap-async
+                     (fn [[nm spec]]
+                       (let [old (get old-views nm)]
+                         (if (= spec (get old "spec"))
+                           (js/Promise.resolve
+                            [nm {"spec" spec "rows" (changed-view-rows (get old "rows") spec quads)}])
+                           ;; A newly defined/changed view must backfill its own
+                           ;; attributes. It does not hydrate the four-index db.
+                           (-> (pmap-async
+                                (fn [attr]
+                                  (cold-datoms-async fetch! snapshot
+                                                     {:index :aevt :components [attr]}
+                                                     (constantly true) blind-fn decrypt-fn))
+                                (distinct (get spec "attrs")))
+                               (.then (fn [groups]
+                                        [nm {"spec" spec
+                                             "rows" (->> groups (mapcat identity)
+                                                         (map (fn [{:keys [e a v_edn]}] [e a v_edn]))
+                                                         distinct (sort-by pr-str) vec)}]))))))
+                     specs)
+                    (.then (fn [pairs]
+                             (-> (put-views-block! put! (into {} pairs) encrypt-fn)
+                                 (.then ipld/link))))))))))))
+
+#?(:cljs
+   (defn- fold-incremental!
+     [put! get-fn chain-cid ref? max-novelty blind-fn encrypt-fn decrypt-fn
+      cache-get cache-put! async-get-fn views]
+     (let [state (state-at get-fn chain-cid)
+           snapshot (indexed-cid state)
+           fetch! (or async-get-fn #(js/Promise.resolve (get-fn %)))
+           bounded? (some? max-novelty)]
+       (-> (if snapshot
+             (-> (fetch! snapshot) (.then ipld/decode))
+             (js/Promise.resolve nil))
+           (.then
+            (fn [snap]
+              (if (and snap (not= qs/current-schema-version (get snap "schema-version")))
+                ;; Schema-1 leaves are type-lossy and cannot be mixed with the
+                ;; current encoder. Retain the explicit legacy migration path.
+                (fold-rebuild! put! get-fn chain-cid ref? max-novelty blind-fn
+                               encrypt-fn decrypt-fn cache-get cache-put! async-get-fn views)
+                (-> (if bounded?
+                      (take-oldest-novelty-async put! fetch! state max-novelty)
+                      (-> (novelty-cids-async fetch! state)
+                          (.then (fn [cids] {:taken cids}))))
+                    (.then
+                     (fn [taken]
+                       (-> (pmap-async #(read-tx-block-async fetch! % decrypt-fn) (:taken taken))
+                           (.then
+                            (fn [groups]
+                              (let [quads (vec (mapcat identity groups))
+                                    subjects (into #{} (keep #(when (= :retract-entity (:op %)) (:s %))) quads)]
+                                (-> (pmap-async
+                                     (fn [subject]
+                                       (cold-datoms-async fetch! snapshot
+                                                          {:index :eavt :components [subject]}
+                                                          (constantly true) blind-fn decrypt-fn))
+                                     subjects)
+                                    (.then
+                                     (fn [rows]
+                                       (let [old (map (fn [{:keys [e a v_edn]}]
+                                                        {:s e :p a :o (qs/edn->link (edn/read-string v_edn))})
+                                                      (mapcat identity rows))
+                                             changes (fold-changes quads old)]
+                                         (-> (qs/commit-changes! put! fetch! snapshot changes
+                                                                qs/current-schema-version blind-fn encrypt-fn ref?)
+                                             (.then
+                                              (fn [delta-snapshot]
+                                                ;; Snapshot history lives in the chain. Preserve
+                                                ;; the existing fold snapshot's prev=nil shape.
+                                                (-> (fetch! delta-snapshot) (.then ipld/decode)
+                                                    (.then (fn [node]
+                                                             (ipld/put-node! put! (assoc node "prev" nil)))))))
+                                             (.then
+                                              (fn [new-snapshot]
+                                                (-> (incremental-views! put! fetch! state new-snapshot quads
+                                                                         views blind-fn encrypt-fn decrypt-fn)
+                                                    (.then
+                                                     (fn [views-link]
+                                                       (let [tail (if bounded?
+                                                                    (let [idx (build-novelty-index! put! (:remaining-entries taken))]
+                                                                      (cond-> (dissoc taken :taken :remaining-entries)
+                                                                        idx (assoc "novelty-subject-index" idx)))
+                                                                    {"novelty-front" nil "novelty-back" nil "novelty-count" 0})
+                                                             new-state (cond-> (merge {"indexed" (ipld/link new-snapshot)} tail)
+                                                                         views-link (assoc "views" views-link))]
+                                                         (cd/commit! put! get-fn new-state chain-cid))))))))))))))))))))))))))
+
+(defn fold!
+  "Compact novelty by mutating only affected Prolly leaves on the asynchronous
+   edge path. Triple/entity retractions retain chronological semantics. Existing
+   view rows are updated from the same deltas; new specs scan only their attrs.
+   JVM and legacy schema migration retain fold-rebuild! as a compatibility path."
+  ([put! get-fn chain-cid blind-fn encrypt-fn decrypt-fn]
+   (fold! put! get-fn chain-cid ipld/link? nil blind-fn encrypt-fn decrypt-fn))
+  ([put! get-fn chain-cid ref? blind-fn encrypt-fn decrypt-fn]
+   (fold! put! get-fn chain-cid ref? nil blind-fn encrypt-fn decrypt-fn))
+  ([put! get-fn chain-cid ref? max-novelty blind-fn encrypt-fn decrypt-fn]
+   (fold! put! get-fn chain-cid ref? max-novelty blind-fn encrypt-fn decrypt-fn nil nil))
+  ([put! get-fn chain-cid ref? max-novelty blind-fn encrypt-fn decrypt-fn cache-get cache-put!]
+   (fold! put! get-fn chain-cid ref? max-novelty blind-fn encrypt-fn decrypt-fn cache-get cache-put! nil))
+  ([put! get-fn chain-cid ref? max-novelty blind-fn encrypt-fn decrypt-fn cache-get cache-put! async-get-fn]
+   (fold! put! get-fn chain-cid ref? max-novelty blind-fn encrypt-fn decrypt-fn cache-get cache-put! async-get-fn nil))
+  ([put! get-fn chain-cid ref? max-novelty blind-fn encrypt-fn decrypt-fn cache-get cache-put! async-get-fn views]
+   #?(:clj (fold-rebuild! put! get-fn chain-cid ref? max-novelty blind-fn encrypt-fn decrypt-fn cache-get cache-put! async-get-fn views)
+      :cljs (fold-incremental! put! get-fn chain-cid ref? max-novelty blind-fn encrypt-fn decrypt-fn cache-get cache-put! async-get-fn views))))
 
 (defn fold-serialized-if-needed!
   "CAS-safe scheduler primitive: fold only when the actual head's novelty is
