@@ -131,4 +131,35 @@
         (.catch #(is false (str %)))
         (.finally done))))
 
+(defn measured-pending-tail! [size]
+  (let [s (store) {:keys [get-fn encrypt decrypt]} s
+        puts (atom 0) put! (fn [cid bytes] (swap! puts inc) ((:put! s) cid bytes))
+        fold! (fn [head]
+                (eng/fold! put! get-fn head ipld/link? 1 fixture/test-blind-fn encrypt decrypt nil nil
+                           #(js/Promise.resolve (get-fn %)) nil))]
+    (-> (reduce (fn [prior i]
+                  (.then prior #(eng/commit! put! get-fn [{:s (str "tail-" i) :p "value" :o i}]
+                                             % encrypt fixture/test-blind-fn)))
+                (js/Promise.resolve nil) (range size))
+        (.then fold!)
+        (.then (fn [head]
+                 (reset-counts! s) (reset! puts 0)
+                 (-> (fold! head)
+                     (.then (fn [result]
+                              (let [work (assoc @(:counts s) :puts @puts :pending size)]
+                                (is (= (- size 2) (eng/novelty-size get-fn result)))
+                                work)))))))))
+
+(deftest bounded-fold-reuses-an-immutable-pending-tail
+  (async done
+    (-> (measured-pending-tail! 64)
+        (.then (fn [small]
+                 (-> (measured-pending-tail! 1024)
+                     (.then (fn [large]
+                              (println "persistent-tail-work" (pr-str {:small small :large large}))
+                              (is (= (:gets small) (:gets large)))
+                              (is (= (:puts small) (:puts large)))
+                              (is (= 1 (:decrypts large)))
+                              (is (< (:puts large) 20)))))))
+        (.catch #(is false (str %))) (.finally done))))
 ))

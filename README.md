@@ -728,3 +728,24 @@ scales with the materialized data. An absent view returns before any pending
 payload reads. Compiled consumer peer suite: 115 tests / 322 assertions pass;
 a cold mixed-legacy fixture needs only the stored view, one unknown legacy
 block and one deletion block, while preserving both remaining entities.
+
+## Persistent pending-update tails
+
+Bounded asynchronous compaction now detaches only the consumed front prefix
+and retains the remaining immutable queue links. It does not rebuild a second
+subject directory over every pending transaction. Readers use the exact
+membership already stored on queue entries; legacy unknown entries remain
+conservative. Back is reversed only when front is exhausted, the amortized
+persistent-queue transition. Legacy flat queues still pay their one-time
+conversion. Large reversals are not a strict per-invocation constant bound.
+
+Compaction rebase uses the same prefix operation. Queue node boundaries and
+optional directory presence can change chain CIDs without changing logical
+rows; stored node shapes remain readable. The full-rebuild compatibility path
+is unchanged.
+
+Compiled consumer suite: 116 tests / 328 assertions pass. After initializing a
+front, the next one-entry fold with 64 versus 1,024 pending updates performs
+10 reads and 7 writes in both cases, reads 4,098 versus 4,102 bytes, decrypts
+one transaction and encrypts three leaves. These local counts do not establish
+a production latency guarantee.

@@ -3297,6 +3297,44 @@
                                        (cd/commit! put! get-fn new-state chain-cid))))))))))))))))
 
 
+#?(:cljs
+   (defn- take-novelty-prefix-async
+     "Detach only the consumed front prefix. Preserve the immutable tail and
+      its exact membership metadata. Reverse back only when front is empty,
+      the amortized persistent-queue transition; never rebuild a duplicate
+      directory over every remaining entry on each small fold."
+     [put! fetch! state n]
+     (if (legacy-novelty-state? state)
+       (-> (take-oldest-novelty-async put! fetch! state n)
+           (.then #(dissoc % :remaining-entries)))
+       (let [total (get state "novelty-count" 0)
+             finish (fn [front back taken]
+                      {:taken taken "novelty-front" front "novelty-back" back
+                       "novelty-count" (- total (count taken))})]
+         (letfn [(step [front back remaining taken]
+                   (cond
+                     (zero? remaining) (js/Promise.resolve (finish front back taken))
+                     front
+                     (-> (fetch! (ipld/link-cid front))
+                         (.then ipld/decode)
+                         (.then
+                          (fn [node]
+                            (let [entries (node-entries node)
+                                  k (min remaining (count entries))
+                                  consumed (into taken (map :cid (take k entries)))
+                                  rest-link (get node "rest")]
+                              (if (< k (count entries))
+                                (finish (ipld/link (novelty-segment-cid! put! (subvec entries k) rest-link))
+                                        back consumed)
+                                (step rest-link back (- remaining k) consumed))))))
+                     back
+                     (-> (walk-novelty-entries-async fetch! (ipld/link-cid back))
+                         (.then (fn [entries]
+                                  (step (build-novelty-chain! put! (vec (rseq entries)))
+                                        nil remaining taken))))
+                     :else (js/Promise.resolve (finish nil nil taken))))]
+           (step (get state "novelty-front") (get state "novelty-back") n []))))))
+
 (defn fold-changes
   "Collapse chronological novelty into final triple operations. Indexed rows
    are needed only for retract-entity; ordinary retracts name their own keys."
@@ -3384,7 +3422,7 @@
                 (fold-rebuild! put! get-fn chain-cid ref? max-novelty blind-fn
                                encrypt-fn decrypt-fn cache-get cache-put! async-get-fn views)
                 (-> (if bounded?
-                      (take-oldest-novelty-async put! fetch! state max-novelty)
+                      (take-novelty-prefix-async put! fetch! state max-novelty)
                       (-> (novelty-cids-async fetch! state)
                           (.then (fn [cids] {:taken cids}))))
                     (.then
@@ -3422,9 +3460,7 @@
                                                     (.then
                                                      (fn [views-link]
                                                        (let [tail (if bounded?
-                                                                    (let [idx (build-novelty-index! put! (:remaining-entries taken))]
-                                                                      (cond-> (dissoc taken :taken :remaining-entries)
-                                                                        idx (assoc "novelty-subject-index" idx)))
+                                                                    (dissoc taken :taken)
                                                                     {"novelty-front" nil "novelty-back" nil "novelty-count" 0})
                                                              new-state (cond-> (merge {"indexed" (ipld/link new-snapshot)} tail)
                                                                          views-link (assoc "views" views-link))]
@@ -3465,17 +3501,15 @@
                     (= (select-keys base ["indexed" "views"])
                        (select-keys current ["indexed" "views"])))
          (js/Promise.resolve nil)
-         (-> (novelty-entries-async fetch! base)
+         (-> (take-novelty-prefix-async put! fetch! base folded-count)
              (.then
-              (fn [base-entries]
-                (-> (take-oldest-novelty-async put! fetch! current folded-count)
+              (fn [base-prefix]
+                (-> (take-novelty-prefix-async put! fetch! current folded-count)
                     (.then
                      (fn [taken]
                        (when (and (= folded-count (count (:taken taken)))
-                                  (= (mapv :cid (take folded-count base-entries)) (:taken taken)))
-                         (let [idx (build-novelty-index! put! (:remaining-entries taken))
-                               tail (cond-> (dissoc taken :taken :remaining-entries)
-                                      idx (assoc "novelty-subject-index" idx))
+                                  (= (:taken base-prefix) (:taken taken)))
+                         (let [tail (dissoc taken :taken)
                                state (merge (dissoc current "novelty" "novelty-subject-index"
                                                     "indexed" "views")
                                             (select-keys folded ["indexed" "views"]) tail)]
