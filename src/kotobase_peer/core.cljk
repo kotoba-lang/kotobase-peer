@@ -3072,51 +3072,72 @@
                             (.then ipld/link))
                         (js/Promise.resolve nil)))))))))
 
+#?(:cljs
+   (defn- view-novelty-async [fetch! state attrs blind-fn decrypt-fn]
+     (-> (if (and blind-fn (seq attrs))
+           (-> (if (get state "novelty-subject-index")
+                 (indexed-novelty-entries-async fetch! state)
+                 (novelty-entries-async fetch! state))
+               (.then (fn [entries]
+                        (-> (pmap-async #(blind-fn (str %)) attrs)
+                            (.then (fn [tokens]
+                                     (let [wanted (set tokens)]
+                                       (mapv :cid
+                                             (filter (fn [entry]
+                                                       (or (not (seq (:attributes entry)))
+                                                           (some wanted (:attributes entry))))
+                                                     entries)))))))))
+           (if (seq attrs) (novelty-cids-async fetch! state) (js/Promise.resolve [])))
+         (.then (fn [cids]
+                  ;; Bound decryption and plaintext buffers, preserving chronology.
+                  (reduce (fn [prior batch]
+                            (.then prior
+                                   (fn [quads]
+                                     (-> (pmap-async #(read-tx-block-async fetch! % decrypt-fn) batch)
+                                         (.then #(into quads (mapcat identity %)))))))
+                          (js/Promise.resolve []) (partition-all 4 cids)))))))
+
 (defn view-rows
-  "Rows of materialized view `view-name` as of `chain-cid`, ALWAYS FRESH:
-  the fold-time view rows with unfolded novelty merged on top (retractions
-  cancel stored rows; novelty assertions matching the view's spec are
-  appended) — the same hot/cold split as hot-datoms, but the cold half is
-  ONE views block instead of a tree scan. Returns {:spec .. :rows
-  [{:e :a :v_edn :added} ...]} or nil when the view doesn't exist.
-  `visible?` is REQUIRED (same contract as datoms/hot-datoms). Sync on JVM,
-  js/Promise on cljs."
-  [get-fn chain-cid view-name visible? decrypt-fn]
-  (let [state (state-at get-fn chain-cid)
-        views-cid (some-> (get state "views") ipld/link-cid)
-        finish (fn [views novelty-quads]
-                 (when-let [entry (get views view-name)]
-                   (let [spec (get entry "spec")
-                         attrs (set (get spec "attrs"))
-                         stored (map (fn [[e a v]] {:e e :a a :v_edn v :added true})
-                                     (get entry "rows"))
-                         snap-rows (filter visible?
-                                           (remove-retracted (retraction-filters novelty-quads)
-                                                             stored))
-                         novelty-rows (->> (datoms (reduce (fn [db q] (apply-quad db q ipld/link?))
-                                                           (qs/empty-db) novelty-quads)
-                                                   visible?)
-                                           (filter #(contains? attrs (:a %))))]
-                     {:spec spec :rows (vec (concat snap-rows novelty-rows))})))]
-    #?(:clj
-       (when views-cid
-         (let [views (read-views-block get-fn views-cid decrypt-fn)
-               novelty-quads (mapcat #(read-tx-block get-fn % decrypt-fn)
-                                     (novelty-cids get-fn state))]
-           (finish views novelty-quads)))
-       :cljs
-       (if-not views-cid
-         (js/Promise.resolve nil)
-         ;; Hoisted; see hot-datoms' `novelty` binding. Same shape, fixed by
-         ;; inspection, not separately measured.
-         (let [novelty (novelty-cids get-fn state)]
-           (-> (js/Promise.all
-                #js [(read-views-block get-fn views-cid decrypt-fn)
-                     (js/Promise.all (into-array (map #(read-tx-block get-fn % decrypt-fn)
-                                                      novelty)))])
-               (.then (fn [^js pair]
-                        (finish (aget pair 0)
-                                (apply concat (array-seq (aget pair 1))))))))))))
+  "Fresh materialized-view rows with chronological novelty applied. Optional
+   blind-fn and async-get-fn prune irrelevant update blocks and avoid cold
+   handler restarts. Missing legacy metadata and entity deletions are retained.
+   The flat stored view block remains a size-dependent read."
+  ([get-fn chain-cid view-name visible? decrypt-fn]
+   (view-rows get-fn chain-cid view-name visible? decrypt-fn nil nil))
+  ([get-fn chain-cid view-name visible? decrypt-fn blind-fn async-get-fn]
+   (let [state (state-at get-fn chain-cid)
+         views-cid (some-> (get state "views") ipld/link-cid)
+         finish (fn [views novelty-quads]
+                  (when-let [entry (get views view-name)]
+                    (let [spec (get entry "spec")
+                          attrs (set (get spec "attrs"))
+                          relevant (filter #(or (= :retract-entity (:op %)) (contains? attrs (:p %)))
+                                           novelty-quads)
+                          stored (map (fn [[e a v]] {:e e :a a :v_edn v :added true})
+                                      (get entry "rows"))
+                          snap-rows (filter visible?
+                                            (remove-retracted (retraction-filters relevant) stored))
+                          novelty-rows (->> (datoms (apply-quads (qs/empty-db) relevant ipld/link?) visible?)
+                                            (filter #(contains? attrs (:a %))))]
+                      {:spec spec :rows (vec (concat snap-rows novelty-rows))})))]
+     #?(:clj
+        (when views-cid
+          (let [views (read-views-block get-fn views-cid decrypt-fn)
+                novelty-quads (mapcat #(read-tx-block get-fn % decrypt-fn) (novelty-cids get-fn state))]
+            (finish views novelty-quads)))
+        :cljs
+        (if-not views-cid
+          (js/Promise.resolve nil)
+          (let [fetch! (or async-get-fn #(js/Promise.resolve (get-fn %)))]
+            (-> (fetch! views-cid)
+                (.then ipld/decode)
+                (.then #(decrypt-fn (get % "ct")))
+                (.then #(get (ipld/decode %) "views"))
+                (.then (fn [views]
+                         (when-let [entry (get views view-name)]
+                           (-> (view-novelty-async fetch! state (set (get-in entry ["spec" "attrs"]))
+                                                    blind-fn decrypt-fn)
+                               (.then #(finish views %)))))))))))))
 
 (defn fold-rebuild!
   "Compact `chain-cid`'s novelty into a fresh indexed snapshot: hydrate the

@@ -712,3 +712,19 @@ untrusted caller-supplied fold result.
 Compiled consumer peer suite: 114 tests / 317 assertions pass, including exact
 chain-CID equality with fresh compaction across an appended entity deletion,
 readback of both sides, changed-basis rejection and divergent-prefix rejection.
+
+## Cold materialized-view reads
+
+`view-rows` retains its five-argument compatibility arity and accepts optional
+`blind-fn` / `async-get-fn` arguments. The edge server supplies both: view data
+and pending metadata are fetched directly, rather than restarting the handler
+for every discovered block. Only transaction blocks matching declared
+attributes are decrypted when exact metadata exists; legacy entries and entity
+deletions remain conservative. Decryption runs in chronological batches of
+four, and relevant assertions use the existing bulk accumulator.
+
+The flat stored view representation is unchanged, so its own read size still
+scales with the materialized data. An absent view returns before any pending
+payload reads. Compiled consumer peer suite: 115 tests / 322 assertions pass;
+a cold mixed-legacy fixture needs only the stored view, one unknown legacy
+block and one deletion block, while preserving both remaining entities.

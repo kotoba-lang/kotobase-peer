@@ -137,4 +137,50 @@
                                       (.then (fn [fork] (rebase! base computed fork)))
                                       (.then #(is (nil? %) "different transaction prefix cannot be grafted"))))))))))))))
           (.catch #(is false (str %))) (.finally done)))))
+(deftest cold-view-reads-skip-unrelated-payloads-and-preserve-deletions
+  (async done
+    (let [s (store) {:keys [put! get-fn decrypts]} s]
+      (-> (eng/commit! put! get-fn [{:s "alice" :p "role" :o "old"}] nil
+                      fixture/test-encrypt-fn fixture/test-blind-fn)
+          (.then #(eng/fold! put! get-fn % ipld/link? nil fixture/test-blind-fn
+                             fixture/test-encrypt-fn fixture/test-decrypt-fn nil nil
+                             (fn [cid] (js/Promise.resolve (get-fn cid)))
+                             {"roles" {"attrs" ["role"]}}))
+          (.then (fn [head]
+                   (reduce (fn [prior i]
+                             (.then prior #(eng/commit! put! get-fn [{:s (str "noise-" i) :p "noise" :o i}]
+                                                       % fixture/test-encrypt-fn fixture/test-blind-fn)))
+                           (js/Promise.resolve head) (range 40))))
+          (.then #(eng/commit! put! get-fn [{:s "legacy" :p "role" :o "visible"}]
+                               % fixture/test-encrypt-fn))
+          (.then #(eng/commit! put! get-fn [{:s "alice" :op :retract-entity}
+                                           {:s "bob" :p "role" :o "new"}]
+                               % fixture/test-encrypt-fn fixture/test-blind-fn))
+          (.then
+           (fn [head]
+             (-> (eng/view-rows get-fn head "roles" (constantly true) (:decrypt s))
+                 (.then
+                  (fn [expected]
+                    (let [reads (atom [])
+                          cold-get (fn [cid]
+                                     (swap! reads conj cid)
+                                     ;; state-at is the synchronous control plane;
+                                     ;; all discovered data must use the async seam.
+                                     (if (>= (count @reads) 3)
+                                       (throw (js/Error. "unexpected synchronous data discovery"))
+                                       (get-fn cid)))]
+                      (reset! decrypts 0)
+                      (-> (eng/view-rows cold-get head "roles" (constantly true) (:decrypt s)
+                                         fixture/test-blind-fn #(js/Promise.resolve (get-fn %)))
+                          (.then (fn [actual]
+                                   (is (= (set (:rows expected)) (set (:rows actual))))
+                                   (is (= #{"legacy" "bob"} (set (map :e (:rows actual)))))
+                                   (is (= 3 @decrypts) "stored view, unknown legacy block, entity deletion block")
+                                   (reset! decrypts 0)
+                                   (eng/view-rows get-fn head "absent" (constantly true) (:decrypt s)
+                                                  fixture/test-blind-fn #(js/Promise.resolve (get-fn %)))))
+                          (.then (fn [result]
+                                   (is (nil? result))
+                                   (is (= 1 @decrypts) "missing view never scans novelty"))))))))))
+          (.catch #(is false (str %))) (.finally done)))))
 ))
