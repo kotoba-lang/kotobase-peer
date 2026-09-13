@@ -3428,6 +3428,38 @@
    #?(:clj (fold-rebuild! put! get-fn chain-cid ref? max-novelty blind-fn encrypt-fn decrypt-fn cache-get cache-put! async-get-fn views)
       :cljs (fold-incremental! put! get-fn chain-cid ref? max-novelty blind-fn encrypt-fn decrypt-fn cache-get cache-put! async-get-fn views))))
 
+#?(:cljs
+   (defn rebase-fold!
+     "Attach a trusted, computed fold to a newer append-only head without
+      repeating index encryption. Return nil if its indexed/view basis or
+      folded transaction prefix changed. The caller must flush then CAS the
+      returned chain against current-chain; this never publishes a head.
+      folded-count must describe the candidate computed from base-chain."
+     [put! get-fn base-chain folded-chain current-chain folded-count async-get-fn]
+     (let [base (state-at get-fn base-chain)
+           folded (state-at get-fn folded-chain)
+           current (state-at get-fn current-chain)
+           fetch! (or async-get-fn #(js/Promise.resolve (get-fn %)))]
+       (if-not (and (pos-int? folded-count)
+                    (= (select-keys base ["indexed" "views"])
+                       (select-keys current ["indexed" "views"])))
+         (js/Promise.resolve nil)
+         (-> (novelty-entries-async fetch! base)
+             (.then
+              (fn [base-entries]
+                (-> (take-oldest-novelty-async put! fetch! current folded-count)
+                    (.then
+                     (fn [taken]
+                       (when (and (= folded-count (count (:taken taken)))
+                                  (= (mapv :cid (take folded-count base-entries)) (:taken taken)))
+                         (let [idx (build-novelty-index! put! (:remaining-entries taken))
+                               tail (cond-> (dissoc taken :taken :remaining-entries)
+                                      idx (assoc "novelty-subject-index" idx))
+                               state (merge (dissoc current "novelty" "novelty-subject-index"
+                                                    "indexed" "views")
+                                            (select-keys folded ["indexed" "views"]) tail)]
+                           (cd/commit! put! get-fn state current-chain)))))))))))))
+
 (defn fold-serialized-if-needed!
   "CAS-safe scheduler primitive: fold only when the actual head's novelty is
    at least `:threshold`, publish the fold through HeadCAS, and retry from the

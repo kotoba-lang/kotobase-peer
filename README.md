@@ -696,3 +696,19 @@ the underlying behavior is exercised on both platforms.
 ## License
 
 Apache-2.0.
+
+## Reusing a computed fold after contention
+
+The asynchronous `rebase-fold!` accepts a trusted fold candidate and attaches it
+to a newer head only when the indexed/view basis and the exact oldest folded
+transaction CIDs still match. It retains every later transaction, including
+entity deletions. A competing compactor or divergent prefix returns nil.
+It does not encrypt indexes again, publish a head, or weaken compare-and-set:
+the host must flush its metadata and CAS against the head it just read.
+Metadata traversal and maintenance of the remaining novelty directory remain
+size-dependent. This API is for an internally computed candidate, not an
+untrusted caller-supplied fold result.
+
+Compiled consumer peer suite: 114 tests / 317 assertions pass, including exact
+chain-CID equality with fresh compaction across an appended entity deletion,
+readback of both sides, changed-basis rejection and divergent-prefix rejection.

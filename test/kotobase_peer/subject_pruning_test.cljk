@@ -97,4 +97,44 @@
                                 ;; One snapshot leaf plus the unknown deletion block.
                                 (check! folded 2))))))
           (.catch #(is false (str %))) (.finally done)))))
+(deftest computed-fold-rebases-over-appends-without-repeating-crypto
+  (async done
+    (let [s (store) {:keys [put! get-fn decrypts]} s
+          fold! (fn [head n]
+                  (eng/fold! put! get-fn head ipld/link? n fixture/test-blind-fn
+                             fixture/test-encrypt-fn fixture/test-decrypt-fn nil nil
+                             #(js/Promise.resolve (get-fn %)) nil))
+          rebase! (fn [base folded current]
+                    (eng/rebase-fold! put! get-fn base folded current 1
+                                      #(js/Promise.resolve (get-fn %))))]
+      (-> (eng/commit! put! get-fn [{:s "alice" :p "role" :o "old"}] nil
+                      fixture/test-encrypt-fn fixture/test-blind-fn)
+          (.then
+           (fn [base]
+             (-> (fold! base 1)
+                 (.then
+                  (fn [computed]
+                    (-> (eng/commit! put! get-fn [{:s "alice" :op :retract-entity}
+                                                 {:s "bob" :p "role" :o "new"}]
+                                     base fixture/test-encrypt-fn fixture/test-blind-fn)
+                        (.then
+                         (fn [current]
+                           (-> (fold! current 1)
+                               (.then
+                                (fn [reference]
+                                  (-> (rebase! base computed current)
+                                      (.then
+                                       (fn [rebased]
+                                         (is (= reference rebased) "same immutable chain as fresh compaction")
+                                         (is (= 1 (eng/novelty-size get-fn rebased)))
+                                         (-> (rows! s rebased {:index :aevt :components ["role"]} true)
+                                             (.then #(is (= ["bob"] (mapv :e %)))))))
+                                      (.then (fn [_] (rebase! base computed reference)))
+                                      (.then #(is (nil? %) "another compactor changed the indexed basis"))
+                                      (.then (fn [_]
+                                               (eng/commit! put! get-fn [{:s "different" :p "role" :o "fork"}] nil
+                                                            fixture/test-encrypt-fn fixture/test-blind-fn)))
+                                      (.then (fn [fork] (rebase! base computed fork)))
+                                      (.then #(is (nil? %) "different transaction prefix cannot be grafted"))))))))))))))
+          (.catch #(is false (str %))) (.finally done)))))
 ))
