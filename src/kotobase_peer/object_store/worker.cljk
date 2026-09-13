@@ -429,13 +429,31 @@
                                   (js->clj (js/JSON.parse value)))
                            :etag (gobj/get object "etag")})))
              {:root nil :etag nil}))))
-    (js/Promise.reject
-     (js/Error. "Retention root registry currently requires an R2 binding"))))
+    (if-let [config (b2-config e)]
+      (-> (s3-request! config "GET" (retention-root-key e db-id kind id))
+          (.then (fn [response]
+                   (cond
+                     (= 404 (.-status response)) {:root nil :etag nil}
+                     (.-ok response)
+                     (-> (.text response)
+                         (.then (fn [value]
+                                  {:root (retention/validate-node
+                                          (js->clj (js/JSON.parse value)))
+                                   :etag (.get (.-headers response) "etag")})))
+                     :else
+                     (js/Promise.reject
+                      (ex-info "S3 retention root GET failed"
+                               {:db-id db-id :kind kind :id id
+                                :status (.-status response)}))))))
+      (js/Promise.reject
+       (js/Error. "No MERKLE_BUCKET or MERKLE_S3_* backend configured")))))
 
 (defn cas-retention-root!
-  "Create or replace ROOT with R2 ETag CAS. ROOT may be root-node output or
-  keyword-keyed options accepted by retention/root-node. A lost renewal or
-  release race returns {:won? false}; it never overwrites the winner."
+  "Create or replace ROOT with a provider ETag CAS (R2 native conditional put,
+  or signed If-Match/If-None-Match on S3 with MERKLE_S3_CONDITIONAL_HEAD=true).
+  ROOT may be root-node output or keyword-keyed options accepted by
+  retention/root-node. A lost renewal or release race returns {:won? false};
+  it never overwrites the winner."
   [e root expected-etag]
   (let [node (if (contains? root "format")
                (retention/validate-node root)
@@ -453,8 +471,31 @@
                    {:won? (boolean result)
                     :etag (when result (gobj/get result "etag"))
                     :root (when result node)})))
-      (js/Promise.reject
-       (js/Error. "Retention root registry currently requires an R2 binding")))))
+      (if-let [config (b2-config e)]
+        (if (= "true" (env e "MERKLE_S3_CONDITIONAL_HEAD"))
+          (let [condition (if expected-etag
+                            {"if-match" expected-etag}
+                            {"if-none-match" "*"})]
+            (-> (s3-request! config "PUT" (retention-root-key e db-id kind id)
+                             {:body (js/JSON.stringify (clj->js node))
+                              :headers condition})
+                (.then (fn [response]
+                         (cond
+                           (.-ok response)
+                           {:won? true
+                            :etag (.get (.-headers response) "etag")
+                            :root node}
+                           (contains? #{409 412} (.-status response))
+                           {:won? false :etag nil :root nil}
+                           :else
+                           (js/Promise.reject
+                            (ex-info "S3 retention root conditional PUT failed"
+                                     {:db-id db-id :kind kind :id id
+                                      :status (.-status response)})))))))
+          (js/Promise.reject
+           (js/Error. "Set MERKLE_S3_CONDITIONAL_HEAD=true only for a backend with conditional PutObject")))
+        (js/Promise.reject
+         (js/Error. "No MERKLE_BUCKET or MERKLE_S3_* backend configured"))))))
 
 (defn release-retention-root!
   "CAS a root to an inactive tombstone. Conditional replacement is used instead
