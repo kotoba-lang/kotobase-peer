@@ -148,6 +148,60 @@
                                   :headers (clj->js headers)
                                   :body body})))))
 
+(defn- s3-xml-text [response]
+  "ListObjectsV2 body as text — the parser callers already own."
+  (-> (.text response)
+      (.then (fn [v] {:xml v
+                      :etag (.get (.-headers response) "etag")}))))
+
+(defn- s3-list-page!
+  "One ListObjectsV2 page under KEY-PREFIX. Signed GET with query params —
+  Class B on B2 (free). → Promise<{:keys [...] :next-token ...}> parsed by
+  the caller-supplied PARSE-PAGE (the same shape list-keys uses)."
+  [config key-prefix token parse-page]
+  (let [query (js-obj "list-type" "2" "prefix" key-prefix "max-keys" "1000")]
+    (when token (aset query "continuation-token" token))
+    (-> (s3-request! config "GET" "" nil {:query query})
+        (.then (fn [response]
+                 (if-not (.-ok response)
+                   (js/Promise.reject
+                    (ex-info "S3 list failed"
+                             {:prefix key-prefix :status (.-status response)}))
+                   (-> (.text response) (.then parse-page))))))))
+
+(defn- s3-put-json-conditional!
+  "Signed conditional JSON PUT: If-Match / If-None-Match behind
+  MERKLE_S3_CONDITIONAL_HEAD. → Promise<{:ok? boolean :etag ...}> —
+  :ok? false on 409/412 (the R2 ETag CAS :cas-lost path), rejection otherwise."
+  [e config key value condition]
+  (if-not (= "true" (env e "MERKLE_S3_CONDITIONAL_HEAD"))
+    (js/Promise.reject
+     (js/Error. "Set MERKLE_S3_CONDITIONAL_HEAD=true only for a backend with conditional PutObject"))
+    (let [headers (cond
+                    (and condition (aget condition "etagMatches"))
+                    {"if-match" (aget condition "etagMatches")}
+                    (and condition (aget condition "etagDoesNotMatch"))
+                    {"if-none-match" (aget condition "etagDoesNotMatch")}
+                    :else {})]
+      (-> (s3-request! config "PUT" key
+                       {:body (js/JSON.stringify (clj->js value))
+                        :headers headers})
+          (.then (fn [response]
+                   (cond
+                     (.-ok response)
+                     {:ok? true :etag (.get (.-headers response) "etag")}
+                     (contains? #{409 412} (.-status response))
+                     {:ok? false}
+                     :else
+                     (js/Promise.reject
+                      (ex-info "S3 conditional JSON PUT failed"
+                               {:key key :status (.-status response)})))))))))
+
+(defn- s3-delete!
+  "Signed DELETE. B2 Class A — free. Returns the response (caller checks ok)."
+  [config key]
+  (s3-request! config "DELETE" key nil))
+
 (defn put-block!
   "Idempotently put CID bytes into R2 or a configured S3-compatible bucket."
   [e cid bytes]
@@ -2710,39 +2764,50 @@
                       {:cid cid :actual actual :codec codec})))
     (not raw?)))
 
+(defn- get-object-bytes!
+  "Whole packed-object bytes, transport-agnostic (get-block! for blocks and a
+  signed GET for packed objects — the R2 path keeps the range-free .get)."
+  [e cid]
+  (if-let [bucket (env e "MERKLE_BUCKET")]
+    (-> (.get bucket (object-key e cid))
+        (.then (fn [obj]
+                 (if obj
+                   (-> (.arrayBuffer obj) (.then #(js/Uint8Array. %)))
+                   (js/Promise.reject
+                    (ex-info "Packed object not found" {:cid cid}))))))
+    (if-let [config (b2-config e)]
+      (-> (s3-request! config "GET" (object-key e cid))
+          (.then (fn [response]
+                   (if (.-ok response)
+                     (-> (.arrayBuffer response) (.then #(js/Uint8Array. %)))
+                     (js/Promise.reject
+                      (ex-info "S3 packed object GET failed"
+                               {:cid cid :status (.-status response)}))))))
+      (js/Promise.reject
+       (js/Error. "No MERKLE_BUCKET or MERKLE_S3_* backend configured")))))
+
 (defn reachable-cids!
   "Walk decoded block links from ROOT-CID and return a Promise<set<CID>>.
   Materialized packs live under objects/, are CID-verified opaque leaves, and
-  must not be decoded as DAG-CBOR blocks."
+  must not be decoded as DAG-CBOR blocks. Transport-agnostic: reads go through
+  get-block! (blocks) and get-object-bytes! (packed objects), both of which
+  dispatch R2 binding vs the signed S3 backend."
   [e root-cid]
-  (let [seen (atom #{})
-        bucket (env e "MERKLE_BUCKET")]
-    (letfn [(object-bytes [stored]
-              (-> (.arrayBuffer stored)
-                  (.then #(js/Uint8Array. %))))
-            (verified-links [cid bytes decode?]
+  (let [seen (atom #{})]
+    (letfn [(verified-links [cid bytes decode?]
               (let [dag-cbor? (verify-reachability-bytes! cid bytes)]
                 (if (and decode? dag-cbor?)
                   (lsm/linked-cids (ipld/decode bytes))
                   [])))
             (read-links [cid]
-              (-> (.get bucket (block-key e cid))
+              (-> (get-block! e cid)
                   (.then
-                   (fn [block]
-                     (if block
-                       (-> (object-bytes block)
-                           (.then #(verified-links cid % true)))
-                       (-> (.get bucket (object-key e cid))
-                           (.then
-                            (fn [object]
-                              (if object
-                                (-> (object-bytes object)
-                                    (.then
-                                     #(verified-links cid % false)))
-                                (js/Promise.reject
-                                 (ex-info
-                                  "Reachability object not found"
-                                  {:cid cid})))))))))))
+                   (fn [bytes]
+                     (verified-links cid bytes true)))
+                  (.catch
+                   (fn [_]
+                     (-> (get-object-bytes! e cid)
+                         (.then #(verified-links cid % false)))))))
             (walk [frontier]
               (let [fresh (vec (remove @seen frontier))]
                 (if (empty? fresh)
@@ -2756,9 +2821,6 @@
                                  (walk (into #{} cat (js->clj links))))))))))]
       (cond
         (nil? root-cid) (js/Promise.resolve #{})
-        (nil? bucket)
-        (js/Promise.reject
-         (js/Error. "Reachability GC requires an R2 binding"))
         :else (walk [root-cid])))))
 
 (defn- list-r2-blocks! [bucket prefix]
