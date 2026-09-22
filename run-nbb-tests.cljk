@@ -59,7 +59,7 @@
   (-> p
       (.replace (js/RegExp. "\\\\" "g") "/")
       (.replace (js/RegExp. "^test/") "")
-      (.replace (js/RegExp. "\\.clj[sc]$") "")
+      (.replace (js/RegExp. "\\.clj[scjk]$") "")
       (.replace (js/RegExp. "_" "g") "-")
       (.replace (js/RegExp. "/" "g") ".")))
 
@@ -77,7 +77,8 @@
                   ;; `.cljs` suites were in that state, and running them turned
                   ;; up three real `ipld/encode` sites that always threw.
                   (or (.endsWith name "_test.cljc")
-                      (.endsWith name "_test.cljs")) [p]
+                      (.endsWith name "_test.cljs")
+                      (.endsWith name "_test.cljk")) [p]
                   :else [])))
             (array-seq entries))))
 
