@@ -58,6 +58,7 @@
   "test/kotobase_peer/object_store_worker_test.cljk" ".cljs"
   "test/kotobase_peer/performance_gate_test.cljk" ".cljc"
   "test/kotobase_peer/plan_cardinality_test.cljk" ".cljc"
+  "test/kotobase_peer/policy_authority_test.cljk" ".cljc"
   "test/kotobase_peer/policy_test.cljk" ".cljc"
   "test/kotobase_peer/projection_datalog_test.cljk" ".cljc"
   "test/kotobase_peer/resumable_execution_test.cljk" ".cljc"

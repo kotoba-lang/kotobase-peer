@@ -39,6 +39,7 @@
                :cljs [cljs.reader :as edn])
             [kotoba.lang.text :as str]
             [kotoba.security.information-flow :as flow]
+            [authority.scope :as scope]
             [ipld.core :as ipld]))
 
 (def policy-entity "kotobase.policy/read")
@@ -92,6 +93,41 @@
                 (if (str/starts-with? (or cap "") read-classified-capability-prefix)
                   (let [label (keyword (subs cap (count read-classified-capability-prefix)))]
                     (max best (get flow/ranks (or (flow/canonical label) :public) 0)))
+                  best))
+              0
+              caps))))
+
+;; The per-level read grant, as a scope in the ONE capability lattice
+;; (kotoba-lang/authority over lang/capability-semantics.edn; root
+;; ADR-2608180200 / adr-2609241800 step 7). `[... :*]` covers exactly the
+;; strictly-longer scopes under the prefix, so `covers?` answers "is this a
+;; per-level read grant" by segment equality -- no substring left to confuse
+;; `datom:read-classifiedX/...` with `datom:read-classified/...`.
+(def read-classified-scope
+  (scope/parse (str read-classified-capability-prefix "*")))
+
+(defn- classified-label
+  "The lattice label a per-level read grant names, or nil when CAP is not one.
+  Exactly one segment under the prefix: anything longer names no label in
+  `flow/ranks` (the old substring rule produced a namespaced keyword that
+  `flow/canonical` could never rank), so refusing it here changes no rank."
+  [cap]
+  (let [s (scope/parse cap)]
+    (when (and (scope/covers? read-classified-scope s)
+               (= (count read-classified-scope) (count s))
+               (string? (peek s)))
+      (keyword (peek s)))))
+
+(defn clearance-rank-by-scope
+  "`clearance-rank` decided through `authority.scope` instead of
+  `starts-with?`. Same rounding: unknown labels coerce DOWN."
+  [caps]
+  (let [caps (set caps)]
+    (if (contains? caps read-protected-capability)
+      top-rank
+      (reduce (fn [best cap]
+                (if-let [label (classified-label cap)]
+                  (max best (get flow/ranks (or (flow/canonical label) :public) 0))
                   best))
               0
               caps))))
