@@ -48,14 +48,12 @@
   With `params-dir` (substitution_parameters-sf<N> plus short_message_param.txt)
   every served read is also compared with Neo4j over every official parameter
   -- the reference the network rows cite."
-  (:require [kotobase-peer.core :as eng]
+  (:require [kotoba.io :as kio] [kotobase-peer.core :as eng]
             [arrangement.core :as qs]
             [kotoba.lang.text :as str]
             [clojure.java.io :as io])
   (:import [org.neo4j.dbms.api DatabaseManagementServiceBuilder]
            [org.neo4j.graphdb Label]
-           [java.nio.file Files]
-           [java.nio.file.attribute FileAttribute]
            [java.util.concurrent TimeUnit]))
 
 ;; ── CSV ────────────────────────────────────────────────────────────────────
@@ -874,7 +872,7 @@
         elements (assoc elements :total (reduce + (vals (dissoc elements :posts :comments))))
         kb-build (elapsed-ms #(build-kotobase data))
         {:keys [db quads]} (:result kb-build)
-        tmp (.toFile (Files/createTempDirectory "ldbc-neo4j" (make-array FileAttribute 0)))
+        tmp (kio/temp-dir "ldbc-neo4j")
         dbms (.build (DatabaseManagementServiceBuilder. (.toPath tmp)))
         gdb (.database dbms "neo4j")
         neo-load (elapsed-ms #(neo4j-load! gdb data))

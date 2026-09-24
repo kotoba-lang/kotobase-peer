@@ -20,11 +20,10 @@
       durable-storage write path would be slower; kotobase's numbers are
       its real engine write path (content-addressed blocks in an atom).
   Usage: kbb -M:h2h  (writes nothing; prints receipt EDN to stdout)"
-  (:require [datomic.api :as d]
+  (:require [kotoba.bytes :as kbytes] [datomic.api :as d]
             [kotobase-peer.core :as eng])
   (:import [javax.crypto Cipher Mac]
-           [javax.crypto.spec SecretKeySpec GCMParameterSpec]
-           [java.util Base64]))
+           [javax.crypto.spec SecretKeySpec GCMParameterSpec]))
 
 ;; ── same real JVM crypto construction as load_test.clj / core_test.cljc ─────
 (def ^:private test-dek (SecretKeySpec. (byte-array (range 1 33)) "AES"))
@@ -47,7 +46,7 @@
 
 (defn- test-blind-fn [component]
   (let [mac (doto (Mac/getInstance "HmacSHA256") (.init test-blind-key))]
-    (.encodeToString (Base64/getEncoder) (.doFinal mac (.getBytes (pr-str component) "UTF-8")))))
+    (kbytes/base64-encode (.doFinal mac (kbytes/utf8-bytes (pr-str component))))))
 
 ;; ── harness ─────────────────────────────────────────────────────────────────
 (def entities 3000)
