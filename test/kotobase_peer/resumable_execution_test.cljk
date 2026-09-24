@@ -1,5 +1,5 @@
 (ns kotobase-peer.resumable-execution-test
-  #?(:clj (:require [clojure.test :refer [deftest is testing]]
+  #?(:clj (:require [kotoba.test :refer [deftest is testing]]
                     [ipld.core :as ipld]
                     [kotobase-peer.resumable-execution :as resume])
      :cljs (:require [cljs.test :refer-macros [deftest is testing]]

@@ -15,7 +15,7 @@
   The store below is hostile in the one way that matters: bytes come back only
   through a Promise, and the synchronous reader starts empty, so anything read
   has to arrive either through the trampoline or through `async-get-fn`."
-  (:require #?(:clj  [clojure.test :refer [deftest]]
+  (:require #?(:clj  [kotoba.test :refer [deftest]]
                :cljs [cljs.test :refer [deftest is async]])
             [kotobase-peer.core :as peer]))
 

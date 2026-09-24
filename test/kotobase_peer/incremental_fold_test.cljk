@@ -1,6 +1,6 @@
 (ns kotobase-peer.incremental-fold-test
   (:require #?(:cljs [cljs.test :refer-macros [deftest is async]]
-               :clj [clojure.test :refer [deftest is]])
+               :clj [kotoba.test :refer [deftest is]])
             [kotobase-peer.core :as eng]
             [kotobase-peer.core-test :as fixture]
             [ipld.core :as ipld]))

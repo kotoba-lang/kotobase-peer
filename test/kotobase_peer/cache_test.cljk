@@ -3,7 +3,7 @@
 
   A cache measured against a fake reader proves nothing about the reader, so
   every number here comes from `eng/cold-datoms` over a persisted snapshot."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [kotobase-peer.cache :as kc]
             [kotobase-peer.core :as eng]
             [block.cache :as bc]

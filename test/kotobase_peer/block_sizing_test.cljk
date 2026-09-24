@@ -1,5 +1,5 @@
 (ns kotobase-peer.block-sizing-test
-  (:require #?(:clj [clojure.test :refer [deftest is testing]]
+  (:require #?(:clj [kotoba.test :refer [deftest is testing]]
                :cljs [cljs.test :refer-macros [deftest is testing]])
             [kotobase-peer.block-sizing :as sizing]))
 

@@ -1,5 +1,5 @@
 (ns kotobase-peer.datalog-materialization-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [ipld.core :as ipld]
             [kotobase-peer.core :as peer]
             [kotobase-peer.datalog-materialization :as materialization]

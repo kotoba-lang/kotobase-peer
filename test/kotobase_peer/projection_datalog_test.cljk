@@ -17,7 +17,7 @@
   `peer/transact-effective`, which is what they always proved projection
   against. A test double would have been the weaker option -- it proves
   projection against a model of a store rather than the store."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [ipld.core :as ipld]
             [kotobase-peer.core :as peer]
             [kotobase.projection.datalog :as materialization]

@@ -1,5 +1,5 @@
 (ns kotobase-peer.atomic-publication-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [ipld.core :as ipld]
             [kotobase-peer.atomic-publication :as publication]
             [kotobase-peer.materialized-view :as view]

@@ -1,5 +1,5 @@
 (ns kotobase-peer.materialized-view-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [ipld.core :as ipld]
             [kotobase-peer.materialized-view :as view]))
 

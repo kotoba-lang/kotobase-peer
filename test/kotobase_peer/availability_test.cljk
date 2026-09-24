@@ -1,5 +1,5 @@
 (ns kotobase-peer.availability-test
-  (:require #?(:clj [clojure.test :refer [deftest is testing]]
+  (:require #?(:clj [kotoba.test :refer [deftest is testing]]
                :cljs [cljs.test :refer [deftest is testing] :include-macros true])
             [kotobase-peer.availability :as avail]))
 
