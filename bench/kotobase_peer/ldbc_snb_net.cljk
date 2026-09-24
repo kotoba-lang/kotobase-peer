@@ -44,7 +44,7 @@
   (:require [kotobase-peer.ldbc-snb-bench :as ldbc]
             [kotobase-peer.core :as eng]
             [datalog.index :as index]
-            [clojure.edn :as edn]
+            [kotoba.lang.edn :as edn]
             [clojure.string]
             [clojure.java.io])
   (:import [com.sun.net.httpserver HttpServer HttpHandler HttpExchange]

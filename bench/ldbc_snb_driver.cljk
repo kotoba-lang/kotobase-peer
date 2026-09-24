@@ -41,7 +41,7 @@
 
 (ns ldbc-snb-driver
   (:require [clojure.string :as str]
-            [clojure.edn :as edn]
+            [kotoba.lang.edn :as edn]
             ["fs" :as fs]
             ["os" :as os]
             ["path" :as path]

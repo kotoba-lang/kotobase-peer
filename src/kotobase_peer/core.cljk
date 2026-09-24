@@ -41,7 +41,7 @@
 ;; the {indexed, novelty} state map as its opaque `state`. Neither library is
 ;; modified; this namespace is the seam between them.
 (ns kotobase-peer.core
-  (:require #?(:clj  [clojure.edn :as edn]
+  (:require #?(:clj  [kotoba.lang.edn :as edn]
                :cljs [cljs.reader :as edn])   ; both expose read-string over EDN
             [kotoba.lang.text :as str]
             [ipld.core :as ipld]
