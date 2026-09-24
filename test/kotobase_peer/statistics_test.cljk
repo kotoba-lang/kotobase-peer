@@ -1,5 +1,5 @@
 (ns kotobase-peer.statistics-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [kotobase-peer.statistics :as statistics]
             [merkle-lsm.core :as lsm]))
 

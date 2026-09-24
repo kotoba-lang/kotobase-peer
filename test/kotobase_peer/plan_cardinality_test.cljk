@@ -9,7 +9,7 @@
   executor looks it up, and matches the estimates the plan itself used. That
   the hint cannot change an ANSWER is arrangement's own equivalence suite;
   this side only has to not lie about the numbers."
-  (:require [clojure.test :refer [deftest testing is]]
+  (:require [kotoba.test :refer [deftest testing is]]
             [kotobase-peer.core :as eng]))
 
 (def ^:private everything (constantly true))

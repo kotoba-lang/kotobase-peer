@@ -10,7 +10,7 @@
   transactions out of order into the snapshot, silently. COMPATIBILITY: every
   chain already committed is made of single-entry nodes, so a reader that only
   understood segments would stop seeing history that is already live."
-  (:require [clojure.test :refer [deftest testing is]]
+  (:require [kotoba.test :refer [deftest testing is]]
             [ipld.core :as ipld]
             [kotobase-peer.core :as eng]
             [kotobase-peer.core-test :refer [test-encrypt-fn test-blind-fn test-decrypt-fn]]))

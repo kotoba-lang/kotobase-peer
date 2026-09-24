@@ -1,5 +1,5 @@
 (ns kotobase-peer.retention-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [kotobase-peer.retention :as retention]))
 
 (deftest retention-root-validation-and-activity

@@ -1,5 +1,5 @@
 (ns kotobase-peer.database-restore-test
-  #?(:clj (:require [clojure.test :refer [deftest is testing]]
+  #?(:clj (:require [kotoba.test :refer [deftest is testing]]
                     [ipld.core :as ipld]
                     [kotobase-peer.database-restore :as restore])
      :cljs (:require [cljs.test :refer-macros [deftest is testing]]

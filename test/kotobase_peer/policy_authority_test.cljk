@@ -9,7 +9,7 @@
   gone. Every row of `cases` runs through both and must agree, and each row
   also pins the expected rank so an oracle that drifted with the src would
   still be caught."
-  (:require #?(:clj [clojure.test :refer [deftest is testing]]
+  (:require #?(:clj [kotoba.test :refer [deftest is testing]]
                :cljs [cljs.test :refer [deftest is testing] :include-macros true])
             [kotoba.lang.text :as str]
             [kotoba.security.information-flow :as flow]

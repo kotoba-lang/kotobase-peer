@@ -47,7 +47,7 @@
   * WHICH COMMIT wrote each surviving segment. A commit-scoped pack can only
     co-locate blocks written by the same commit, so this is the fact that
     decides whether `1 commit = 1 pack` can put a chain in one pack."
-  (:require #?(:clj  [clojure.test :refer [deftest]]
+  (:require #?(:clj  [kotoba.test :refer [deftest]]
                :cljs [cljs.test :refer [deftest is async]])
             #?(:cljs [ipld.core :as ipld])
             [kotobase-peer.core :as peer]))

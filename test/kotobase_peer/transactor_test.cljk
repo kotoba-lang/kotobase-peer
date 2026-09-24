@@ -1,5 +1,5 @@
 (ns kotobase-peer.transactor-test
-  (:require #?(:clj [clojure.test :refer [deftest is]]
+  (:require #?(:clj [kotoba.test :refer [deftest is]]
                :cljs [cljs.test :refer [deftest is]])
             [kotobase-peer.transactor :as transactor]))
 

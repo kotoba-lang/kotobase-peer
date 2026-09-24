@@ -1,5 +1,5 @@
 (ns kotobase-peer.performance-gate-test
-  (:require #?(:clj [clojure.test :refer [deftest is]]
+  (:require #?(:clj [kotoba.test :refer [deftest is]]
                :cljs [cljs.test :refer-macros [deftest is]])
             [kotobase-peer.performance-gate :as gate]))
 
