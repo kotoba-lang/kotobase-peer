@@ -74,29 +74,6 @@
     (get flow/ranks canonical)
     top-rank))
 
-(defn clearance-rank
-  "The viewer's clearance rank, from verified capability strings.
-
-  Unknown labels coerce DOWN here -- an unrecognised capability grants
-  nothing. This is the OPPOSITE rounding to `object-rank`, and deliberately
-  so: both directions are the fail-closed one for their own side, and a
-  single shared rule would have to be wrong on one of them. Coercing a
-  subject's unknown label up is privilege escalation by typo.
-
-  `read-protected-capability` is the legacy grant and means top clearance,
-  which is what it already meant when the rule was binary."
-  [caps]
-  (let [caps (set caps)]
-    (if (contains? caps read-protected-capability)
-      top-rank
-      (reduce (fn [best cap]
-                (if (str/starts-with? (or cap "") read-classified-capability-prefix)
-                  (let [label (keyword (subs cap (count read-classified-capability-prefix)))]
-                    (max best (get flow/ranks (or (flow/canonical label) :public) 0)))
-                  best))
-              0
-              caps))))
-
 ;; The per-level read grant, as a scope in the ONE capability lattice
 ;; (kotoba-lang/authority over lang/capability-semantics.edn; root
 ;; ADR-2608180200 / adr-2609241800 step 7). `[... :*]` covers exactly the
@@ -118,9 +95,22 @@
                (string? (peek s)))
       (keyword (peek s)))))
 
-(defn clearance-rank-by-scope
-  "`clearance-rank` decided through `authority.scope` instead of
-  `starts-with?`. Same rounding: unknown labels coerce DOWN."
+(defn clearance-rank
+  "The viewer's clearance rank, from verified capability strings.
+
+  Unknown labels coerce DOWN here -- an unrecognised capability grants
+  nothing. This is the OPPOSITE rounding to `object-rank`, and deliberately
+  so: both directions are the fail-closed one for their own side, and a
+  single shared rule would have to be wrong on one of them. Coercing a
+  subject's unknown label up is privilege escalation by typo.
+
+  `read-protected-capability` is the legacy grant and means top clearance,
+  which is what it already meant when the rule was binary.
+
+  Decided by `authority.scope` (the one decider, root adr-2609241800 step
+  7), not a local `starts-with?`: see `classified-label`. The equivalence
+  with the old substring rule is pinned case by case in
+  kotobase-peer.policy-authority-test."
   [caps]
   (let [caps (set caps)]
     (if (contains? caps read-protected-capability)
@@ -277,6 +267,10 @@
                  ;; The highest rank among EVERY matching prefix, so an
                  ;; overlapping pair cannot be used to read at the lower of
                  ;; the two. nil = matched nothing = not protected.
+                 ;; This `starts-with?` is over ATTRIBUTE names (":dm."), the
+                 ;; graph's own local policy -- not over a capability. The
+                 ;; capability half of the decision is `clearance-rank`,
+                 ;; which asks authority.scope (adr-2609241800 step 7).
                  (let [required (reduce (fn [best [p r]]
                                           (if (str/starts-with? (or attr "") p)
                                             (max (or best 0) r)
@@ -332,6 +326,11 @@
         required-purpose (:required-purpose policy)
         purpose (:purpose context)
         owner-attrs (set (:owner-attrs policy))
+        ;; The prefix tests below are over ATTRIBUTE / ENTITY names -- the
+        ;; graph's local policy, the `local-policy` term of
+        ;; requested ∩ delegated ∩ local-policy. The capability half is the
+        ;; exact membership of `effective-caps` above, which the caller has
+        ;; already decided through authority (adr-2609241800 step 7).
         protected-prefixes [":kotobase.policy/" ":kotobase.authority/"
                             ":kotobase.schema/" ":db/"]
         denial

@@ -76,9 +76,8 @@
   (doseq [[desc caps expected] cases]
     (testing desc
       (is (= expected (legacy-clearance-rank caps)) "oracle pins the table")
-      (is (= expected (policy/clearance-rank caps)) "src (old) matches the table")
-      (is (= expected (policy/clearance-rank-by-scope caps)) "authority decider matches the table")
-      (is (= (legacy-clearance-rank caps) (policy/clearance-rank-by-scope caps))
+      (is (= expected (policy/clearance-rank caps)) "authority decider matches the table")
+      (is (= (legacy-clearance-rank caps) (policy/clearance-rank caps))
           "old and new agree"))))
 
 (deftest the-grant-is-a-scope-in-the-authority-lattice
@@ -93,4 +92,4 @@
   ;; it differs from an exception to the fail-closed answer.
   (let [caps [(symbol (str rc "restricted"))]]
     (is (thrown? #?(:clj Throwable :cljs :default) (legacy-clearance-rank caps)))
-    (is (= 0 (policy/clearance-rank-by-scope caps)))))
+    (is (= 0 (policy/clearance-rank caps)))))
