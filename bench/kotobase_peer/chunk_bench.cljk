@@ -15,12 +15,11 @@
   Run:
     kbb -M:chunk-bench
     kbb -M:chunk-bench 50000 200000"
-  (:require [clojure.java.io :as io]
-            [clojure.java.shell]
+  (:require [kotoba.io :as io]
+            [kotoba.process]
             [kotoba.lang.text]
             [ipld.core :as ipld]
-            [merkle-lsm.core :as lsm])
-  (:import [java.io File]))
+            [merkle-lsm.core :as lsm]))
 
 (defn- live-bytes
   "Live heap after a forced collection.
@@ -41,13 +40,13 @@
 (defn- spill-run!
   "Write every block of RUN to DIR as <cid>.edn and return the run node.
   The run value itself is dropped by the caller afterwards."
-  [^File dir run]
+  [dir run]
   (doseq [b (or (:blocks run) [])]
     (spit (io/file dir (str (ipld/link-cid (get-in b [:descriptor "cid"])) ".edn"))
           (pr-str (:node b))))
   (:node run))
 
-(defn- disk-fetch [^File dir]
+(defn- disk-fetch [dir]
   (fn [cid]
     (read-string (slurp (io/file dir (str cid ".edn"))))))
 
@@ -66,9 +65,9 @@
         (range runs-count)))
 
 (defn- measure [runs-count rows-per-run target-rows]
-  (let [dir (doto (File. (str (System/getProperty "java.io.tmpdir")
+  (let [dir (doto (io/file (str (System/getProperty "java.io.tmpdir")
                               "/kotobase-chunk-bench-" (System/nanoTime)))
-              (.mkdirs))
+              (io/mkdirs))
         nodes (build-inputs! dir runs-count rows-per-run)
         total (* runs-count rows-per-run)]
     (System/gc)
@@ -93,8 +92,8 @@
                      (when (zero? (mod @emitted 8))
                        (swap! peak max (live-bytes)))))
           elapsed-ms (/ (- (System/nanoTime) t0) 1e6)]
-      (doseq [f (.listFiles dir)] (.delete f))
-      (.delete dir)
+      (doseq [f (io/list-files dir)] (io/delete f))
+      (io/delete dir)
       {:datoms total
        :runs-in runs-count
        :baseline-live baseline

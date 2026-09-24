@@ -35,13 +35,12 @@
   never presented as an end-to-end measurement.
 
   Usage: kbb -M:dag-shape-bench [docs] [novelty-tx]"
-  (:require [kotobase-peer.core :as eng]
+  (:require [kotoba.bytes :as kbytes] [kotobase-peer.core :as eng]
             [kotoba.lang.text :as str]
             [ipld.core :as ipld]
             [prolly-tree.core :as pt])
   (:import [javax.crypto Cipher Mac]
-           [javax.crypto.spec SecretKeySpec GCMParameterSpec]
-           [java.util Base64]))
+           [javax.crypto.spec SecretKeySpec GCMParameterSpec]))
 
 ;; ── same crypto harness as the other head-to-head benches ──────────────────
 (def ^:private test-dek (SecretKeySpec. (byte-array (range 1 33)) "AES"))
@@ -64,7 +63,7 @@
 
 (defn- test-blind-fn [component]
   (let [mac (doto (Mac/getInstance "HmacSHA256") (.init test-blind-key))]
-    (.encodeToString (Base64/getEncoder) (.doFinal mac (.getBytes (pr-str component) "UTF-8")))))
+    (kbytes/base64-encode (.doFinal mac (kbytes/utf8-bytes (pr-str component))))))
 
 ;; ── production-shaped workload ─────────────────────────────────────────────
 ;; kotobase-protocols-worker.kotobase-store/hydrate! rebuilds a LocalStore

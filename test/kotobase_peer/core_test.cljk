@@ -1,7 +1,7 @@
 (ns kotobase-peer.core-test
   (:require #?(:clj [kotoba.test :refer [deftest is testing]]
                :cljs [cljs.test :refer [deftest is testing async] :include-macros true])
-            [clojure.set :as set]
+            [kotoba.lang.coll :as set]
             [ipld.core :as ipld]
             [chain.core :as cd]
             [arrangement.core :as qs]

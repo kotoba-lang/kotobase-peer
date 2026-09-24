@@ -26,11 +26,10 @@
 
   Run: kbb -M:bench (see bb.edn's `loadtest` task / deps.edn's `:bench`
   alias) or `kbb -M:loadtest [novelty-sizes...]` (defaults to a preset sweep)."
-  (:require [ipld.core :as ipld]
+  (:require [kotoba.bytes :as kbytes] [ipld.core :as ipld]
             [kotobase-peer.core :as eng])
   (:import [javax.crypto Cipher Mac]
-           [javax.crypto.spec SecretKeySpec GCMParameterSpec]
-           [java.util Base64]))
+           [javax.crypto.spec SecretKeySpec GCMParameterSpec]))
 
 ;; ── real JVM crypto (identical construction to core_test.cljc's) ───────────
 
@@ -54,7 +53,7 @@
 
 (defn- test-blind-fn [component]
   (let [mac (doto (Mac/getInstance "HmacSHA256") (.init test-blind-key))]
-    (.encodeToString (Base64/getEncoder) (.doFinal mac (.getBytes (pr-str component) "UTF-8")))))
+    (kbytes/base64-encode (.doFinal mac (kbytes/utf8-bytes (pr-str component))))))
 
 ;; ── harness ─────────────────────────────────────────────────────────────────
 

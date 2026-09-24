@@ -12,10 +12,9 @@
   away; reads run against the page cache after warmup.
 
   Usage: kbb -M:h2h-neo4j"
-  (:require [kotobase-peer.core :as eng])
+  (:require [kotoba.bytes :as kbytes] [kotobase-peer.core :as eng])
   (:import [javax.crypto Cipher Mac]
            [javax.crypto.spec SecretKeySpec GCMParameterSpec]
-           [java.util Base64]
            [java.nio.file Files]
            [java.nio.file.attribute FileAttribute]
            [java.util.concurrent TimeUnit]
@@ -43,7 +42,7 @@
 
 (defn- test-blind-fn [component]
   (let [mac (doto (Mac/getInstance "HmacSHA256") (.init test-blind-key))]
-    (.encodeToString (Base64/getEncoder) (.doFinal mac (.getBytes (pr-str component) "UTF-8")))))
+    (kbytes/base64-encode (.doFinal mac (kbytes/utf8-bytes (pr-str component))))))
 
 (def entities 3000)
 (def batches 3)

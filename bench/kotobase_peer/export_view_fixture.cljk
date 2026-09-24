@@ -1,8 +1,7 @@
 (ns kotobase-peer.export-view-fixture
-  (:require [kotoba.lang.text :as str]
+  (:require [kotoba.bytes :as kbytes] [kotoba.lang.text :as str]
             [kotobase-peer.materialized-view :as view])
   (:import [java.nio.file Files Paths OpenOption]
-           [java.util Base64]
            [javax.crypto Cipher Mac]
            [javax.crypto.spec GCMParameterSpec SecretKeySpec]))
 
@@ -70,4 +69,4 @@
           :encrypted? encrypted?
           :key-id key-id
           :key-b64 (when encrypted?
-                     (.encodeToString (Base64/getEncoder) fixture-key))})))
+                     (kbytes/base64-encode fixture-key))})))
