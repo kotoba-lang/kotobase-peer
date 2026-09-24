@@ -1,0 +1,21 @@
+{
+  "jobs": [
+    {
+      "base_url": null,
+      "deliver": "origin",
+      "enabled": true,
+      "id": "kotobase-ldbc-tick",
+      "model": "qwen3.8-27b-whitehacker",
+      "name": "kotobase-ldbc-tick",
+      "prompt": "kotobase-ldbc: SOUL.md を読んで 1 tick 実行せよ。前提 (2026-09-18 訂正): graph 面は https://graph.kotoba.cloud を使う（graph.kotobase.cloud は NXDOMAIN で存在しない。旧 premise を prompt から除去済み）。対象 repo は work/kotobase-peer、branch codex/ldbc-complete-path-20260913 (base 07f5a75)。\n\n優先順:\n1. bench/ldbc_ic01_ic03_test.cljk を `kbb --backend sci --classpath bench bench/ldbc_ic01_ic03_test.cljk` で実行。残タスクは (a) ldbc_complex_reads.cljk の IC1 BFS neighbors が knows 双方向 edge で d1 に余計な人を混入させる問題の特定・修正、(b) 期待値 triple 数再計算、(c) 全 14 assertion green 実測。測れなかった修正を成功として報告しない。\n2. green を実測したら 1 commit (message: \"Serve IC01 and IC03 with JVM-free fixture oracle reference checks\") + LDBC-QUALIFICATION.md に IC01/IC03 milestone 節。graph 面への query 経路がある場合は graph.kotoba.cloud に対して 1 回だけ実 query を打ち、実測を添える（API surface はその場で実測して使う。404/405 を成功と読まない）。\n3. 残り時間があれば IC12 の下調べのみ。実装はしない。\n4. HANDOFF.md 更新（着地点・次の 1 手・未検証項目）。graph.kotoba.cloud の実測応答（endpoint / status code）を記録。\n\n進捗 0 なら「0」と正直に報告し次の 1 手を名指す。git push はしない。JVM 起動は打たない — kbb のみ。",
+      "provider": "kotoba",
+      "schedule": {
+        "kind": "cron",
+        "expr": "23 * * * *",
+        "display": "23 * * * *"
+      },
+      "skill": null,
+      "skills": []
+    }
+  ]
+}

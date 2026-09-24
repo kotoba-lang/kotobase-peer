@@ -1,0 +1,4 @@
+description: Kotobase LDBC SNB v1 correctness and performance continuation. Owns the
+  external complete-path worktree; finish IC01/03/12/14, independent validation, then
+  measured optimization.
+description_auto: false

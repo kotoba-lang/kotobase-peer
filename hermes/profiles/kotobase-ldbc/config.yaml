@@ -1,0 +1,70 @@
+# Host-local blocks (command_allowlist, onboarding, secrets, skills, terminal) are kept on the host and omitted here.
+model:
+  provider: kotoba
+
+  base_url: https://api.kotoba.cloud/v1
+  default: qwen3.8-27b-whitehacker
+
+  max_tokens: 8192
+  context_length: 262144
+plugins:
+  enabled: []
+_config_version: 45
+agent:
+  max_turns: 500
+  run_budget_seconds: 1800
+providers:
+  murakumo:
+    base_url: https://api.murakumo.cloud/v1
+    api_mode: chat_completions
+    models:
+      nex-n2.5-mini-uncensored:
+        context_length: 65536
+        max_tokens: 8192
+    stale_timeout_seconds: 600
+    request_timeout_seconds: 900
+    extra_headers:
+      HTTP-Referer: https://itonami.cloud
+      X-OpenRouter-Title: Itonami By KotobaLabs
+      X-Title: Itonami By KotobaLabs
+    key_env: MURAKUMO_API_TOKEN
+  kotoba:
+    base_url: https://api.kotoba.cloud/v1
+    api_mode: chat_completions
+    key_env: KOTOBA_API_TOKEN
+    stale_timeout_seconds: 600
+    request_timeout_seconds: 900
+    models:
+      qwen3.8-27b-whitehacker:
+        context_length: 262144
+      qwen3.8-flash-next-whitehacker:
+        context_length: 131072
+fallback_providers:
+  - provider: openrouter-free
+    model: z-ai/glm-5.3-flash
+    base_url: https://openrouter.ai/api/v1
+gateway:
+  multiplex_profiles: false
+auxiliary:
+  vision:
+    provider: kotoba
+    base_url: https://api.kotoba.cloud/v1
+    key_env: KOTOBA_API_TOKEN
+    model: qwen3.8-flash-next-whitehacker
+    reasoning_effort: none
+  compression:
+    provider: kotoba
+    base_url: https://api.kotoba.cloud/v1
+    model: qwen3.8-flash-next-whitehacker
+    reasoning_effort: none
+  title_generation:
+    provider: kotoba
+    base_url: https://api.kotoba.cloud/v1
+    model: qwen3.8-flash-next-whitehacker
+    reasoning_effort: none
+
+
+
+cron:
+  bot_chat_delivery_timeout_seconds: 900
+  max_parallel_jobs: 12
