@@ -35,7 +35,7 @@
   kotobase-peer already threads (datoms / cold-datoms / hot-datoms / q /
   view-rows — 'Query is a first-class effect'): the seam existed
   everywhere, this ns just decides the fn from (policy × viewer caps)."
-  (:require #?(:clj [clojure.edn :as edn]
+  (:require #?(:clj [kotoba.lang.edn :as edn]
                :cljs [cljs.reader :as edn])
             [kotoba.lang.text :as str]
             [kotoba.security.information-flow :as flow]
