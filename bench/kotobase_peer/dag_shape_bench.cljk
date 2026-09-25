@@ -35,7 +35,7 @@
   never presented as an end-to-end measurement.
 
   Usage: kbb -M:dag-shape-bench [docs] [novelty-tx]"
-  (:require [kotoba.bytes :as kbytes] [kotobase-peer.core :as eng]
+  (:require [kotoba.lang.error :as kerror] [kotoba.bytes :as kbytes] [kotobase-peer.core :as eng]
             [kotoba.lang.text :as str]
             [ipld.core :as ipld]
             [prolly-tree.core :as pt])
@@ -99,7 +99,7 @@
     (loop [passes 0]
       (let [outcome (try
                       {:ok (pt/scan-prefix get-fn root-cid prefix)}
-                      (catch clojure.lang.ExceptionInfo e
+                      (catch kerror/ExceptionInfo e
                         (if (:block-miss (ex-data e))
                           {:miss (:cid (ex-data e))}
                           (throw e))))]

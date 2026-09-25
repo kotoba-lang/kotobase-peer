@@ -40,7 +40,7 @@
 ;; or a run had failed operations at the FIRST rate -- nothing was measured).
 
 (ns ldbc-snb-driver
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [kotoba.lang.edn :as edn]
             ["fs" :as fs]
             ["os" :as os]

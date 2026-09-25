@@ -44,13 +44,13 @@
            (mapv #(mapv :request-ids %) waves)))))
 
 (deftest rejects-ambiguous-request-acknowledgements
-  (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+  (is (thrown? js/Error
                (transactor/plan-head-batches
                 [{:request-id 1 :head-key "a" :tx-data [1]}
                  {:request-id 1 :head-key "b" :tx-data [2]}]))))
 
 (deftest validates-receipt-counts-before-publication
-  (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+  (is (thrown? js/Error
                (transactor/validate-batch
                 {:head-key "a" :request-ids [1] :request-count 1
                  :datom-count 2 :tx-data [1]}))))

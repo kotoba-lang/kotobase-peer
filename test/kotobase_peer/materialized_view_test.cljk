@@ -269,7 +269,7 @@
     (is (true? (:compact? over-bytes)))
     (is (false? (:within-budget? over-bytes)))
     (is (thrown-with-msg?
-         #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+         js/Error
          #"byte budget exceeded"
          (view/compact-packed-chain
           {:view-id :feed :epoch 1
@@ -354,7 +354,7 @@
             :entries [{:key "between" :value 1}
                       {:key "later" :value 2}]})]
       (is (thrown-with-msg?
-           #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+           js/Error
            #"overlap or are unordered"
            (view/compose-view-segments
             {:view-id :hot :epoch 10
@@ -375,7 +375,7 @@
     (is (every? #(<= (get % "length") max-bytes)
                 (get-in bounded [:bundle :node "blocks"])))
     (is (thrown-with-msg?
-         #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+         js/Error
          #"row byte budget exceeded"
          (view/build-view
           {:view-id :bytes :epoch 1 :entries (take 1 entries)

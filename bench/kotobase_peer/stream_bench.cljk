@@ -22,7 +22,7 @@
 
   gate-1M: `kbb -J-Xmx4g -M:stream-bench 1000000` must complete with
   rows conserved. gate-10M: `-J-Xmx8g ... 10000000`."
-  (:require [clojure.java.io :as io]
+  (:require [kotoba.io :as io]
             [ipld.core :as ipld]
             [merkle-lsm.core :as lsm]))
 
@@ -42,7 +42,7 @@
   [dir run]
   (doseq [{:keys [cid bytes]} (:effects run)]
     (let [f (io/file dir (str cid ".bin"))]
-      (when-not (.exists f)
+      (when-not (io/exists? f)
         (with-open [out (io/output-stream f)]
           (.write out ^bytes bytes)))))
   {:root (:cid run) :count (:count run)})
@@ -79,7 +79,7 @@
 
 (defn measure [n target-rows fan-in]
   (let [dir (io/file "target" (str "stream-bench-" n "-" (System/currentTimeMillis)))
-        _ (.mkdirs dir)
+        _ (io/mkdirs dir)
         batch-size 1000
         build (elapsed-ms
                (fn []
@@ -102,7 +102,7 @@
                 :total-ms (+ (:ms build) (:ms compact))
                 :throughput-per-sec (/ (* n 1000.0) (+ (:ms build) (:ms compact)))
                 :final-runs (count final-refs) :final-rows total-rows}]
-    (doseq [f (reverse (file-seq dir))] (.delete ^java.io.File f))
+    (doseq [f (reverse (io/file-seq dir))] (io/delete f))
     result))
 
 (defn -main [& args]
