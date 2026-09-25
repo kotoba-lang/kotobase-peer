@@ -96,18 +96,18 @@
 
 (deftest challenge-throws-on-nil-cid-or-nonce
   (testing "challenge fails fast (ex-info) on a nil cid or nonce instead of silently building a challenge with no freshness guarantee"
-    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+    (is (thrown? js/Error
                  (avail/challenge nil nonce-1 1)))
-    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+    (is (thrown? js/Error
                  (avail/challenge "cid-a" nil 1)))))
 
 (deftest prove-throws-on-nil-cid-or-nonce
   (testing "prove fails fast (ex-info) on a nil cid or nonce in the challenge it's given"
     (let [node (mem-store {"cid-a" block-a})]
-      (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+      (is (thrown? js/Error
                    (avail/prove (:get-fn node)
                                  {:kotobase.availability/cid nil :kotobase.availability/nonce nonce-1})))
-      (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+      (is (thrown? js/Error
                    (avail/prove (:get-fn node)
                                  {:kotobase.availability/cid "cid-a" :kotobase.availability/nonce nil}))))))
 

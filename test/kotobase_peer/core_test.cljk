@@ -1,5 +1,5 @@
 (ns kotobase-peer.core-test
-  (:require #?(:clj [kotoba.test :refer [deftest is testing]]
+  (:require [kotoba.bytes :as kbytes] #?(:clj [kotoba.test :refer [deftest is testing]]
                :cljs [cljs.test :refer [deftest is testing async] :include-macros true])
             [kotoba.lang.coll :as set]
             [ipld.core :as ipld]
@@ -12,8 +12,7 @@
             ;; weight on the ClojureScript side.
             #?@(:clj [[kotobase.blockcodec.core :as bc]]))
   #?(:clj (:import [javax.crypto Cipher Mac]
-                   [javax.crypto.spec SecretKeySpec GCMParameterSpec]
-                   [java.util Base64])))
+                   [javax.crypto.spec SecretKeySpec GCMParameterSpec])))
 
 (defn- mem-store []
   (let [store (atom {})]
@@ -63,8 +62,8 @@
    (defn test-blind-fn [component]
      (let [mac (Mac/getInstance "HmacSHA256")]
        (.init mac test-blind-key)
-       (let [digest (.doFinal mac (.getBytes (pr-str component) "UTF-8"))]
-         (.encodeToString (Base64/getEncoder) digest)))))
+       (let [digest (.doFinal mac (kbytes/utf8-bytes (pr-str component)))]
+         (kbytes/base64-encode digest)))))
 
 #?(:cljs
    (def ^:private subtle (.-subtle js/crypto)))
@@ -555,7 +554,7 @@
 
 (deftest transact-with-schema-rejects-unknown-attribute
   (let [db (eng/install-schema (eng/empty-db) {"role" {:db/valueType :string}})]
-    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+    (is (thrown-with-msg? js/Error
                            #"unknown attribute"
                            (eng/transact-with-schema db [{:s "alice" :p "nickname" :o "Al"}] {})))))
 
@@ -567,7 +566,7 @@
 
 (deftest transact-with-schema-rejects-value-type-mismatch
   (let [db (eng/install-schema (eng/empty-db) {"age" {:db/valueType :long}})]
-    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+    (is (thrown-with-msg? js/Error
                            #"schema violation"
                            (eng/transact-with-schema db [{:s "bob" :p "age" :o "not-a-number"}] {})))
     (testing "a real long passes validation (storage still stringifies, matching the rest of this codebase's convention -- schema validates the ORIGINAL value's type, it doesn't change on-disk representation)"
@@ -590,7 +589,7 @@
 (deftest transact-with-schema-unique-identity-rejects-cross-entity-collision
   (let [db0 (eng/install-schema (eng/empty-db) {"email" {:db/valueType :string :db/unique :identity}})
         db1 (eng/transact-with-schema db0 [{:s "alice" :p "email" :o "a@x.com"}] {})]
-    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+    (is (thrown-with-msg? js/Error
                            #"unique attribute violation"
                            (eng/transact-with-schema db1 [{:s "bob" :p "email" :o "a@x.com"}] {})))
     (testing "the SAME entity re-asserting its own unique value is not a violation"
@@ -604,7 +603,7 @@
         db1 (eng/transact-with-schema db0
                                       [{:s "first" :p "serial" :o "S-1"}]
                                       {})]
-    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+    (is (thrown-with-msg? js/Error
                           #"unique attribute violation"
                           (eng/transact-with-schema
                            db1 [{:s "second" :p "serial" :o "S-1"}] {})))
@@ -621,7 +620,7 @@
   ;; regression test for a real bug: passing {:db/valueType ...} directly
   ;; to transact-with-schema (never pre-installed via install-schema)
   ;; used to silently skip value-type validation entirely.
-  (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+  (is (thrown-with-msg? js/Error
                         #"schema violation"
                         (eng/transact-with-schema (eng/empty-db)
                                                   [{:s "bob" :p "age" :o "not-a-number"}]
@@ -632,13 +631,13 @@
         the-id #uuid "0f1e86a9-aa89-414e-8368-d4e95e9fcd4c"]
     (testing "validates against the ORIGINAL value's type; storage still stringifies (same convention as long/etc.)"
       (is (= #{(str the-id)} (get (eng/pull (eng/transact-with-schema db0 [{:s "a" :p "id" :o the-id}] {}) "a") "id"))))
-    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+    (is (thrown-with-msg? js/Error
                           #"schema violation"
                           (eng/transact-with-schema db0 [{:s "a" :p "id" :o "not-a-uuid"}] {})))))
 
 (deftest instant-value-type
   (let [db0 (eng/install-schema (eng/empty-db) {"born" {:db/valueType :instant}})]
-    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+    (is (thrown-with-msg? js/Error
                           #"schema violation"
                           (eng/transact-with-schema db0 [{:s "a" :p "born" :o "not-a-date"}] {})))))
 
@@ -647,7 +646,7 @@
         db1 (eng/transact-with-schema db0 [{:s "a" :p "status" :o :active} {:s "a" :p "op" :o 'foo}] {})]
     (is (= #{(str :active)} (get (eng/pull db1 "a") "status")))
     (is (= #{(str 'foo)} (get (eng/pull db1 "a") "op")))
-    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+    (is (thrown-with-msg? js/Error
                           #"schema violation"
                           (eng/transact-with-schema db0 [{:s "a" :p "status" :o "active"}] {})))))
 
@@ -655,10 +654,10 @@
   (let [db0 (eng/install-schema (eng/empty-db)
                                 {"coords" {:db/valueType :tuple :db/tupleTypes [:double :double]}})]
     (is (= #{(str [1.0 2.0])} (get (eng/pull (eng/transact-with-schema db0 [{:s "a" :p "coords" :o [1.0 2.0]}] {}) "a") "coords")))
-    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+    (is (thrown-with-msg? js/Error
                           #"tuple arity mismatch"
                           (eng/transact-with-schema db0 [{:s "a" :p "coords" :o [1.0 2.0 3.0]}] {})))
-    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+    (is (thrown-with-msg? js/Error
                           #"schema violation"
                           (eng/transact-with-schema db0 [{:s "a" :p "coords" :o [1.0 "not-a-double"]}] {})))))
 

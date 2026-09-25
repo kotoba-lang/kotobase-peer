@@ -46,12 +46,12 @@
     (is (= {"reason" "operator-request"}
            (get-in cancelled [:node "error"])))
     (testing "attempt, token, and ordinal mismatches fail closed"
-      (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+      (is (thrown? js/Error
                    (resume/advance
                     {:task task-a :checkpoint initial
                      :token "token-b" :attempt 1 :ordinal 0
                      :payload [] :item-count 0 :byte-count 0})))
-      (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+      (is (thrown? js/Error
                    (resume/advance
                     {:task task-a :checkpoint initial
                      :token "token-a" :attempt 1 :ordinal 1

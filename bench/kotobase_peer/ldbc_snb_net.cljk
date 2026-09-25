@@ -41,7 +41,7 @@
   `params-dir` (substitution_parameters-sf<N>) enables the `:impl :index`
   path: at startup every official parameter for IC02/07/08/09 is answered
   both ways and the index path is served only if all of them agree."
-  (:require [kotoba.bytes :as kbytes] [kotobase-peer.ldbc-snb-bench :as ldbc]
+  (:require [kotoba.lang.error :as kerror] [kotoba.bytes :as kbytes] [kotobase-peer.ldbc-snb-bench :as ldbc]
             [kotobase-peer.core :as eng]
             [datalog.index :as index]
             [kotoba.lang.edn :as edn]
@@ -258,7 +258,7 @@
 
             :else
             (respond! ex 404 (pr-str {:error :no-such-route :path path}))))
-        (catch clojure.lang.ExceptionInfo e
+        (catch kerror/ExceptionInfo e
           (respond! ex (or (:status (ex-data e)) 500)
                     (pr-str {:error (ex-message e) :data (dissoc (ex-data e) :status)})))
         (catch Throwable t
