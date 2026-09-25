@@ -15,7 +15,8 @@
         "display": "23 * * * *"
       },
       "skill": null,
-      "skills": []
+      "skills": [],
+      "workdir": null
     }
   ]
 }
