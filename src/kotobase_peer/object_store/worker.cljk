@@ -1923,7 +1923,7 @@
                 (ex-info "S3 compaction lease GET failed"
                          {:db-id db-id :status (.-status response)}))))))
       (js/Promise.reject
-       (js/Error. "No MERKLE_BUCKET or MERKLE_S3_* backend configured"))))
+       (js/Error. "No MERKLE_BUCKET or MERKLE_S3_* backend configured")))))
 
 (defn compaction-pressure!
   "Inspect a bounded newest-first window. Scheduling is warranted when either
@@ -2055,7 +2055,7 @@
                                         :else
                                         (js/Promise.reject
                                          (ex-info "S3 compaction lease CAS failed"
-                                                  {:db-id db-id :status (.-status response)})))))))))))))))))))
+                                                  {:db-id db-id :status (.-status response)}))))))))))))))))))))
 
 (defn claim-compaction-lease!
   "Claim one deterministic head task using R2 ETag CAS. An active lease is
@@ -2083,9 +2083,7 @@
           (js/Promise.reject
            (js/Error. "Set MERKLE_S3_CONDITIONAL_HEAD=true only for a backend with conditional PutObject")))
         (js/Promise.reject
-         (js/Error. "No MERKLE_BUCKET or MERKLE_S3_* backend configured")))))))
-      (js/Promise.reject
-       (js/Error. "Compaction scheduler currently requires an R2 binding")))))
+         (js/Error. "No MERKLE_BUCKET or MERKLE_S3_* backend configured"))))))
 
 (defn renew-compaction-lease!
   "Extend a running lease with ETag fencing. A stale worker receives won? false."
@@ -2260,7 +2258,7 @@
                          {:db-id db-id :task-id task-id
                           :status (.-status response)}))))))
       (js/Promise.reject
-       (js/Error. "No MERKLE_BUCKET or MERKLE_S3_* backend configured"))))
+       (js/Error. "No MERKLE_BUCKET or MERKLE_S3_* backend configured")))))
 
 (defn- claim-resumable-execution-r2!
   "R2-binding branch of the resumable claim: ETag CAS on the pointer key."
@@ -2322,7 +2320,7 @@
                                            :checkpoint (:node checkpoint)
                                            :etag (gobj/get result "etag")}
                                           {:claimed? false
-                                           :reason :cas-lost}))))))))))))))))))
+                                           :reason :cas-lost})))))))))))))))))))
 
 (defn- claim-resumable-execution-s3!
   "Signed-S3 branch of the resumable claim: If-Match/If-None-Match CAS on the
@@ -2391,7 +2389,7 @@
                                           (js/Promise.reject
                                            (ex-info "S3 resumable pointer CAS failed"
                                                     {:task-id task-id
-                                                     :status (.-status response)}))))))))))))))))))))
+                                                     :status (.-status response)})))))))))))))))))))))
 
 (defn claim-resumable-execution!
   "Claim or reclaim one deterministic snapshot-pinned task. Task and initial
@@ -2417,9 +2415,7 @@
           (js/Promise.reject
            (js/Error. "Set MERKLE_S3_CONDITIONAL_HEAD=true only for a backend with conditional PutObject")))
         (js/Promise.reject
-         (js/Error. "No MERKLE_BUCKET or MERKLE_S3_* backend configured")))))))
-      (js/Promise.reject
-       (js/Error. "Resumable execution currently requires an R2 binding")))))
+         (js/Error. "No MERKLE_BUCKET or MERKLE_S3_* backend configured"))))))
 
 (defn advance-resumable-execution!
   "Persist one spill and successor checkpoint, then advance the mutable pointer
@@ -2523,7 +2519,7 @@
           (js/Promise.reject
            (js/Error. "Set MERKLE_S3_CONDITIONAL_HEAD=true only for a backend with conditional PutObject")))
         (js/Promise.reject
-         (js/Error. "No MERKLE_BUCKET or MERKLE_S3_* backend configured")))))
+         (js/Error. "No MERKLE_BUCKET or MERKLE_S3_* backend configured"))))))
 
 (defn finish-resumable-execution!
   "Publish a terminal immutable checkpoint and CAS the pointer to terminal.
@@ -2605,7 +2601,7 @@
           (js/Promise.reject
            (js/Error. "Set MERKLE_S3_CONDITIONAL_HEAD=true only for a backend with conditional PutObject")))
         (js/Promise.reject
-         (js/Error. "No MERKLE_BUCKET or MERKLE_S3_* backend configured")))))
+         (js/Error. "No MERKLE_BUCKET or MERKLE_S3_* backend configured")))))))
 
 (defn cancel-resumable-execution!
   "Atomically fence a running resumable task with a terminal cancelled
@@ -2731,7 +2727,7 @@
         (js/Promise.reject
          (js/Error. "Set MERKLE_S3_CONDITIONAL_HEAD=true only for a backend with conditional PutObject")))
       (js/Promise.reject
-       (js/Error. "No MERKLE_BUCKET or MERKLE_S3_* backend configured"))))
+       (js/Error. "No MERKLE_BUCKET or MERKLE_S3_* backend configured")))))
 
 (defn- verify-reachability-bytes!
   "Verify BYTES against CID using the codec CID declares. Returns true when
