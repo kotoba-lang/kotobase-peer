@@ -2175,11 +2175,11 @@
                        (.then (fn [result]
                                 {:task-id (:id task) :outcome outcome
                                  :checkpoint checkpoint
-                                 :lease-fenced? (not (.-ok result))}))))))))
+                                 :lease-fenced? (not (.-ok result))})))))))
           (js/Promise.reject
            (js/Error. "Set MERKLE_S3_CONDITIONAL_HEAD=true only for a backend with conditional PutObject")))
         (js/Promise.reject
-         (js/Error. "No MERKLE_BUCKET or MERKLE_S3_* backend configured")))))
+         (js/Error. "No MERKLE_BUCKET or MERKLE_S3_* backend configured"))))))
 
 (defn run-compaction-once!
   "Claim, execute, checkpoint, and terminally fence one database compaction.
