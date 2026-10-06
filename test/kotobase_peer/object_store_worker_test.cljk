@@ -61,7 +61,12 @@
   (async done
     (let [object-bytes (ipld/encode {"opaque-pack" true})
           object-cid (str (mf/cidv1-raw object-bytes))
-          root-bytes (ipld/encode {"pack" (ipld/link object-cid)})
+          logical-cid (str (ipld/cid object-bytes))
+          root-bytes (ipld/encode {"format" "kotobase/query-bundle"
+                                   "pack-cid" (ipld/link object-cid)
+                                   "blocks" [{"cid" (ipld/link logical-cid)
+                                              "offset" 0
+                                              "length" (.-byteLength object-bytes)}]})
           root-cid (str (ipld/cid root-bytes))
           values {(str "opaque/blocks/" root-cid) root-bytes
                   (str "opaque/objects/" object-cid) object-bytes}
@@ -81,6 +86,8 @@
                    "MERKLE_S3_PREFIX" "opaque"}]
       (is (str/starts-with? object-cid "bafkrei")
           "the fixture must actually be raw-addressed, or it proves nothing")
+      (is (not= logical-cid object-cid)
+          "the descriptor CID is virtual and must not be fetched as a block")
       (-> (worker/reachable-cids! env root-cid)
           (.then
            (fn [reachable]
@@ -1805,7 +1812,7 @@
           orphan-bytes (ipld/encode {"orphan" true})
           orphan (ipld/cid orphan-bytes)
           orphan-object-bytes (ipld/encode {"opaque-orphan" true})
-          orphan-object (ipld/cid orphan-object-bytes)
+          orphan-object (mf/cidv1-raw orphan-object-bytes)
           prefix "test/"
           block-key #(str prefix "blocks/" %)
           object-key #(str prefix "objects/" %)
@@ -1920,7 +1927,7 @@
                                        (ipld/cid
                                         (get @objects (block-key orphan)))))
                                 (is (= orphan-object
-                                       (ipld/cid
+                                       (mf/cidv1-raw
                                         (get @objects
                                              (object-key orphan-object)))))
                                 (is (contains? @objects
