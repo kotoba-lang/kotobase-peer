@@ -2782,6 +2782,27 @@
       (js/Promise.reject
        (js/Error. "No MERKLE_BUCKET or MERKLE_S3_* backend configured")))))
 
+(defn- stored-node-links [node]
+  ;; A query bundle names logical blocks inside a raw pack. Only the pack is
+  ;; stored under objects/; descriptor CIDs are range identities, not separate
+  ;; storage keys. Keep every other link, including the pack and lineage.
+  (let [links (lsm/linked-cids node)]
+    (if (= "kotobase/query-bundle" (get node "format"))
+      (let [pack (get node "pack-cid")
+            descriptors (get node "blocks")]
+        (when-not (and (ipld/link? pack) (vector? descriptors))
+          (throw (ex-info "Invalid query bundle storage references" {})))
+        (let [virtual (into #{}
+                            (keep (fn [link]
+                                    (when (ipld/link? link)
+                                      (ipld/link-cid link))))
+                            (mapcat (fn [descriptor]
+                                      [(get descriptor "cid")
+                                       (get descriptor "stored-cid")])
+                                    descriptors))]
+          (conj (reduce disj links virtual) (ipld/link-cid pack))))
+      links)))
+
 (defn reachable-cids!
   "Walk decoded block links from ROOT-CID and return a Promise<set<CID>>.
   Materialized packs live under objects/, are CID-verified opaque leaves, and
@@ -2793,7 +2814,7 @@
     (letfn [(verified-links [cid bytes decode?]
               (let [dag-cbor? (verify-reachability-bytes! cid bytes)]
                 (if (and decode? dag-cbor?)
-                  (lsm/linked-cids (ipld/decode bytes))
+                  (stored-node-links (ipld/decode bytes))
                   [])))
             (read-links [cid]
               (-> (get-block! e cid)
@@ -3121,7 +3142,7 @@
         (fn [bytes decode?]
           (let [dag-cbor? (verify-reachability-bytes! cid bytes)]
             (if (and decode? dag-cbor?)
-              (lsm/linked-cids (ipld/decode bytes))
+              (stored-node-links (ipld/decode bytes))
               [])))]
     (-> (.get bucket (block-key e cid))
         (.then
@@ -4317,7 +4338,7 @@
                     (verify-gc-entry-bytes!
                      e (block-key e cid) cid bytes)
                     {:namespace "blocks" :cid cid :bytes bytes
-                     :links (lsm/linked-cids (ipld/decode bytes))})))))))))
+                     :links (stored-node-links (ipld/decode bytes))})))))))))
 
 (defn- backup-database-storage-graph!
   [e primary backup-bucket root-cid]
@@ -6129,7 +6150,7 @@
                     (verify-gc-entry-bytes!
                      e (database-storage-key e namespace cid) cid bytes)
                     (if (= "blocks" namespace)
-                      (lsm/linked-cids (ipld/decode bytes))
+                      (stored-node-links (ipld/decode bytes))
                       [])))))))
         (.then
          (fn [links]

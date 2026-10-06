@@ -61,7 +61,12 @@
   (async done
     (let [object-bytes (ipld/encode {"opaque-pack" true})
           object-cid (str (mf/cidv1-raw object-bytes))
-          root-bytes (ipld/encode {"pack" (ipld/link object-cid)})
+          logical-cid (str (ipld/cid object-bytes))
+          root-bytes (ipld/encode {"format" "kotobase/query-bundle"
+                                   "pack-cid" (ipld/link object-cid)
+                                   "blocks" [{"cid" (ipld/link logical-cid)
+                                              "offset" 0
+                                              "length" (.-byteLength object-bytes)}]})
           root-cid (str (ipld/cid root-bytes))
           values {(str "opaque/blocks/" root-cid) root-bytes
                   (str "opaque/objects/" object-cid) object-bytes}
@@ -81,6 +86,8 @@
                    "MERKLE_S3_PREFIX" "opaque"}]
       (is (str/starts-with? object-cid "bafkrei")
           "the fixture must actually be raw-addressed, or it proves nothing")
+      (is (not= logical-cid object-cid)
+          "the descriptor CID is virtual and must not be fetched as a block")
       (-> (worker/reachable-cids! env root-cid)
           (.then
            (fn [reachable]
