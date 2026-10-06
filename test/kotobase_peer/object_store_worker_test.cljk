@@ -1805,7 +1805,7 @@
           orphan-bytes (ipld/encode {"orphan" true})
           orphan (ipld/cid orphan-bytes)
           orphan-object-bytes (ipld/encode {"opaque-orphan" true})
-          orphan-object (ipld/cid orphan-object-bytes)
+          orphan-object (mf/cidv1-raw orphan-object-bytes)
           prefix "test/"
           block-key #(str prefix "blocks/" %)
           object-key #(str prefix "objects/" %)
@@ -1920,7 +1920,7 @@
                                        (ipld/cid
                                         (get @objects (block-key orphan)))))
                                 (is (= orphan-object
-                                       (ipld/cid
+                                       (mf/cidv1-raw
                                         (get @objects
                                              (object-key orphan-object)))))
                                 (is (contains? @objects

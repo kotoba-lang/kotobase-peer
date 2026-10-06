@@ -3811,8 +3811,20 @@
          (str (prefix e) "scheduler/database-backup/")
          (str (prefix e) "scheduler/ingress/")]))
 
+(defn- gc-content-cid [expected-cid bytes]
+  (str (if (= (ipld/cid-codec expected-cid) mf/codec-raw)
+         (mf/cidv1-raw bytes)
+         (ipld/cid bytes))))
+
+(defn- gc-addressed-key-cid [e key]
+  (some (fn [key-prefix]
+          (when (str/starts-with? key key-prefix)
+            (subs key (count key-prefix))))
+        [(str (prefix e) "blocks/")
+         (str (prefix e) "objects/")]))
+
 (defn- verify-gc-entry-bytes! [e key expected-cid bytes]
-  (let [actual (str (ipld/cid bytes))
+  (let [actual (gc-content-cid expected-cid bytes)
         cid-key-prefix
         (some #(when (str/starts-with? key %) %)
               [(str (prefix e) "blocks/")
@@ -3842,7 +3854,7 @@
                     (-> (stored-bytes! existing)
                         (.then
                          (fn [existing-bytes]
-                           (let [actual (str (ipld/cid existing-bytes))]
+                           (let [actual (gc-content-cid expected-cid existing-bytes)]
                              (when-not (= expected-cid actual)
                                (throw
                                 (ex-info "GC immutable backup CID conflict"
@@ -3863,7 +3875,10 @@
            (-> (stored-bytes! stored)
                (.then
                 (fn [bytes]
-                  (let [content-cid (str (ipld/cid bytes))]
+                  (let [key-cid (gc-addressed-key-cid e key)
+                        content-cid (if key-cid
+                                      (gc-content-cid key-cid bytes)
+                                      (str (ipld/cid bytes)))]
                     (verify-gc-entry-bytes! e key content-cid bytes)
                     (-> (put-immutable-gc-backup!
                          backup-bucket
