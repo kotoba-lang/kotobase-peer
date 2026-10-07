@@ -1,0 +1,62 @@
+{:schema 1
+ :date "2026-08-14"
+ :receipt/type :representation-experiment
+ :follows "2026-08-14-representation-ceiling.edn"
+
+ :question
+ "The ceiling receipt found a direct index walk 40x faster than the engine and
+  attributed the gap to three things: a persistent-map binding per row, an
+  {:s :p :o} map per candidate, and a set at every step. Price them."
+
+ :answer
+ "Those three, together, are 3.0x of a 33.9x gap. The remaining 11.4x is
+  something else. The attribution in the previous receipt was wrong."
+
+ :method
+ "Arm B0 from the ceiling receipt, with one general-engine feature added back at
+  a time. Every arm asserted to return the same set as the engine, on all five
+  start persons, before anything was timed. 10 warmup rounds, 60 samples, median.
+  Host load 4.82."
+
+ :arms
+ [{:arm "B0" :what "positional loop, vector out, no visible?, no dedup" :ms 0.527}
+  {:arm "B1" :what "+ visible? applied to every candidate quad" :ms 0.562 :vs-previous "1.07x"}
+  {:arm "B2" :what "+ a set at every step (deduplication)" :ms 0.940 :vs-previous "1.67x"}
+  {:arm "B3" :what "+ a persistent-map binding per row, projected at the end" :ms 1.568 :vs-previous "1.67x"}
+  {:arm "A"  :what "the engine, dl/q" :ms 17.853 :vs-previous "11.39x"}]
+
+ :the-reading
+ "Visibility costs almost nothing -- 7%. Deduplication costs 1.67x. Map-shaped
+  bindings cost another 1.67x. All three are real and all three together are 3.0x.
+  The engine is 11.4x beyond that.
+
+  So the answer to 'how much of the gap does generality need?' is: about a tenth
+  of it. The rest is not the price of being a general engine. It is in how this
+  engine reaches the index -- arms B0 through B3 all read `:pos` and `:spo`
+  directly, while the engine goes through `scan*` and `query-seq`, which
+  construct an {:s :p :o} map per candidate and traverse lazy seqs. That layer
+  was measured on 2026-08-14 at 131 ns a row against 0.4 ns for the raw index
+  read."
+
+ :this-refutes-its-own-predecessor
+ "2026-08-14-the-gap-is-a-constant-factor.edn named binding maps, quad maps and
+  per-step sets as the 9x, and 2026-08-14-representation-ceiling.edn repeated it
+  for the 40x. Two of those three are now priced at 1.67x each and the third at
+  1.07x. The claim was plausible, was stated as a reading rather than a
+  measurement, and was wrong."
+
+ :caveats
+ ["One query shape, one dataset, one JVM. The arms are hand-written for IC02's
+   clause order and prove nothing about other shapes."
+  "B1 constructs the {:s :p :o} map it passes to visible?, so its 7% includes that
+   allocation for three quads per row. A general engine that already has the quad
+   would pay less."
+  "The 11.4x is a residue, not a measurement of anything named. Calling it
+   'scan* and query-seq' is the next hypothesis to test, not a result."]
+
+ :next
+ "Price the read path the same way: a walk that reads `:pos`/`:spo` directly
+  against one that goes through `query-seq` and materialises {:s :p :o}, same
+  query, answers asserted equal. That splits the 11.4x into 'how the engine
+  reads' and 'everything else', and it is the last decomposition available before
+  the remainder has to be attacked in the engine itself."}

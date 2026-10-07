@@ -1,0 +1,18 @@
+{:receipt/type :ldbc-snb-interactive-network-iteration
+ :iteration 44
+ :date "2026-09-12"
+ :benchmark :ldbc-snb-interactive-network-v2
+ :s23b-ic05
+ {:loaded "forum_hasMember_person (1,611,869 rows) reified as INS5 reifies a membership: mb:<forum>:<person> with membership/forum, membership/person, membership/joinDate -- one shape for loaded and streamed memberships. SUT: 25,405,564 quads, 6,161 MB used heap after gc (was 20.6M / 5.2 GB)"
+  :served {:datalog "kb-ic05: two reaches (friends; friends-of-friends excluding self) as [forum post] pairs -- post by ?x, its forum ?f, the membership reached by its DERIVED id `(str \"mb:\" ?f \":\" ?x)` (a function clause, one point lookup per pair), joinDate > minDate -- unioned and counted per forum, top 20 by count desc / forum asc"
+           :index-twin "kb-ic05-index: the same walk by hand"
+           :gate {:checked 4780 :disagreements 0 :ic05-params 99}}
+  :cost {:first-parameter {:datalog-ms [2302 2714 2456] :twin-ms [690 668 685] :answer-rows 0}
+         :reading "2.4 s in Datalog, 0.68 s hand-written, for ~2,200 reached persons x ~300 posts each: every post of every reached person is a candidate before the membership date filters it. IC05's empty answer for this parameter is real: its minDate (2012-09-27) lies after the last loaded date (2012-09-13); the joins it asks about arrive in the INS5 stream"}
+  :decision "IC05 is served and gated but NOT admitted to the measured mix: at 2.4 s per query it fails the 95% rule at any rate. Admitting it needs a plan that starts from memberships joined after minDate (a value range on membership/joinDate) and a way to reach posts by (creator, forum) without walking every post of the creator -- a composite index (S35)."}
+ :row-restated {:inflight 64 :sut-threads 16 :reads-rate 3328 :on-time-pct 100.0 :throughput-ops-s 4631.8 :next-rate 3712 :next-on-time-pct 49.2
+                :note "the 11-op mix with memberships now resident in the SUT: 4801.5 -> 4631.8 (-3.5%) for +4.8M quads and +1 GB of live heap. The row stands at this number from here on; the loader keeps memberships because INS5 now lands on a real population"
+                :receipt "2026-09-12-ldbc-snb-network-iteration-44-full-sf1-64slots-with-memberships.edn"}
+ :sut {:host "levi (M4: 4P+6E)" :threads 16 :quads 25405564 :gate {:checked 4780 :disagreements 0} :resident {:heap-used-mb 6340 :rss-mb 10358 :swap-used-pct 33.0}}
+ :not-an-ldbc-score "SF1 is below the audited table; 11 of 21 reads in the mix (IC05 served, not mixed); no ACID suite; no auditor."
+ :seeds [:s35-ic05-plan-from-memberships-and-a-creator-forum-index :m4-owner-decision-a-host :s34-bindings-as-arrays :m3-sf3]}

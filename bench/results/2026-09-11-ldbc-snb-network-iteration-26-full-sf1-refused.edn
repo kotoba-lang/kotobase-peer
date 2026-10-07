@@ -1,0 +1,336 @@
+{:schema 1,
+ :date "2026-09-11",
+ :memory
+ {:jvm "-Xmx14500m -Xmn1g -XX:+UseParallelGC on a 16 GiB host",
+  :sut-reported
+  {:heap-used-mb 10954,
+   :heap-max-mb 14163,
+   :rss-mb 8476,
+   :swap-total-mib 8192,
+   :swap-used-mib 6614,
+   :swap-used-pct 80.7},
+  :host
+  "macOS created an 8 GB swap file for the JVM (swap total was 0 all day); 1.0M pages in the compressor; 3.8M page-ins by the time of the probe",
+  :bytes-per-quad-on-this-shape
+  "used heap after the gate 10.9 GB / 20.57M quads = ~530 B per quad -- the 337 B measured on the 2M-quad subset (iteration 24) does not extrapolate: message content strings (3.06M of them) and 3M-entry index maps weigh more per quad than the reified knows that dominated the subset"},
+ :what-this-is-not ["Not a throughput row." "Not an LDBC score."],
+ :iteration 26,
+ :benchmark
+ "kotoba-lang/ayatori bench/benchmark.edn :ldbc-snb-interactive-network-v2 -- rung SF1 proper, origin :cross-host path :lan; NOT a row",
+ :receipt/type :ldbc-snb-rung-full-sf1-refused,
+ :gate
+ {:with-the-ic09-fix {:checked 1082, :disagreements 0},
+  :duration
+  "faster twins (this iteration): by-avet reads arrangement.core/by-predicate-value and top-k-by keeps a bounded 20 -- IC09 twin 1,082 -> 217 ms per parameter on the subset; the full-SF1 gate finished inside the load wait instead of ~30 minutes",
+  :first-run-with-old-twins
+  "old gen 100% full (9,088,000K of 9,088,000K) after a forced GC, 295% CPU in GC, gate crawling -- killed"},
+ :probe
+ {:driver
+  "levi over the LAN, 11-op mix, official SF1 parameters + 99 full-SF1 messages",
+  :runs
+  [{:on-time 960,
+    :server-ms
+    {:ic02
+     {:n 88,
+      :p50 105.304208,
+      :p95 145.255166,
+      :p99 198.531375,
+      :max 198.531375},
+     :ic07
+     {:n 88,
+      :p50 25.938292,
+      :p95 118.350292,
+      :p99 190.9515,
+      :max 190.9515},
+     :ic08
+     {:n 88,
+      :p50 0.37025,
+      :p95 1.277833,
+      :p99 1.870209,
+      :max 1.870209},
+     :ic09
+     {:n 87,
+      :p50 81.9645,
+      :p95 140.961667,
+      :p99 181.017584,
+      :max 181.017584},
+     :is1
+     {:n 87,
+      :p50 0.17025,
+      :p95 0.416417,
+      :p99 0.679333,
+      :max 0.679333},
+     :is2
+     {:n 87,
+      :p50 21.006834,
+      :p95 78.273958,
+      :p99 93.342334,
+      :max 93.342334},
+     :is3
+     {:n 87,
+      :p50 5.997041,
+      :p95 16.464167,
+      :p99 32.164041,
+      :max 32.164041},
+     :is4
+     {:n 87, :p50 0.104375, :p95 0.2865, :p99 0.348791, :max 0.348791},
+     :is5
+     {:n 87,
+      :p50 0.098792,
+      :p95 0.255708,
+      :p99 0.339584,
+      :max 0.339584},
+     :is6
+     {:n 87,
+      :p50 0.114292,
+      :p95 0.33375,
+      :p99 0.644417,
+      :max 0.644417},
+     :is7
+     {:n 87,
+      :p50 0.094042,
+      :p95 0.298709,
+      :p99 0.360958,
+      :max 0.360958}},
+    :completed 960,
+    :latency-ms
+    {:ic02
+     {:n 88,
+      :p50 111.04999999999927,
+      :p95 149.570916,
+      :p99 209.891833,
+      :max 209.891833},
+     :ic07
+     {:n 88,
+      :p50 29.42066700000032,
+      :p95 122.24012500000026,
+      :p99 195.19624999999996,
+      :max 195.19624999999996},
+     :ic08
+     {:n 88,
+      :p50 4.008832999999868,
+      :p95 6.169041000000021,
+      :p99 11.311290999999983,
+      :max 11.311290999999983},
+     :ic09
+     {:n 87,
+      :p50 86.08674999999994,
+      :p95 145.05829100000028,
+      :p99 185.38825000000003,
+      :max 185.38825000000003},
+     :is1
+     {:n 87,
+      :p50 3.731166999999914,
+      :p95 6.46066699999983,
+      :p99 36.84008300000005,
+      :max 36.84008300000005},
+     :is2
+     {:n 87,
+      :p50 25.127082999999402,
+      :p95 82.71466699999928,
+      :p99 98.42566699999998,
+      :max 98.42566699999998},
+     :is3
+     {:n 87,
+      :p50 10.884458999999879,
+      :p95 23.755750000000035,
+      :p99 50.54029199999968,
+      :max 50.54029199999968},
+     :is4
+     {:n 87,
+      :p50 3.3244580000000497,
+      :p95 17.34729200000038,
+      :p99 29.526583000000755,
+      :max 29.526583000000755},
+     :is5
+     {:n 87,
+      :p50 3.340041999999812,
+      :p95 5.356167000000028,
+      :p99 17.108125000000655,
+      :max 17.108125000000655},
+     :is6
+     {:n 87,
+      :p50 3.4932500000013533,
+      :p95 4.155457999999953,
+      :p99 6.999832999999853,
+      :max 6.999832999999853},
+     :is7
+     {:n 87,
+      :p50 3.491541999999754,
+      :p95 4.286583000000064,
+      :p99 5.218124999999986,
+      :max 5.218124999999986}},
+    :empty-answers 74,
+    :throughput 63.72019947251612,
+    :inflight 8,
+    :rate 64,
+    :seconds 15,
+    :rows-mean 55.626041666666666,
+    :scheduled 960,
+    :pass true,
+    :on-time-pct 100,
+    :start-delay-ms
+    {:n 960,
+     :p50 0.7153750000002219,
+     :p95 1.473707999999533,
+     :p99 8.12329200000022,
+     :max 10.851208000000042},
+    :failed 0}
+   {:on-time 771,
+    :server-ms
+    {:ic02
+     {:n 350,
+      :p50 161.402541,
+      :p95 199.699125,
+      :p99 218.858125,
+      :max 226.23675},
+     :ic07
+     {:n 349,
+      :p50 36.663917,
+      :p95 140.310667,
+      :p99 206.003708,
+      :max 225.608625},
+     :ic08
+     {:n 349,
+      :p50 0.657458,
+      :p95 2.21275,
+      :p99 11.040208,
+      :max 21.781584},
+     :ic09
+     {:n 349,
+      :p50 129.86175,
+      :p95 196.61275,
+      :p99 216.185959,
+      :max 235.823625},
+     :is1
+     {:n 349, :p50 0.290667, :p95 0.397292, :p99 0.548, :max 9.165917},
+     :is2
+     {:n 349,
+      :p50 35.811,
+      :p95 116.007875,
+      :p99 140.498167,
+      :max 163.285917},
+     :is3
+     {:n 349,
+      :p50 9.448666,
+      :p95 22.095417,
+      :p99 29.753792,
+      :max 33.428125},
+     :is4
+     {:n 349,
+      :p50 0.174583,
+      :p95 0.242125,
+      :p99 0.551083,
+      :max 8.893917},
+     :is5
+     {:n 349,
+      :p50 0.184833,
+      :p95 0.242417,
+      :p99 0.298875,
+      :max 0.511167},
+     :is6
+     {:n 349,
+      :p50 0.231458,
+      :p95 0.3185,
+      :p99 0.513166,
+      :max 11.102625},
+     :is7
+     {:n 349,
+      :p50 0.198833,
+      :p95 0.444042,
+      :p99 0.595333,
+      :max 8.496667}},
+    :completed 3840,
+    :latency-ms
+    {:ic02
+     {:n 350,
+      :p50 165.80958300000202,
+      :p95 204.13329200000226,
+      :p99 222.2998750000006,
+      :max 236.38750000000073},
+     :ic07
+     {:n 349,
+      :p50 38.836749999998574,
+      :p95 147.35849999999482,
+      :p99 207.8852079999997,
+      :max 229.27941700000156},
+     :ic08
+     {:n 349,
+      :p50 3.445625000000291,
+      :p95 12.175999999999476,
+      :p99 15.777500000000146,
+      :max 24.572582999997394},
+     :ic09
+     {:n 349,
+      :p50 135.41454199999862,
+      :p95 199.0253330000014,
+      :p99 221.4468340000003,
+      :max 239.04791599999953},
+     :is1
+     {:n 349,
+      :p50 2.9580410000016855,
+      :p95 6.467458000000988,
+      :p99 13.21666599999844,
+      :max 17.509833999996772},
+     :is2
+     {:n 349,
+      :p50 39.34216600000218,
+      :p95 120.93716700000004,
+      :p99 146.45308300000033,
+      :max 166.55125000000044},
+     :is3
+     {:n 349,
+      :p50 13.864667000001646,
+      :p95 27.303125000002183,
+      :p99 34.284709000001385,
+      :max 38.36700000000019},
+     :is4
+     {:n 349,
+      :p50 3.184124999999767,
+      :p95 11.449667000000773,
+      :p99 14.235000000000582,
+      :max 17.70270800000071},
+     :is5
+     {:n 349,
+      :p50 2.9902079999992566,
+      :p95 12.155625000003056,
+      :p99 16.793375000001106,
+      :max 18.402750000001106},
+     :is6
+     {:n 349,
+      :p50 2.977708000002167,
+      :p95 11.935207999995328,
+      :p99 15.57395799999722,
+      :max 21.430959000001167},
+     :is7
+     {:n 349,
+      :p50 2.7662079999972775,
+      :p95 10.933917000002111,
+      :p99 14.989458000000013,
+      :max 21.16545799999949}},
+    :empty-answers 303,
+    :throughput 201.07167713433952,
+    :inflight 8,
+    :rate 256,
+    :seconds 15,
+    :rows-mean 54.766666666666666,
+    :scheduled 3840,
+    :pass false,
+    :on-time-pct 20.078125,
+    :start-delay-ms
+    {:n 3840,
+     :p50 1998.2038330000032,
+     :p95 3884.2833329999994,
+     :p99 4002.3858330000003,
+     :max 4028.0989580000023},
+    :failed 0}],
+  :read
+  "rate 64: 100% on-time but IC02 111 ms, IC09 86 ms, IS2 25 ms (3.4 / 5.6 / 2.8 on the resident subset); empty share 7.7% (the subset's 33-43% was the subset); rate 256 fails at 20% on-time. A paging SUT, measured through paging -- iteration 14's shape on the SUT side."},
+ :verdict
+ "REFUSED-HOST-MEMORY. Full SF1 loads, builds and passes the 1,082-parameter gate on this host, and cannot be served resident from 16 GiB at ~530 B per quad. M3's wall is here: a rung above the subset needs either a host with ~24 GB free for this heap shape or a smaller footprint (content strings off-heap or interned, or the persisted plane).",
+ :driver-rule
+ {:before "refuse when SUT rss < 0.5 x used heap",
+  :after
+  "refuse when SUT rss < 0.95 x used heap (a resident JVM's RSS exceeds its used heap)",
+  :control
+  "the full-SF1 SUT is now refused: rss 8259 MB below used heap 11014 MB"}}

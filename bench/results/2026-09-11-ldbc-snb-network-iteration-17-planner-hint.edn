@@ -1,0 +1,285 @@
+{:mechanism
+ {:in-process-timing-35k-subset-official-persons
+  {:ic08
+   {:empty-answer-ms 61.1, :nonempty-answer-ms 2.2, :n 12, :empty 7},
+   :ic09 {:empty-answer-ms 163.7, :n 12, :empty 12},
+   :ic02 {:empty-answer-ms 2.5, :nonempty-answer-ms 8.1},
+   :ic07 {:nonempty-answer-ms 1.7},
+   :planner-ms 2},
+  :cause
+  "kotobase-peer.core/datalog-query-plan hands datalog.core the estimate of each clause AFTER :in inputs are substituted; datalog.core reads :clause-cardinality as the size of the BROAD relation its hash join would scan. For IC08 clause 0 `[?msg hasCreator ?person]` with a person who has no message the estimate is 0, the budget reads 0 <= 4 x 1 group as a tiny relation, and hash-join-rows scans and group-bys all 86,932 hasCreator rows to find nothing.",
+  :first-fix-measured-and-rejected
+  "estimating the broad relation for input-narrowed clauses costs ~10 ms per clause on that relation (reduce over 86,932 subject buckets): IC08 non-empty 2.2 -> 13.0 ms, IC02 2.5 -> 7.4. Rejected.",
+  :fix
+  "the hint is WITHHELD for input-narrowed clauses; the executor takes its documented default, the keyed path, which is right when one binding pins the key. kotobase-peer.core/datalog-query-plan :input-narrowed?",
+  :warmup-lesson
+  "a 2-pass warm-up read the fix as 4x WORSE on non-empty IC08 (2.1 -> 9.9) and IC02 (2.8 -> 8.9); 12 passes + p50 of 7 repeats showed both unchanged. A/B numbers taken from a cold JIT compare compilers, not code.",
+  :test
+  "plan_cardinality_test/an-input-narrowed-clause-is-withheld-from-the-hint -- fails on the previous planner at 2 assertions, passes now; suite 260 tests / 791 assertions / 0 failures"},
+ :schema 1,
+ :date "2026-09-11",
+ :in-process-after
+ {:ic08 {:empty-answer-ms 2, :nonempty-answer-ms 2.1},
+  :ic02 {:empty 2.4, :nonempty 8.3},
+  :ic07 1.5,
+  :ic09-empty 162.7},
+ :prediction-before-network-run
+ "IC08 served -> ~rtt; IC09 unchanged ~295; throughput at 8 slots 90-100, IC09-bound",
+ :question
+ "iteration 16 seed S5: make the Datalog path pay what the index path pays. Where does the Datalog IC08 spend 128 ms served / 60 ms in-process?",
+ :what-this-is-not ["Not an LDBC score." "Not hardware-normalised."],
+ :iteration 17,
+ :benchmark
+ "kotoba-lang/ayatori bench/benchmark.edn :ldbc-snb-interactive-network-v2 (rung SF1 subset 35k posts, origin :cross-host, mix IC02/07/08/09, impl :datalog)",
+ :result
+ {:throughput-ops-s 93.9,
+  :rate 96,
+  :previous 62.4,
+  :p50-ms {:ic02 15.3, :ic07 13.7, :ic08 14.5, :ic09 293.1},
+  :next-failed
+  {:rate 128, :on-time-pct 19.22, :throughput-at-failure 99.3}},
+ :receipt/type :ldbc-snb-interactive-network,
+ :origin
+ {:kind :cross-host,
+  :sut "simeon (fleet mac-mini, swap off), JDK 26, -Xmx8g, 8 threads",
+  :driver "this workstation over Tailscale, rtt ~10-14 ms"},
+ :sut
+ {:quads 810221,
+  :ready true,
+  :max-date 1347528903591,
+  :load-ms 7165.481875,
+  :host-memory
+  {:heap-used-mb 1935,
+   :heap-max-mb 8192,
+   :rss-mb 4416,
+   :swap-total-mib 0,
+   :swap-used-mib 0,
+   :swap-used-pct 0,
+   :host "simeonnoMac-mini.local"},
+  :elements
+  {:persons 9892,
+   :knows-edges 180623,
+   :messages 86932,
+   :posts 35000,
+   :comments 51932,
+   :has-creator 86932,
+   :reply-of 51932,
+   :likes 38821},
+  :build-ms 746.49175,
+  :threads 8,
+  :index-path
+  {:enabled true,
+   :checked 392,
+   :disagreements 0,
+   :first-disagreement nil},
+  :subset-rule
+  "all persons + all knows; 35000 most recent Posts + full transitive reply trees; hasCreator for included Messages; likes onto included Messages",
+  :implementation
+  "kotobase-peer.ldbc-snb-net over kotobase-peer.ldbc-snb-bench",
+  :dataset
+  "LDBC SNB Interactive v1, SF1, Datagen v1.0.0, CsvComposite/LongDateFormatter"},
+ :reading
+ ["IC08 served 128.1 -> 14.5 ms (the rtt); IC02/IC07 unchanged at the rtt; IC09 unchanged at 213-293 ms. Throughput 62.4 -> 93.9 ops/s with rung, origin, mix, inflight and impl held: growth on the Datalog column, 1.5x."
+  "What remains on the Datalog path is IC09 alone: every one of the 12 official IC09 parameters is an EMPTY answer on this subset and each costs ~164 ms in-process -- the two-hop join materialises friend-of-friend x messages and the harness applies the maxDate filter afterwards. The engine has fuse-value-ranges (a range clause from `[?m date ?d] [(< ?d max)]`); the harness does not use it. That is seed S7."],
+ :arms
+ {:datalog-inflight-8
+  [{:on-time 1280,
+    :server-ms
+    {:ic02
+     {:n 320,
+      :p50 3.623333,
+      :p95 5.695542,
+      :p99 12.175166,
+      :max 21.611334},
+     :ic07
+     {:n 320, :p50 1.843625, :p95 4.127041, :p99 6.07, :max 19.111},
+     :ic08
+     {:n 320,
+      :p50 2.409875,
+      :p95 4.446583,
+      :p99 5.356208,
+      :max 19.000083},
+     :ic09
+     {:n 320,
+      :p50 202.496292,
+      :p95 229.527125,
+      :p99 242.579125,
+      :max 258.049625}},
+    :completed 1280,
+    :latency-ms
+    {:ic02
+     {:n 320,
+      :p50 14.742874999999913,
+      :p95 26.103417000000036,
+      :p99 46.2972920000002,
+      :max 78.65737499999977},
+     :ic07
+     {:n 320,
+      :p50 12.178249999997206,
+      :p95 24.78595800000039,
+      :p99 30.885957999999846,
+      :max 63.731166999999914},
+     :ic08
+     {:n 320,
+      :p50 12.506499999999505,
+      :p95 23.41437500000029,
+      :p99 44.613499999999476,
+      :max 49.336999999999534},
+     :ic09
+     {:n 320,
+      :p50 213.52929099999983,
+      :p95 241.0840000000003,
+      :p99 255.42916700000023,
+      :max 268.21579199999996}},
+    :empty-answers 568,
+    :throughput 63.346799348655395,
+    :inflight 8,
+    :rate 64,
+    :seconds 20,
+    :rows-mean 8.11328125,
+    :scheduled 1280,
+    :pass true,
+    :on-time-pct 100,
+    :start-delay-ms
+    {:n 1280,
+     :p50 0.6114999999999782,
+     :p95 1.1665000000002692,
+     :p99 1.7019579999996495,
+     :max 3.945625000000291},
+    :failed 0}
+   {:on-time 1920,
+    :server-ms
+    {:ic02
+     {:n 480,
+      :p50 5.309208,
+      :p95 7.519458,
+      :p99 23.7135,
+      :max 27.680875},
+     :ic07
+     {:n 480,
+      :p50 3.618916,
+      :p95 5.112125,
+      :p99 21.212542,
+      :max 40.994958},
+     :ic08
+     {:n 480,
+      :p50 4.516666,
+      :p95 6.036333,
+      :p99 29.812625,
+      :max 42.858666},
+     :ic09
+     {:n 480,
+      :p50 282.410458,
+      :p95 343.852959,
+      :p99 380.63525,
+      :max 444.952542}},
+    :completed 1920,
+    :latency-ms
+    {:ic02
+     {:n 480,
+      :p50 15.309291999998095,
+      :p95 29.109833000002254,
+      :p99 43.76787500000137,
+      :max 77.4342089999991},
+     :ic07
+     {:n 480,
+      :p50 13.685750000000553,
+      :p95 24.75695800000176,
+      :p99 41.98020800000086,
+      :max 89.31412499999715},
+     :ic08
+     {:n 480,
+      :p50 14.456125000000611,
+      :p95 29.644250000001193,
+      :p99 44.67762500000026,
+      :max 53.19908299999952},
+     :ic09
+     {:n 480,
+      :p50 293.08729200000016,
+      :p95 354.6499580000018,
+      :p99 414.1665420000063,
+      :max 456.2115830000039}},
+    :empty-answers 833,
+    :throughput 93.88559948018182,
+    :inflight 8,
+    :rate 96,
+    :seconds 20,
+    :rows-mean 8.271875,
+    :scheduled 1920,
+    :pass true,
+    :on-time-pct 100,
+    :start-delay-ms
+    {:n 1920,
+     :p50 31.809292000001733,
+     :p95 296.29137533333414,
+     :p99 336.80929200000537,
+     :max 365.24858333333395},
+    :failed 0}
+   {:on-time 492,
+    :server-ms
+    {:ic02
+     {:n 640,
+      :p50 5.339958,
+      :p95 7.47125,
+      :p99 17.878167,
+      :max 29.986875},
+     :ic07
+     {:n 640,
+      :p50 3.676083,
+      :p95 5.015459,
+      :p99 25.718875,
+      :max 35.372042},
+     :ic08
+     {:n 640,
+      :p50 4.529709,
+      :p95 5.529292,
+      :p99 27.733667,
+      :max 37.547958},
+     :ic09
+     {:n 640,
+      :p50 282.448542,
+      :p95 327.284209,
+      :p99 346.18175,
+      :max 362.643417}},
+    :completed 2560,
+    :latency-ms
+    {:ic02
+     {:n 640,
+      :p50 15.063333999998576,
+      :p95 21.131124999999884,
+      :p99 39.03470799999923,
+      :max 66.65145800000028},
+     :ic07
+     {:n 640,
+      :p50 13.452958000001672,
+      :p95 20.55145800000173,
+      :p99 36.693749999998545,
+      :max 48.46274999999878},
+     :ic08
+     {:n 640,
+      :p50 14.10662500000035,
+      :p95 25.237666999993962,
+      :p99 41.37275000000227,
+      :max 56.41745799999626},
+     :ic09
+     {:n 640,
+      :p50 293.4796669999996,
+      :p95 338.2119160000002,
+      :p99 356.1659579999978,
+      :max 372.3687090000021}},
+    :empty-answers 1119,
+    :throughput 99.25519989803713,
+    :inflight 8,
+    :rate 128,
+    :seconds 20,
+    :rows-mean 8.203515625,
+    :scheduled 2560,
+    :pass false,
+    :on-time-pct 19.21875,
+    :start-delay-ms
+    {:n 2560,
+     :p50 2730.512125000001,
+     :p95 5211.727334000003,
+     :p99 5499.364000000001, 
+     :max 5545.560584000006}, 
+    :failed 0}]}}

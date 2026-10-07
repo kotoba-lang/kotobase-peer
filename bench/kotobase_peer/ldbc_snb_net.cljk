@@ -1,0 +1,345 @@
+(ns kotobase-peer.ldbc-snb-net
+  "The LDBC SNB Interactive complex reads IC02 / IC07 / IC08 / IC09 served
+  OVER THE NETWORK from kotobase's hot db, so that a driver in another
+  process can measure them the way the benchmark defines the metric --
+  throughput (ops/s) at a schedule, with the 95% on-time requirement --
+  instead of the way `ldbc-snb-bench` measures them (elapsed nanoseconds
+  around an in-JVM function call).
+
+  Owner instruction 2026-09-11: the benchmark is LDBC SNB Interactive, the
+  target is the audited world No.1, and it is measured over the network.
+  This namespace is the system-under-test side of that; the driver is
+  `bench/ldbc_snb_driver.cljk` (nbb). Both are deliberately small: a JDK
+  `HttpServer` on loopback and a scheduled `fetch`. What they measure is
+  kotobase's query engine plus one HTTP hop, which is the smallest thing
+  that is still a network measurement. A cross-host run (fleet mac-mini) and
+  the live Worker are the same driver against a different origin.
+
+  Data and queries are `ldbc-snb-bench`'s, reached through their vars the way
+  `ic09-diag` / `scan-instrument` already do -- the same deterministic SF1
+  subset, the same four Datalog queries, the same harness-side top-20. So
+  the correctness gate that namespace holds (answers asserted equal to
+  Neo4j's) applies to what is served here byte for byte; this file adds no
+  query logic of its own.
+
+  Routes (EDN in, EDN out):
+    GET  /ldbc/meta            -> {:ready true :elements .. :quads .. :max-date ..}
+    POST /ldbc/ic  {:op ic02 :person id [:max-date n]}
+                               -> {:rows [..] :n count :server-ms x}
+  A request the server cannot answer is a 4xx/5xx with an EDN body, never a
+  200 with an empty vector -- an empty answer and a failed answer must not
+  look alike to the driver (the join-hazard lesson, root ADR-2609109900).
+
+  The SUT reports its OWN residency in /ldbc/meta (:host-memory: JVM heap
+  used, process RSS, host swap). Iteration 14 measured the same query at
+  1.9 ms in-process and 96-310 ms served because the serving JVM was paged
+  out; the driver could only see its own host. With the SUT saying what it
+  looks like, the driver refuses on the SUT's swap, not the driver's, and a
+  cross-host run is judged by the right machine.
+
+  Usage: kbb -M:ldbc-snb-net <ldbc-dynamic-dir> [posts] [port] [threads] [bind-host] [params-dir]
+  `params-dir` (substitution_parameters-sf<N>) enables the `:impl :index`
+  path: at startup every official parameter for IC02/07/08/09 is answered
+  both ways and the index path is served only if all of them agree."
+  (:require [kotoba.lang.error :as kerror] [kotoba.bytes :as kbytes] [kotobase-peer.ldbc-snb-bench :as ldbc]
+            [kotobase-peer.core :as eng]
+            [datalog.index :as index]
+            [kotoba.lang.edn :as edn]
+            [kotoba.lang.text]
+            [clojure.java.io])
+  (:import [com.sun.net.httpserver HttpServer HttpHandler HttpExchange]
+           [java.net InetSocketAddress]
+           [java.util.concurrent Executors]))
+
+(defn- sh [& args]
+  (try (let [p (.start (ProcessBuilder. ^java.util.List (vec args)))
+             out (slurp (.getInputStream p))]
+         (.waitFor p) (kotoba.lang.text/trim out))
+       (catch Throwable _ nil)))
+
+(defn- host-memory
+  "Heap used (JVM), RSS (ps), host swap (macOS sysctl; nil elsewhere). RSS far
+  below heap-used is the paged-out signature iteration 14 found."
+  []
+  ;; used heap is read AFTER a collection so it is the live set: garbage
+  ;; pages the host has compressed (macOS compresses idle pages proactively;
+  ;; levi held 250k pages in its compressor with 8 GB free) made RSS fall
+  ;; below a garbage-inflated used heap and refused a resident SUT
+  ;; (iteration 32). Live objects are touched by the collector and are
+  ;; resident when it returns; RSS against live heap is the real test.
+  (System/gc)
+  (let [rt (Runtime/getRuntime)
+        pid (str (.pid (java.lang.ProcessHandle/current)))
+        rss-kb (some-> (sh "ps" "-o" "rss=" "-p" pid) parse-long)
+        swap (sh "sysctl" "-n" "vm.swapusage")
+        num (fn [k] (some->> swap (re-find (re-pattern (str k " = ([0-9.]+)M"))) second parse-double))
+        st (num "total") su (num "used")]
+    {:heap-used-mb (quot (- (.totalMemory rt) (.freeMemory rt)) 1048576)
+     :heap-max-mb (quot (.maxMemory rt) 1048576)
+     :rss-mb (when rss-kb (quot rss-kb 1024))
+     :swap-total-mib st :swap-used-mib su
+     ;; no swap file at all is 0% used, not unknown -- a host with swap off
+     ;; must not fall through to the driver's own reading
+     :swap-used-pct (cond (and st su (pos? st)) (* 100.0 (/ su st))
+                          (and st (zero? st)) 0.0
+                          :else nil)
+     :host (sh "hostname")}))
+
+(defn- respond! [^HttpExchange ex status ^String body]
+  (let [bytes (kbytes/utf8-bytes body)]
+    (.add (.getResponseHeaders ex) "content-type" "application/edn; charset=utf-8")
+    (.sendResponseHeaders ex status (alength bytes))
+    (with-open [os (.getResponseBody ex)]
+      (.write os bytes))))
+
+(defn- read-body [^HttpExchange ex]
+  (with-open [is (.getRequestBody ex)]
+    (slurp is :encoding "UTF-8")))
+
+(defn- answer
+  "Dispatch one IC read. `:impl :datalog` (default) is the Datalog join;
+  `:impl :index` is the index-path twin (ldbc-snb-bench, iteration 16),
+  served only if `index-path-agrees?` held at startup on the official
+  parameters -- otherwise 409, never a different answer with a 200."
+  [db max-date index-ok? {:keys [op person message impl] :as req}]
+  (let [person (some-> person str)
+        message (some-> message str)
+        md (long (or (:max-date req) max-date))
+        impl (keyword (name (or impl :datalog)))]
+    (when (and (= impl :index) (not index-ok?))
+      (throw (ex-info "index path refused: it disagreed with the Datalog path at startup" {:status 409 :impl impl})))
+    (case [impl (keyword (name op))]
+      [:datalog :ic02] (#'ldbc/kb-ic02 db person md)
+      [:datalog :ic07] (#'ldbc/kb-ic07 db person)
+      [:datalog :ic08] (#'ldbc/kb-ic08 db person)
+      [:datalog :ic09] (#'ldbc/kb-ic09 db person md)
+      [:datalog :ic05] (#'ldbc/kb-ic05 db person (long (:min-date req)))
+      [:index :ic05] (#'ldbc/kb-ic05-index db person (long (:min-date req)))
+      [:index :ic02] (#'ldbc/kb-ic02-index db person md)
+      [:index :ic07] (#'ldbc/kb-ic07-index db person)
+      [:index :ic08] (#'ldbc/kb-ic08-index db person)
+      [:index :ic09] (#'ldbc/kb-ic09-index db person md)
+      ;; S29 (ayatori iteration 38): the HTTP layer's cost per request, measured
+      ;; by an op that does nothing -- the same route, parse and response shape
+      [:datalog :noop] []
+      [:index :noop] []
+      [:datalog :is2] (#'ldbc/kb-is2 db person)
+      [:datalog :is4] (#'ldbc/kb-is4 db message)
+      [:datalog :is5] (#'ldbc/kb-is5 db message)
+      [:datalog :is7] (#'ldbc/kb-is7 db message)
+      [:datalog :is1] (#'ldbc/kb-is1 db person)
+      [:datalog :is3] (#'ldbc/kb-is3 db person)
+      [:datalog :is6] (#'ldbc/kb-is6 db message)
+      [:index :is1] (#'ldbc/kb-is1-index db person)
+      [:index :is3] (#'ldbc/kb-is3-index db person)
+      [:index :is6] (#'ldbc/kb-is6-index db message)
+      [:index :is2] (#'ldbc/kb-is2-index db person)
+      [:index :is4] (#'ldbc/kb-is4-index db message)
+      [:index :is5] (#'ldbc/kb-is5-index db message)
+      [:index :is7] (#'ldbc/kb-is7-index db message)
+      (throw (ex-info "unknown op or impl" {:status 400 :op op :impl impl})))))
+
+(defn- update-datoms
+  "The datoms one LDBC insert asserts, in this harness's data model.
+  INS2 (a person likes a post): the like reified as in the loader.
+  INS8 (a friendship): `knows` both ways plus the reified friendship date
+  both ways. All eight inserts are served since iteration 33 (INS4 without
+  its tags, INS5 without a covering read -- both stated in the receipt)."
+  [{:keys [op] :as req}]
+  (let [q (fn [s p o] {:s s :p p :o o})]
+    (case (keyword (name op))
+      :ins2 (let [{:keys [person post date]} req
+                  lid (str "like:" person ":" post)]
+              [(q lid "like/person" (str person)) (q lid "like/message" (str post)) (q lid "like/creationDate" (str date))])
+      :ins8 (let [{:keys [p1 p2 date]} req
+                  p1 (str p1) p2 (str p2)]
+              (into [(q p1 "knows" p2) (q p2 "knows" p1)]
+                    (for [[x y] [[p1 p2] [p2 p1]] :let [k (str "kn:" x ":" y)]
+                          d [(q k "knows/person" x) (q k "knows/friend" y) (q k "knows/creationDate" (str date))]] d)))
+      ;; INS1 (a person): the profile as the loader models it
+      :ins1 (let [{:keys [person first last gender birthday date ip browser city]} req
+                  p (str person)]
+              [(q p "person/firstName" first) (q p "person/lastName" last) (q p "person/gender" gender)
+               (q p "person/birthday" (str birthday)) (q p "person/creationDate" (str date))
+               (q p "person/locationIP" ip) (q p "person/browserUsed" browser) (q p "person/city" (str city))])
+      ;; INS3 (a person likes a comment): the same reified like as INS2
+      :ins3 (let [{:keys [person comment date]} req
+                  lid (str "like:" person ":" comment)]
+              [(q lid "like/person" (str person)) (q lid "like/message" (str comment)) (q lid "like/creationDate" (str date))])
+      ;; INS6 (a post) and INS7 (a comment replying to a post or a comment)
+      :ins6 (let [{:keys [post date content creator forum]} req
+                  m (str post)]
+              [(q m "message/creationDate" (str date)) (q m "message/content" (or content ""))
+               (q m "hasCreator" (str creator)) (q m "post/forum" (str forum))])
+      :ins7 (let [{:keys [comment date content creator parent]} req
+                  m (str comment)]
+              [(q m "message/creationDate" (str date)) (q m "message/content" (or content ""))
+               (q m "hasCreator" (str creator)) (q m "replyOf" (str parent))])
+      ;; INS4 (a forum) as the loader models it: title, creationDate, moderator.
+      ;; Its tags are not modelled anywhere in this harness (no read uses them)
+      ;; and are dropped here -- stated, not hidden.
+      :ins4 (let [{:keys [forum title date moderator]} req
+                  f (str forum)]
+              [(q f "forum/title" title) (q f "forum/creationDate" (str date)) (q f "forum/moderator" (str moderator))])
+      ;; INS5 (a person joins a forum): the membership reified with its join
+      ;; date, the shape `knows` and `like` already take. No served read
+      ;; covers memberships (IC05 would); the driver counts these as
+      ;; :no-covering-read, never as visible.
+      :ins5 (let [{:keys [person forum date]} req
+                  mb (str "mb:" forum ":" person)]
+              [(q mb "membership/forum" (str forum)) (q mb "membership/person" (str person)) (q mb "membership/joinDate" (str date))])
+      (throw (ex-info "insert not served" {:status 400 :op op})))))
+
+(defn- handler [meta db-ref max-date index-ok?]
+  (reify HttpHandler
+    (handle [_ ex]
+      (try
+        (let [path (.getPath (.getRequestURI ex))
+              method (.getRequestMethod ex)]
+          (cond
+            (and (= method "GET") (= path "/ldbc/meta"))
+            ;; the engine's maintained orders rebuild from scratch on a miss (seconds
+            ;; on the full SF1); the counts say whether a served run paid that
+            (respond! ex 200 (pr-str (-> meta (dissoc :updates) (assoc :host-memory (host-memory) :updates-applied @(:updates meta)
+                                                                       :order-rebuilds {:value (index/value-order-rebuild-count)
+                                                                                        :group (index/group-order-rebuild-count)}))))
+
+            (and (= method "POST") (= path "/ldbc/ic"))
+            (let [req (edn/read-string (read-body ex))
+                  ;; S31 (ayatori iteration 40): `:repeat n` answers the same
+                  ;; request n times in this thread and reports every time, so a
+                  ;; served-vs-in-process gap can be split into per-request
+                  ;; overhead and steady-state cost without a second JVM
+                  n (max 1 (or (:repeat req) 1))
+                  db @db-ref
+                  timings (mapv (fn [_] (let [t0 (System/nanoTime)
+                                              rows (answer db max-date index-ok? req)]
+                                          [(/ (- (System/nanoTime) t0) 1e6) rows]))
+                                (range n))
+                  [ms rows] (peek timings)]
+              (respond! ex 200 (pr-str (cond-> {:rows rows :n (count rows) :server-ms ms}
+                                         (> n 1) (assoc :repeat-ms (mapv first timings))))))
+
+            ;; M2, first step (ayatori iteration 30): the SUT transacts. One
+            ;; atom holds the db value; `swap!` with `eng/transact` is the
+            ;; single writer, and every read takes the value it finds -- a
+            ;; snapshot per read, no lock on the read path. The response
+            ;; carries what a read-after-write check needs (the post's
+            ;; creator for INS2), so the driver can verify the write landed.
+            (and (= method "POST") (= path "/ldbc/update"))
+            (let [req (edn/read-string (read-body ex))
+                  t0 (System/nanoTime)
+                  datoms (update-datoms req)
+                  db' (swap! db-ref eng/transact datoms)
+                  ms (/ (- (System/nanoTime) t0) 1e6)
+                  op (keyword (name (:op req)))
+                  creator (case op
+                            :ins2 (first (get (eng/entity db' (str (:post req))) "hasCreator"))
+                            :ins3 (first (get (eng/entity db' (str (:comment req))) "hasCreator"))
+                            nil)
+                  ;; INS8 to a person this SUT never received (the stream's INS1
+                  ;; persons are not served yet): the datoms land, but no read
+                  ;; that needs the friend's name can show them -- said so
+                  ;; known = has a name (a person record), not merely an entity: an
+                  ;; earlier INS8 in the same stream may have asserted `knows`
+                  ;; datoms onto a person INS1 never created here
+                  p2-known (when (= :ins8 op) (boolean (seq (get (eng/entity db' (str (:p2 req))) "person/firstName"))))
+                  ;; INS6: IS6 on the new post can show its forum only if the forum
+                  ;; is held (loaded, or created by INS4 in this stream) AND its
+                  ;; moderator is a person with a name -- both said, so the driver
+                  ;; verifies INS4 through the post that lands in the forum
+                  forum-known (when (= :ins6 op)
+                                (let [f (eng/entity db' (str (:forum req)))
+                                      m (first (get f "forum/moderator"))]
+                                  (boolean (and (seq (get f "forum/title")) m
+                                                (seq (get (eng/entity db' (str m)) "person/firstName"))))))]
+              (swap! (:updates meta) inc)
+              (respond! ex 200 (pr-str {:ok true :datoms (count datoms) :server-ms ms :creator creator :p2-known p2-known :forum-known forum-known})))
+
+            :else
+            (respond! ex 404 (pr-str {:error :no-such-route :path path}))))
+        (catch kerror/ExceptionInfo e
+          (respond! ex (or (:status (ex-data e)) 500)
+                    (pr-str {:error (ex-message e) :data (dissoc (ex-data e) :status)})))
+        (catch Throwable t
+          (respond! ex 500 (pr-str {:error (str (class t)) :message (ex-message t)})))))))
+
+(defn -main [& args]
+  (let [dir (or (first args)
+                (throw (ex-info "usage: kbb -M:ldbc-snb-net <ldbc-dynamic-dir> [posts] [port] [threads]" {})))
+        n-posts (parse-long (or (second args) "35000"))
+        port (parse-long (or (nth args 2 nil) "8090"))
+        threads (parse-long (or (nth args 3 nil) "8"))
+        bind-host (or (nth args 4 nil) "127.0.0.1")
+        params-dir (nth args 5 nil)
+        t0 (System/nanoTime)
+        data (#'ldbc/load-subset dir n-posts)
+        load-ms (/ (- (System/nanoTime) t0) 1e6)
+        t1 (System/nanoTime)
+        {:keys [db quads]} (#'ldbc/build-kotobase data)
+        build-ms (/ (- (System/nanoTime) t1) 1e6)
+        max-date (+ 1 (reduce max 0 (keep first (vals (:messages data)))))
+        elements {:persons (count (:persons data))
+                  :knows-edges (count (:knows data))
+                  :messages (count (:messages data))
+                  :posts (count (:post-ids data))
+                  :comments (count (:comment-ids data))
+                  :has-creator (count (:creator data))
+                  :reply-of (count (:reply-of data))
+                  :likes (count (:likes data))}
+        meta {:ready true
+              :implementation "kotobase-peer.ldbc-snb-net over kotobase-peer.ldbc-snb-bench"
+              :dataset "LDBC SNB Interactive v1, SF1, Datagen v1.0.0, CsvComposite/LongDateFormatter"
+              :subset-rule (str "all persons + all knows; " n-posts
+                                " most recent Posts + full transitive reply trees; "
+                                "hasCreator for included Messages; likes onto included Messages")
+              :elements elements
+              :quads quads
+              :max-date max-date
+              :load-ms load-ms
+              :build-ms build-ms
+              :threads threads
+              :warm-persons (#'ldbc/pick-persons data 5)}
+        params (when params-dir
+                 (into (vec (for [[op n] {:ic02 2 :ic05 5 :ic07 7 :ic08 8 :ic09 9}
+                                 line (rest (kotoba.lang.text/split-lines
+                                             (slurp (str params-dir "/interactive_" n "_param.txt"))))
+                                 :when (seq line)
+                                 :let [[pid md] (kotoba.lang.text/split line #"\|")]]
+                             (cond-> {:op op :person pid}
+                               (and md (= op :ic05)) (assoc :min-date (parse-long md))
+                               (and md (not= op :ic05)) (assoc :max-date (parse-long md)))))
+                       ;; short reads: IS2 takes the IC07 persons; IS4/5/7 take
+                       ;; short_message_param.txt (messages of this subset,
+                       ;; written by bench/ldbc_short_params.cljk) when present
+                       (let [mf (str params-dir "/short_message_param.txt")
+                             msgs (when (.exists (clojure.java.io/file mf))
+                                    (remove empty? (rest (kotoba.lang.text/split-lines (slurp mf)))))]
+                         (concat (for [line (rest (kotoba.lang.text/split-lines (slurp (str params-dir "/interactive_7_param.txt"))))
+                                       :when (seq line)]
+                                   {:op :is2 :person line})
+                                 (for [line (rest (kotoba.lang.text/split-lines (slurp (str params-dir "/interactive_7_param.txt"))))
+                                       :when (seq line) op [:is1 :is3]]
+                                   {:op op :person line})
+                                 (for [op [:is4 :is5 :is6 :is7] m msgs] {:op op :message m})))))
+        agreement (when params (#'ldbc/index-path-agrees? db max-date params))
+        index-ok? (boolean (and agreement (zero? (count (:disagreements agreement)))))
+        meta (assoc meta :index-path {:enabled index-ok?
+                                      :checked (:checked agreement)
+                                      :disagreements (count (:disagreements agreement))
+                                      :first-disagreement (first (:disagreements agreement))})
+        ;; backlog 1024, not the system default: at 128 driver slots the
+        ;; default dropped connections under the burst (iteration 20, 80 of
+        ;; 40,960 operations failed with fetch failed; the driver refused)
+        server (HttpServer/create (InetSocketAddress. ^String bind-host (int port)) 1024)]
+    ;; warm the engine on the same five high-degree persons the in-JVM
+    ;; harness warms on, so the first scheduled operation is not a JIT sample
+    (doseq [p (:warm-persons meta)]
+      (#'ldbc/kb-ic02 db p max-date) (#'ldbc/kb-ic07 db p)
+      (#'ldbc/kb-ic08 db p) (#'ldbc/kb-ic09 db p max-date))
+    (.createContext server "/" (handler (assoc meta :updates (atom 0)) (atom db) max-date index-ok?))
+    (.setExecutor server (Executors/newFixedThreadPool (int threads)))
+    (.start server)
+    (println (pr-str (assoc meta :listening (str "http://" bind-host ":" port) :host-memory (host-memory))))
+    (flush)
+    @(promise)))

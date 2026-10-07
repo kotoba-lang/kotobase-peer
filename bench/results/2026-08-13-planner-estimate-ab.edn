@@ -1,0 +1,58 @@
+{:schema 1
+ :date "2026-08-13"
+ :receipt/type :planner-estimate-ab
+ :implementation "kotobase-peer.ldbc-snb-bench, run twice with one line changed"
+
+ :question
+ "Does estimating clause cardinality from the covering indexes, instead of
+  counting it exactly, change the LDBC ratio against Neo4j?"
+
+ :method
+ "Same machine, same dataset, same harness, the two runs back to back. ONE line
+  differs: `datalog-query-plan`'s fallback estimate is `kqe/estimate-cardinality`
+  in arm A and `kqe/cardinality` in arm B. Both arms interleave kotobase and
+  Neo4j per sample inside one JVM, so `:paired-ratio` is the load-invariant
+  column -- which matters here, because the host was at load average ~26."
+
+ :why-an-ab-at-all
+ "The obvious comparison -- today's numbers against the 2026-08-02 receipt --
+  spans eleven days and many other changes, so it cannot attribute anything to
+  any of them. An A/B of one line can. Three findings earlier in this same line
+  of work were attributed by inference and were wrong; this one is not."
+
+ ;; kotobase-ms / neo4j-ms, computed per sample with the two engines run back to
+ ;; back, then summarised. Lower is better; 1.0 is parity.
+ :paired-p50-ratio
+ {:ic02 {:exact 16.281 :estimate 9.710}
+  :ic07 {:exact 2.464  :estimate 0.995}
+  :ic08 {:exact 11.398 :estimate 1.855}
+  :ic09 {:exact 12.549 :estimate 8.641}}
+
+ :absolute-p50-ms
+ {:arm-a-estimate {:kotobase {:ic02 47.529 :ic07 1.874 :ic08 2.648 :ic09 449.309}
+                   :neo4j    {:ic02 4.922  :ic07 1.168 :ic08 1.148 :ic09 46.991}}
+  :arm-b-exact    {:kotobase {:ic02 78.216 :ic07 3.104 :ic08 13.371 :ic09 613.472}
+                   :neo4j    {:ic02 4.804  :ic07 1.261 :ic08 1.173 :ic09 48.885}}
+  :note "Taken at load average ~26. Do not quote these; quote the paired ratio."}
+
+ :result
+ "Every query improves. IC07 reaches 0.995 -- parity with embedded Neo4j on that
+  query. IC08 improves most, 11.40x to 1.85x. The planning cost was a fixed
+  per-query tax, so it fell hardest on the cheapest queries, which is why the two
+  cheapest moved furthest."
+
+ :measured-cost-of-the-line
+ "On LDBC SF-0.1, `[_ \":label\" \"Message\"]` (286,744 rows): `cardinality`
+  96.393 ms, `estimate-cardinality` 0.0129 ms. Same number, 7,470x. In a separate
+  harness with the same fallback the PLAN cost 101 ms for a query whose execution
+  cost 2.3 ms."
+
+ :answers-agree "asserted true for all four queries in both arms, as the harness requires"
+
+ :non-claims
+ ["Not an LDBC score. Four Interactive Complex reads over a deterministic subset
+   of SF1, not the certified driver over the full workload with an auditor."
+  "Not a claim that kotobase is faster than Neo4j. Three of the four are still
+   slower -- IC02 by 9.7x and IC09 by 8.6x."
+  "The absolute milliseconds were taken on a loaded host and are recorded only so
+   the ratio can be rederived."]}

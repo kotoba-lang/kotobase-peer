@@ -1,0 +1,22 @@
+{:receipt/type :ldbc-snb-interactive-network-iteration
+ :iteration 43
+ :date "2026-09-12"
+ :benchmark :ldbc-snb-interactive-network-v2
+ :m4-host-survey {:question "is there a host in the fleet with more performance cores or memory than levi?"
+                  :hosts {:benjamin "Apple M4 4P+6E 16 GiB, a 2.0 GB comfyui python resident (fleet process)"
+                          :joseph "Apple M4 4P+6E 16 GiB, a 2.0 GB comfyui python resident"
+                          :simeon "Apple M4 4P+6E 16 GiB, a 2.0 GB comfyui python resident (the 8 GB python of iteration 26 is gone; not touched)"
+                          :levi "Apple M4 4P+6E 16 GiB (the SUT)" :judah "Apple M4 4P+6E 16 GiB (the driver)"
+                          :workstation "Apple M1 Max 8P+2E 32 GiB -- the owner's interactive machine: swap 13.1 of 14.3 GB used, load 15-30, 22 GB wired; not a valid SUT host"}
+                  :answer "no. Every fleet node is the same M4 mini. M4 (the hardware milestone) needs a machine the fleet does not have: a decision for the owner, not an experiment."}
+ :s26-full-data-parameters {:what "the IC parameter files were the official LDBC SF1 substitution parameters already (99 rows each); only the short-read message ids were subset-derived (100 of the most recent posts). Now 999 message ids spread across ALL 1,003,605 posts (bench/ldbc_short_params.cljk over the full post file), and the SUT gates on that set"
+                            :gate {:checked 4682 :disagreements 0}
+                            :file "2026-09-12-ldbc-short-message-params-full-sf1.txt"}
+ :residency-note "an idle SUT on macOS gets compressed: after 27 idle minutes `top` showed 4.3 GB of the SUT's 9.8 GB footprint in the compressor and `ps` an RSS of 66 MB; the /ldbc/meta call (System/gc walks the heap) re-inflated it to 5.6 GB before the driver read it. The residency rule is judged on the reading after that walk, and every sweep here begins with a 15-20 s warm run, so no row was measured on compressed pages; the rule cannot see compression that a run's own warm-up undoes. Stated, not hidden."
+ :sut {:host "levi (M4: 4P+6E)" :threads 16 :params "params-full" :gate {:checked 4682 :disagreements 0} :order-rebuilds {:value 1 :group 3}}
+ :rows
+ [{:rung :sf1-full :inflight 64 :sut-threads 16 :reads-rate 3328 :tcr 0.00015 :on-time-pct 100.0 :failures 0 :throughput-ops-s 4801.5 :reads-per-s 3328 :updates-per-s 1475 :params :full-data
+   :read-after-write {:checked 360 :not-visible 0 :outside-window 0 :unverifiable 0 :is6-checked 60 :no-covering-read 60}
+   :note "3712 fails (76.2%); the same number as iteration 41's row, now on the full-data parameter set" :receipt "2026-09-12-ldbc-snb-network-iteration-43-full-sf1-64slots-params-full.edn"}]
+ :not-an-ldbc-score "SF1 is below the audited table; 11 of 21 reads; no ACID suite; no auditor. Audited No.1 (SF300 139,411 ops/s) is 29x this row."
+ :seeds [:m4-owner-decision-a-host :s23b-ic05-covers-ins5 :s34-bindings-as-arrays :m3-sf3-needs-13gb-same-host-decision]}

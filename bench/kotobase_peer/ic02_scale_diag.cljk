@@ -1,0 +1,83 @@
+(ns kotobase-peer.ic02-scale-diag
+  "Where do IC02's milliseconds go on the FULL SF1? (ayatori iteration 35)
+
+  On the 35k-post subset IC02 answers in 3.8 ms served; on the full SF1
+  (3.06M messages) it is 90-141 ms, and the hand-written index twin is 32 ms
+  on the same data. A person's friends have ~9,000 messages there against
+  ~300 on the subset, and the ordered drive's 512-value walk (0.3% hit
+  rate) is exhausted before the limit fills, so the plain join answers.
+
+  This measures, in one process on the same db and the same official
+  parameters, interleaved:
+
+    :engine        kb-ic02 as served (drive on, then plain join on exhaustion)
+    :engine-plain  the same with *ordered-drive* bound to false
+    :twin          the hand-written index path (kb-ic02-index)
+    :raw           the stages by hand off the index: friends, candidate
+                   messages, their dates, the top-20 -- each timed
+
+  so the per-candidate cost of each path is a number, not a guess.
+
+  Usage: kbb -M:ic02-scale-diag <ldbc-dynamic-dir> <params-dir> [posts] [n-params]"
+  (:require [kotoba.lang.text :as str]
+            [kotobase-peer.core :as eng]
+            [kotobase-peer.ldbc-snb-bench :as ldbc]
+            [datalog.core :as dl]
+            [datalog.index :as index]))
+
+(defn- ms [f]
+  (let [t (System/nanoTime) r (f)]
+    [(/ (- (System/nanoTime) t) 1e6) r]))
+
+(defn- median [xs] (let [s (vec (sort xs))] (nth s (quot (count s) 2))))
+
+(defn- raw-stages
+  "IC02 by hand, each stage timed: friends off :eavt, candidates off :avet
+  (hasCreator), dates off :eavt, then a bounded top-20."
+  [db person max-date]
+  (let [[t-friends friends] (ms #(vec (get (index/entity-attrs db person) "knows")))
+        [t-cands cands] (ms #(into [] (mapcat (fn [f] (map (fn [m] [f m]) (index/by-predicate-value db "hasCreator" f)))) friends))
+        [t-dates dated] (ms #(into [] (keep (fn [[f m]]
+                                              (let [d (first (get (index/entity-attrs db m) "message/creationDate"))]
+                                                (when (neg? (compare d (str max-date))) [f m d]))))
+                                     cands))
+        [t-top top] (ms #(vec (take 20 (sort (fn [[_ ma da] [_ mb db2]] (let [c (compare db2 da)] (if (zero? c) (compare ma mb) c))) dated))))]
+    {:friends (count friends) :candidates (count cands) :in-range (count dated)
+     :ms {:friends t-friends :candidates t-cands :dates t-dates :top t-top
+          :total (+ t-friends t-cands t-dates t-top)}
+     :rows (mapv (fn [[f m d]] [f m (parse-long d)]) top)}))
+
+(defn -main [& args]
+  (let [[dir params-dir posts n] args
+        n-posts (parse-long (or posts "2000000"))
+        n (parse-long (or n "40"))
+        data (#'ldbc/load-subset dir n-posts)
+        {:keys [db quads]} (#'ldbc/build-kotobase data)
+        params (->> (#'ldbc/read-param-lines params-dir "interactive_2_param.txt")
+                    (map #(str/split % #"\|")) (map (fn [[p d]] [p (parse-long d)])) (take n) vec)
+        one (fn [[p d]]
+               (let [[t-e r-e] (ms #(#'ldbc/kb-ic02 db p d))
+                     [t-p r-p] (ms #(binding [dl/*ordered-drive* false] (#'ldbc/kb-ic02 db p d)))
+                     [t-t r-t] (ms #(#'ldbc/kb-ic02-index db p d))
+                     raw (raw-stages db p d)]
+                 {:person p :engine-ms t-e :engine-plain-ms t-p :twin-ms t-t :raw raw
+                  :agree {:engine-vs-twin (= r-e r-t) :engine-vs-plain (= r-e r-p) :engine-vs-raw (= r-e (:rows raw))}}))]
+    ;; warm: three passes over the first five parameters, unbilled
+    (dotimes [_ 3] (doseq [pd (take 5 params)] (one pd)))
+    (let [results (mapv one params)
+          med (fn [k] (median (map k results)))
+          raw-med (fn [k] (median (map #(get-in % [:raw :ms k]) results)))]
+      (prn {:schema 1 :receipt/type :ic02-scale-diagnosis :date "2026-09-11"
+            :dataset {:posts n-posts :quads quads :messages (count (:messages data))}
+            :params (count results)
+            :median-ms {:engine (med :engine-ms) :engine-plain (med :engine-plain-ms) :twin (med :twin-ms)
+                        :raw-total (raw-med :total) :raw-friends (raw-med :friends) :raw-candidates (raw-med :candidates)
+                        :raw-dates (raw-med :dates) :raw-top (raw-med :top)}
+            :median-counts {:friends (median (map #(get-in % [:raw :friends]) results))
+                            :candidates (median (map #(get-in % [:raw :candidates]) results))
+                            :in-range (median (map #(get-in % [:raw :in-range]) results))}
+            :us-per-candidate {:engine (/ (* 1000 (med :engine-ms)) (max 1 (median (map #(get-in % [:raw :candidates]) results))))
+                               :twin (/ (* 1000 (med :twin-ms)) (max 1 (median (map #(get-in % [:raw :candidates]) results))))
+                               :raw (/ (* 1000 (raw-med :total)) (max 1 (median (map #(get-in % [:raw :candidates]) results))))}
+            :disagreements (count (remove (fn [r] (every? true? (vals (:agree r)))) results))
+            :per-param (mapv #(select-keys % [:person :engine-ms :engine-plain-ms :twin-ms]) results)}))))

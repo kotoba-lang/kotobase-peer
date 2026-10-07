@@ -1,0 +1,130 @@
+(ns kotobase-peer.plan-cardinality-test
+  "ADR-2608021000 §6-4-1: the planner already measures each clause's
+  cardinality to choose an order, and used to throw those numbers away. It now
+  hands them to the executor, which uses them to choose a STRATEGY per clause
+  -- one broad scan plus a hash join when a clause's relation is small
+  relative to the number of keyed scans a step would issue for it.
+
+  What is asserted here is that the hint is emitted, is keyed the way the
+  executor looks it up, and matches the estimates the plan itself used. That
+  the hint cannot change an ANSWER is arrangement's own equivalence suite;
+  this side only has to not lie about the numbers."
+  (:require [kotoba.test :refer [deftest testing is]]
+            [kotobase-peer.core :as eng]))
+
+(def ^:private everything (constantly true))
+
+(defn- db []
+  (eng/transact (eng/empty-db)
+                (concat
+                 (for [i (range 30)] {:s (str "m" i) :p "creator" :o (str "p" (mod i 5))})
+                 (for [i (range 30)] {:s (str "m" i) :p "date" :o (str i)})
+                 (for [i (range 5)] {:s (str "p" i) :p "role" :o "author"}))))
+
+(deftest the-plan-hands-its-own-estimates-to-the-executor
+  (let [query '{:find [?m ?d]
+                :where [[?m "creator" ?p] [?m "date" ?d] [?p "role" "author"]]}
+        plan (eng/datalog-query-plan (db) query everything)
+        hint (get-in plan [:query :clause-cardinality])]
+    (is (:optimized? plan))
+    (testing "keyed by the clause itself -- how arrangement.datalog looks it up"
+      (is (= (set (:where query)) (set (keys hint)))))
+    (testing "the numbers are the ones the plan ordered on, not a second guess"
+      (is (= (into {} (map (juxt :clause :estimated-rows)) (:plan plan)) hint)))
+    (is (= 30 (get hint '[?m "creator" ?p])))
+    (is (= 5 (get hint '[?p "role" "author"])))))
+
+(deftest an-input-narrowed-clause-is-withheld-from-the-hint
+  ;; The executor reads the hint as the size of the BROAD relation its hash
+  ;; join would scan. For a clause an `:in` input narrows, the plan's own
+  ;; estimate is the narrowed count -- 0 for a subject with no facts -- and
+  ;; the executor would read 0 as "tiny relation, scan it whole". Measured
+  ;; 2026-09-11 (ayatori iteration 17): LDBC IC08 spent 60 ms hash-joining
+  ;; 86,932 rows to return nothing, against 2 ms when the person had
+  ;; messages. The narrowed clause is therefore absent from the hint; the
+  ;; clauses no input touches keep theirs.
+  (let [query '{:find [?m ?d] :in [?p]
+                :where [[?m "creator" ?p] [?m "date" ?d] [?p "role" "author"]]}
+        plan (eng/datalog-query-plan (db) query everything ["p9"])
+        hint (get-in plan [:query :clause-cardinality])]
+    (is (:optimized? plan))
+    (testing "the narrowed clauses estimate 0 for a subject with no facts"
+      (is (= 0 (:estimated-rows (first (filter #(= '[?m "creator" ?p] (:clause %)) (:plan plan)))))))
+    (testing "and are not in the hint -- both clauses that mention ?p"
+      (is (not (contains? hint '[?m "creator" ?p])))
+      (is (not (contains? hint '[?p "role" "author"]))))
+    (testing "the untouched clause keeps its number"
+      (is (= 30 (get hint '[?m "date" ?d]))))
+    (testing "the answer is still empty, and a bound person still answers"
+      (is (= #{} (eng/query (db) query everything ["p9"])))
+      (is (= 6 (count (eng/query (db) query everything ["p1"])))))))
+
+(deftest the-relation-size-is-the-subject-count-and-costs-nothing-under-writes
+  ;; The whole-relation estimate used to be an exact datom count cached by
+  ;; identity of the attribute's :aevt inner map; under a write stream that
+  ;; cache recounted the whole relation on nearly every plan (iteration 36:
+  ;; 2-3M buckets, 80-100 ms p95 on the full SF1). It is now the number of
+  ;; subjects holding the attribute -- O(1), no cache, nothing to go stale.
+  (let [d1 (db)
+        query '{:find [?m ?d] :where [[?m "creator" ?p] [?m "date" ?d]]}
+        est (fn [d] (get-in (eng/datalog-query-plan d query everything) [:query :clause-cardinality '[?m "creator" ?p]]))]
+    (is (= 30 (est d1)))
+    (testing "a transaction on the attribute moves the number with no cache to invalidate"
+      (let [d3 (eng/transact d1 [{:s "m99" :p "creator" :o "p0"}])]
+        (is (= 31 (est d3)))
+        (is (= 30 (est d1)) "the older db value still answers for itself")))
+    (testing "subjects, not datoms: a second value on an existing subject does not move it"
+      (let [d4 (eng/transact d1 [{:s "m1" :p "creator" :o "p0"}])]
+        (is (= 30 (est d4)))))
+    (testing "control: the count is taken from the attribute asked for, not any other"
+      (is (not= (est d1) (get-in (eng/datalog-query-plan d1 '{:find [?p] :where [[?p "role" ?r]]} everything)
+                                 [:query :clause-cardinality '[?p "role" ?r]]))))))
+
+(deftest an-unoptimized-plan-emits-no-hint
+  ;; Queries with functions/negation keep source order and are not estimated,
+  ;; so there is nothing to hand over. A hint that is absent leaves the
+  ;; executor on the keyed path, which is the safe default.
+  (let [query '{:find [?s] :where [[?s "date" ?d] [(> ?d 18)]]}
+        plan (eng/datalog-query-plan (db) query everything)]
+    (is (false? (:optimized? plan)))
+    (is (nil? (get-in plan [:query :clause-cardinality])))))
+
+(deftest the-hint-does-not-change-what-query-returns
+  ;; End to end through kotobase-peer.core/query, which is what actually
+  ;; threads the hint into arrangement.
+  (let [d (db)
+        query '{:find [?m] :where [[?m "creator" ?p] [?p "role" "author"]]}]
+    (is (= 30 (count (eng/query d query everything))))))
+
+(deftest fallback-planning-does-not-enumerate-visible-rows
+  (let [visibility-calls (atom 0)
+        visible? (fn [_] (swap! visibility-calls inc) true)
+        plan (eng/datalog-query-plan
+              (db)
+              '{:find [?m] :where [[?m "creator" ?p] [?m "date" ?d]]}
+              visible?)]
+    (is (= [:index-estimate :index-estimate]
+           (mapv :estimate-source (:plan plan))))
+    (is (zero? @visibility-calls)
+        "a cost estimate must not run authorization once per candidate row")))
+
+(deftest the-plan-is-cached-by-query-shape-and-refreshed
+  ;; same query value -> the planner runs once; a different shape plans again;
+  ;; after the refresh count the planner runs again for the same shape. The
+  ;; answer is the same either way (a plan is an order, never a filter).
+  (let [d1 (db)
+        q1 '{:find [?m ?d] :in [?p] :where [[?m "creator" ?p] [?m "date" ?d]]}
+        q2 '{:find [?m] :in [?p] :where [[?m "creator" ?p]]}
+        calls (atom 0)
+        counted (fn [f] (fn [& args] (swap! calls inc) (apply f args)))]
+    (reset! @#'eng/plan-cache {})
+    (with-redefs [eng/datalog-query-plan (counted eng/datalog-query-plan)]
+      (let [a (eng/query d1 q1 everything ["p1"])
+            b (eng/query d1 q1 everything ["p2"])]
+        (is (= 1 @calls) "two calls, one shape, one plan")
+        (eng/query d1 q2 everything ["p1"])
+        (is (= 2 @calls) "a second shape plans once more")
+        (swap! @#'eng/plan-cache assoc-in [q1 :uses] 100000)
+        (is (= a (eng/query d1 q1 everything ["p1"])) "the refreshed plan answers the same rows")
+        (is (= 3 @calls) "past the refresh count the shape is planned again")
+        (is (= b (eng/query d1 q1 everything ["p2"])))))))

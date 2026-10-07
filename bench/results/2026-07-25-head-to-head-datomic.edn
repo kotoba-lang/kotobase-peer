@@ -1,7 +1,7 @@
 {:schema 1
  :date "2026-07-25"
  :implementation "kotobase-peer.head-to-head-datomic (bench/head_to_head_datomic.clj, :h2h alias)"
- :command "clojure -M:h2h"
+ :command "kbb -M:h2h"
  :environment
  {:machine "Apple M4, 32GB RAM, macOS (Darwin 25.4.0)"
   :jvm "OpenJDK 21.0.1"

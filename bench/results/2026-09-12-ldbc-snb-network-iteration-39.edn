@@ -1,0 +1,22 @@
+{:receipt/type :ldbc-snb-interactive-network-iteration
+ :iteration 39
+ :date "2026-09-12"
+ :benchmark :ldbc-snb-interactive-network-v2
+ :s30-cpu-profile {:method "JFR execution samples, 40 s, SUT under the 64-slot mix at 2944 reads/s (4,217 samples)"
+                   :receipt "2026-09-12-ldbc-jfr-mix-64slots-execution-samples.txt"
+                   :top-self ["PersistentHashMap BitmapIndexedNode.assoc 6.8%" "Util.dohasheq 6.6%" "Util.hasheq 5.3%" "RT.first 4.5%" "PersistentArrayMap.indexOfObject 4.4%" "String.compareTo 3.7%" "datalog.index/ve-compare 3.1%"]
+                   :top-inclusive ["TransientHashMap.doAssoc 13.2%" "datalog.index/ve-compare 7.9%" "APersistentVector.hasheq 5.9%" "PersistentTreeMap.seqFrom 5.8%" "APersistentMap.hasheq 5.5%"]
+                   :first-engine-frame ["datalog.index/ve-compare 7.8%" "datalog.core/group-cut 2.1%" "datalog.query/query-seq 1.9%" "datalog.core/merge-groups 1.4%" "join-clause 1.4%"]
+                   :reading "two families: the binding-set machinery (transient hash maps, hasheq of binding maps and vectors -- the generic join) and the grouped drive's cuts (ve-compare + PersistentTreeMap.seqFrom, one cut per group, ~2,200 for IC09)"}
+ :change {:repo "kotoba-lang/datalog" :sha "4921e8b7a559c01db29cdc80172cfcfd196c51ac"
+          :what "the drive chooses the grouped merge or the global value walk by expected steps: global when limit * N_e / E_G is under both half the value budget and |G| (N_e = the ordering attribute's subject count, E_G = entries in the reached groups, O(|G|))"
+          :in-process {:ic09-before-ms 8.7 :ic09-after-ms 4.9 :two-hop-before 7.1 :two-hop-after 3.97 :expansion 3.3 :disagreements 0 :receipt "2026-09-12-ldbc-ic09-scale-diagnosis-walk-choice.edn"}
+          :refuted-first "a rule on group COUNTS alone (|G|^2 < limit * N) sent IC07 (2,000 message groups holding 0.2% of all likes) to the global walk, which exhausted its budget and fell to the plain join: IC07 81 ms p50 / 510 p95, the 64-slot sweep at 2944 fell to 35% on-time. Receipt kept: 2026-09-12-ldbc-snb-network-iteration-39-count-rule-refuted-64slots.edn"}
+ :sut {:host "levi" :cores 10 :jvm-flags "-Xmx10g -XX:-G1UseAdaptiveIHOP -XX:InitiatingHeapOccupancyPercent=75" :threads 16 :gate {:checked 1082 :disagreements 0} :order-rebuilds {:value 1 :group 3}}
+ :rows
+ [{:rung :sf1-full :inflight 64 :sut-threads 16 :reads-rate 2944 :tcr 0.00015 :on-time-pct 100.0 :failures 0 :throughput-ops-s 4374.1 :reads-per-s 2944 :updates-per-s 1475
+   :read-after-write {:checked 240 :not-visible 0 :outside-window 0 :unverifiable 0 :is6-checked 39 :no-covering-read 40}
+   :note "3328 fails (73.4%); same passing read rate as iteration 38 (4233.3): IC09's wire p50 at 64 slots 30.7 -> 20.0 ms, the column +3%" :receipt "2026-09-12-ldbc-snb-network-iteration-39-full-sf1-64slots.edn"}]
+ :served-vs-in-process "IC09 served alone at 8 slots is ~12 ms p50 while the same code in one process is 4.9 ms on the same parameters; not explained this iteration (S31)"
+ :not-an-ldbc-score "SF1 is below the audited table; 11 of 21 reads; subset-derived parameters; no ACID suite; no auditor. Audited No.1 (SF300 139,411 ops/s) is 32x this row."
+ :seeds [:s31-served-vs-in-process-gap :s32-binding-set-machinery-hasheq-of-binding-maps :m4-more-cores :s26-full-data-parameter-set :s23b-ic05 :m3-sf3]}

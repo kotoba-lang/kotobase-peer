@@ -1,0 +1,48 @@
+{:schema 1
+ :date "2026-08-13"
+ :receipt/type :ic02-open-question
+ :implementation "kotobase-peer.ic02-diag, rerun after the planner estimate change"
+
+ :status "IC02's remaining cost is still unexplained. This receipt narrows where it is NOT."
+
+ ;; From ic02-diag, which asserts :answers-equal per step. It reimplements the
+ ;; two strategies from the same primitives arrangement uses, so these are
+ ;; indicative of the shape rather than exact engine timings.
+ :ic02-join-steps-ms
+ {:step-0 {:clause [:?person "knows" :?f]                :per-binding 1.572 :grouped 1.777 :out 882}
+  :step-1 {:clause [:?msg "hasCreator" :?f]              :per-binding 2.592 :grouped 3.240 :out 910}
+  :step-2 {:clause [:?msg "message/creationDate" :?date] :per-binding 3.043 :grouped 4.032 :out 910}
+  :sum-per-binding 7.208}
+
+ :the-gap
+ "The three join steps total 7.2 ms. The paired benchmark on the same dataset
+  reports IC02 at 47.5 ms p50 for kotobase. Planning is no longer the answer --
+  it is 2.3 ms on the heavier IC09 two-hop since kotobase-peer ea13f73 -- so
+  roughly 40 ms of IC02 is somewhere other than clause joining or planning.
+  Naming that place is the next measurement, and this receipt deliberately does
+  not guess at it: the last time someone reasoned about IC02 instead of
+  measuring it, the resulting change made IC02 monotonically worse across three
+  runs (2026-08-02-ldbc-snb-ic02-hypothesis-refuted.edn)."
+
+ :a-trap-worth-recording
+ "An ad-hoc probe written to split IC02 into plan / execute / harness-top-20
+  reported plan 0.136 ms, execute 0.810 ms, full query 0.615 ms -- numbers that
+  would have looked like a discovery. It also printed `rows 0`. The query was
+  matching nothing, and every one of those timings was of an empty answer.
+
+  It was caught only because the probe printed a row count, a habit acquired
+  earlier the same day after the LDBC Interactive Short harness was found timing
+  zero-row queries and reporting them as measurements. A benchmark that cannot
+  tell `fast` from `found nothing` will eventually report the second as the
+  first, and a hand-written probe is a benchmark."
+
+ :what-changed-since-the-refuted-hypothesis
+ {:ic02-paired-ratio {:2026-08-02-median-quotient 19.2 :2026-08-13-paired 9.710}
+  :note "Different statistics -- a quotient of separately-summarised medians then,
+         a per-sample paired ratio now -- so the two are not strictly comparable.
+         The direction is clear and the magnitude is not."}
+
+ :next
+ "Instrument the engine's own execute for IC02, the way ic09-diag instruments
+  planning: measure inside `datalog.core/q`, not around it. A probe that rebuilds
+  the query outside the engine can be wrong in ways the engine cannot."}

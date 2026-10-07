@@ -1,0 +1,43 @@
+{:schema 1
+ :date "2026-08-13"
+ :receipt/type :ic02-diagnosis
+ :supersedes "2026-08-13-ic02-open-question.edn"
+
+ :correction
+ "That receipt reported IC02's join as 7.2 ms, taken from ic02-diag's per-step
+  table, and concluded ~40 ms of the query was 'somewhere other than clause
+  joining or planning'. That was wrong. ic02-diag REIMPLEMENTS the two join
+  strategies from arrangement's primitives -- its own caveat says so -- and its
+  step timings are not the engine's. Measured through the engine, the join is
+  the cost."
+
+ :measured
+ {:person 2199023262543 :rows 995 :quads 409877
+  :plan-ms 1.677
+  :eng-query-plan-plus-execute-ms 100.631
+  :dl-q-planned-order-ms 95.573
+  :dl-q-source-order-ms 97.317
+  :harness-top-20-ms 2.989
+  :method "20 iterations after 3 warmups, same JVM, host load average ~7-9"}
+
+ :findings
+ ["The join is ~96 ms. Planning is 1.7 ms and the harness's top-20 is 3.0 ms.
+   IC02's cost is inside `datalog.core/q`, joining three clauses to produce 995
+   rows over 409,877 quads."
+  "CLAUSE ORDER IS NOT THE LEVER. Planned order 95.573 ms, source order 97.317 ms
+   -- a 1.8% difference. This explains, rather than merely records, why the
+   2026-08-02 attempt to make IC02 faster by changing how the join groups its
+   work moved the number the wrong way three runs running: there is very little
+   ordering headroom in this query to begin with."]
+
+ :guard-that-caught-the-previous-attempt
+ "The first version of this probe reported plan 0.136 ms and execute 0.810 ms --
+  a spectacular-looking result. It also printed `rows 0`: `build-kotobase`
+  returns `{:db .. :quads ..}` and the probe had passed the whole map as the db,
+  so every query matched nothing. This version aborts with exit 2 when the row
+  count is zero, rather than printing timings of an empty answer."
+
+ :next
+ "Instrument inside `datalog.core/q` for this shape: three clauses, ~1000 result
+  rows, 409,877 quads, 96 ms. Not around it -- a probe outside the engine can be
+  wrong in ways the engine cannot, which is how the superseded receipt happened."}

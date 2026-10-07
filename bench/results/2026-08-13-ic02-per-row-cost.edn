@@ -1,0 +1,52 @@
+{:schema 1
+ :date "2026-08-13"
+ :receipt/type :ic02-diagnosis
+ :method
+ "Clause-prefix decomposition: run `dl/q` on the first clause, then the first
+  two, then all three, and read the deltas. Non-invasive -- nothing inside the
+  engine is modified, so the numbers are the engine's own. 8 iterations after 3
+  warmups, one JVM, host load average 5.3 recorded by the probe itself."
+
+ :measured-ms
+ {:c1 {:clause [:?person "knows" :?friend] :ms 5.54 :rows 920 :note "?person bound by :in"}
+  :c1+c2 {:added [:?msg "hasCreator" :?friend] :ms 32.06 :rows 995 :delta 26.52}
+  :c1+c2+c3 {:added [:?msg "message/creationDate" :?date] :ms 45.65 :rows 995 :delta 13.59}
+  :c2-alone {:ms 26.13 :rows 7355 :note "unbound: the whole hasCreator relation"}
+  :c3-alone {:ms 22.74 :rows 7355 :note "unbound: the whole creationDate relation"}
+  :c2-before-c1 {:ms 264.20 :rows 995 :note "same three clauses, bad order"}}
+
+ :findings
+ ["Adding `hasCreator` to 920 bindings costs 26.5 ms. Reading the ENTIRE
+   hasCreator relation unbound costs 26.1 ms. They are the same number, so the
+   step is paying for a full relation read -- which is the hash-join path, and is
+   the correct choice at 7,355 rows against 920 groups."
+  "The cost is therefore PER ROW, not per join step: 7,355 rows in 26.1 ms is
+   3.5 microseconds a row, and 7,355 rows in 22.7 ms for creationDate is the same
+   rate. IC02 touches roughly 15,000 quads across its two message clauses and
+   spends about 45 ms doing it."
+  "For scale, `estimate-cardinality` reads 286,744 rows out of the same indexes in
+   0.0129 ms. The difference between reading an index and materialising rows from
+   it is about four orders of magnitude, and execution is on the materialising
+   side."]
+
+ :refines-an-earlier-claim
+ "2026-08-13-ic02-join-is-the-cost.edn said 'clause order is not the lever',
+  from planned order 95.573 ms against source order 97.317 ms. That comparison
+  was between two orders that happen to be nearly identical. Putting `hasCreator`
+  before `knows` costs 264.20 ms against 45.65 ms -- 5.8x. Order matters
+  enormously; what is true is that the planner already picks a good one, so
+  there is no headroom ABOVE it. The earlier sentence was right about the
+  conclusion and wrong about the reason."
+
+ :next
+ "The per-row cost inside the scan path, not the join algorithm. `query-seq`
+  builds an {:s :p :o} map per candidate and `visible?` is applied to each; the
+  join then hashes them into a set. Whether that allocation is the 3.5
+  microseconds is the next thing to measure -- inside the engine this time, and
+  before anything is changed."
+
+ :caveats
+ ["Absolute milliseconds move with host load: the same three-clause query measured
+   95.6 ms at load ~8 earlier the same day and 45.7 ms at load 5.3 here. Compare
+   within a run, not across."
+  "One start person (the highest-degree one), one dataset, one JVM. A diagnosis."]}

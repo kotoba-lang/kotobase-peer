@@ -1,0 +1,28 @@
+{:receipt/type :ldbc-snb-interactive-network-iteration
+ :iteration 36
+ :date "2026-09-11"
+ :benchmark :ldbc-snb-interactive-network-v2
+ :claim "IC07 and IC08 carry their top-20 inside the query so the grouped drive answers them (IC07 with a fetch-more loop for one-row-per-liker); and two write-side stalls found on the way are closed: the planner's per-version relation recount and the order-version vector rebuilt per push."
+ :changes
+ [{:where "kotobase-peer bench (kb-ic07, kb-ic08)" :what ":order-by/:limit written into the query; IC07 doubles N while N rows hold fewer than 20 distinct likers and the query was not exhausted" :gate {:checked 1082 :disagreements 0}}
+  {:where "kotobase-peer core (relation-size)" :what "the planner's [nil attr nil] estimate is the SUBJECT count, O(1), no cache -- it was an exact datom count cached by identity of the attribute's :aevt map, which every insert on the attribute invalidated: 2-3M buckets recounted, 80-100 ms, seen as p95 spikes on IC08/IS7 (replyOf) and IS2 (creationDate/content) under the stream while IC02 (fused range, not that shape) stayed at 0.6 ms"
+   :isolate {:mix [:ic08 :is2 :is7 :ic02] :rate 400 :inflight 8 :stream-tcr 0.0002
+             :before {:on-time-pct 73.2 :p95 {:ic08 96.6 :is7 101.0 :is2 78.6 :ic02 0.6} :max {:ic08 230.6 :is7 239.4 :is2 184.1}}
+             :after {:on-time-pct 100.0 :p95 {:ic08 1.4 :is7 0.5 :is2 0.7 :ic02 0.9} :max {:ic08 3.2 :is7 1.1 :is2 1.1}}
+             :receipt "2026-09-11-ldbc-snb-network-iteration-36-planner-recount-closed-isolate.edn"}}
+  {:where "kotoba-lang/datalog 3ab273e4 (index)" :what "order versions held newest-last and trimmed every window, one conj per push; the newest-first form rebuilt a 1,024-element vector through a lazy seq per push, 3-4 pushes per insert (~40 KB garbage each at 1,100 inserts/s)"}]
+ :sut {:host "levi" :heap "-Xmx10g" :quads 20569957 :gate {:checked 1082 :disagreements 0} :order-rebuilds {:value 0 :group 3} :resident {:heap-used-mb 5090 :rss-mb 10204 :swap-used-pct 23.5}}
+ :prediction-before-running "IC07 16.8 -> a few ms, IC08 p95 tightens, both ceilings rise. (The planner recount was not predicted: it was found by the isolate test when the first sweep after the rewrite failed at 640 reads where iteration 35 had passed.)"
+ :observed "IC07 16.8 -> ~6 ms server (8.6 wire) p50; IC08 0.2 p50 with p95 1.4; 8-slot ceiling 640 -> 1024 reads/s, 32-slot 512 -> 2048."
+ :rows
+ [{:rung :sf1-full :inflight 8 :reads-rate 1024 :tcr 0.0002 :on-time-pct 100.0 :failures 0 :throughput-ops-s 2115.4 :reads-per-s 1024 :updates-per-s 1092
+   :read-after-write {:checked 351 :not-visible 0 :outside-window 0 :unverifiable 0 :is6-checked 60 :no-covering-read 60}
+   :receipt "2026-09-11-ldbc-snb-network-iteration-36-full-sf1-8slots.edn"}
+  {:rung :sf1-full :inflight 8 :reads-rate 1280 :tcr 0.0002 :on-time-pct 64.94 :verdict :fails-95pct-rule :delay-p95-ms 2470}
+  {:rung :sf1-full :inflight 32 :reads-rate 2048 :tcr 0.00015 :on-time-pct 100.0 :failures 0 :throughput-ops-s 3512.2 :reads-per-s 2048 :updates-per-s 1475
+   :read-after-write {:checked 600 :not-visible 0 :outside-window 0 :unverifiable 0 :is6-checked 100 :no-covering-read 100}
+   :receipt "2026-09-11-ldbc-snb-network-iteration-36-full-sf1-32slots.edn"}
+  {:rung :sf1-full :inflight 32 :reads-rate 2560 :tcr 0.00015 :on-time-pct 51.54 :verdict :fails-95pct-rule :delay-p95-ms 3810}]
+ :wire-p50-ms-at-8-slots-1024 {:ic02 2.4 :ic07 8.6 :ic08 2.3 :ic09 13.1 :is1 2.1 :is2 2.1 :is3 8.2 :is4 2.0 :is5 2.1 :is6 2.2 :is7 2.2}
+ :not-an-ldbc-score "SF1 is below the audited table; 11 of 21 reads; subset-derived parameters; no ACID suite; no auditor. Audited No.1 (SF300 139,411 ops/s) is 40x the 32-slot row."
+ :seeds [:s28-ic09-two-hop-at-full-scale-13ms :s26-full-data-parameter-set :s23b-ic05-covers-ins5 :m3-sf3-needs-13gb :gc-pauses-60-170ms-max-without-stream-try-zgc]}

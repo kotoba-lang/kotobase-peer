@@ -1,5 +1,15 @@
 # kotobase-peer
 
+> **Compatibility repository — feature frozen 2026-08-04.** This name uses
+> Datomic's embedded-library meaning of “peer”; it does not own Kotobase
+> network federation. The repository accumulated several unrelated
+> capabilities and is being retired by extraction, not renamed as a monolith.
+> New projection, federation, and background-lifecycle behavior belongs in
+> `kotobase-projection`, `kotobase-federation`, and `kotobase-maintenance`.
+> Database engine work belongs behind `kotobase-engine-contract`. Existing
+> public namespaces remain available for pinned consumers during migration;
+> see [`MIGRATION.md`](MIGRATION.md).
+
 **The kotobase peer library — Datomic's own term for the transact/q/pull
 library an application embeds — in real CLJC, verified on both JVM and
 ClojureScript.** Composes the already-landed Wave 1–3 primitives
@@ -135,8 +145,14 @@ fully materialized hot `db` (backfill/migration tooling, tests).
 
 ## Merkle-LSM migration (ADR-2607201600)
 
-`kotobase-peer.merkle-lsm` contains the pure M1 kernel and M2 shadow-flush
-vertical slice replacing full-snapshot folding:
+`merkle-lsm.core` — from the [`kotoba-lang/merkle-lsm`](https://github.com/kotoba-lang/merkle-lsm)
+dependency, and `kotobase-peer.merkle-lsm` in this repo until the copies here
+were deleted — contains the pure M1 kernel and M2 shadow-flush vertical slice
+replacing full-snapshot folding, with `merkle-lsm.compaction` (formerly
+`kotobase-peer.compaction`) the M4 policy over it. Their tests moved with them;
+what this repo still tests is the HOST side that interprets the effect
+descriptors they return (`kotobase-peer.cache`,
+`kotobase-peer.object-store.worker`):
 
 Large immutable runs are stored as a small run root plus logical-key-aligned
 data blocks (128 rows and 1 MiB encoded bytes by default). Both bounds are
@@ -290,7 +306,7 @@ ETag-CAS lease; active contenders return `:leased`, expired work is reclaimed,
 and the lease is removed from the committed checkpoint after each bounded
 effect.
 
-Run `clojure -M:merkle-bench 1000 100000 10000000` for the ADR scale sweep;
+Run `kbb -M:merkle-bench 1000 100000 10000000` for the ADR scale sweep;
 `MERKLE_BENCH_WRITERS` selects simulated concurrent flushers (default 32).
 For release evidence, prefer `npm run bench:merkle-scale`, which runs each
 size in an isolated JVM, defaults to one writer and a 2 GiB heap, and enables
@@ -300,7 +316,7 @@ Every result includes flush p50/p95/p99, compaction and total wall time,
 process CPU, sampled peak heap, object counts/bytes, and read/write
 amplification. Missing metrics, lost rows, threshold breaches, or OOM make the
 runner nonzero; a smaller successful tier cannot mask a failed larger tier.
-Run `clojure -M:view-bench 100000 512` for the browser/no-local-disk serving
+Run `kbb -M:view-bench 100000 512` for the browser/no-local-disk serving
 gate. It builds an immutable materialized-view pack, then executes deterministic
 point and bounded-range queries through the same sparse-index selection, byte
 range slicing, block-CID verification, and decode path used by a browser host.
@@ -334,7 +350,7 @@ every returned range is verified against its logical block CID before decode.
 `build-view-delta` appends an epoch pack linked to the previous bundle;
 `query-packed-chain` applies newest-key-wins assertions/retraction tombstones,
 and `compact-packed-chain` deterministically collapses a bounded chain back to
-one base pack. Run `clojure -M:view-delta-bench 10000 1000 512` for this gate.
+one base pack. Run `kbb -M:view-delta-bench 10000 1000 512` for this gate.
 
 Resumable join hosts can encode a large positive-conjunctive Datalog frontier
 with `datalog-materialization/build-frontier-work-chain`. It canonicalizes
@@ -611,10 +627,64 @@ entirely chain's job. Neither library needed to change.
   or cron wires the policy (e.g. fold after every write past a threshold,
   or on a timer) using its own storage/scheduling.
 
+## Incremental edge compaction
+
+On ClojureScript, `fold!` applies the oldest selected novelty transactions to
+existing Prolly indexes through `arrangement/commit-changes!`. It does not
+hydrate the indexed database and rebuild all four indexes for every fold.
+A transaction-count limit alone cannot bound that older full-rebuild cost.
+
+Operations retain log order. Assertions and explicit retractions collapse to
+the final operation for each triple. Entity retractions read only that entity's
+indexed EAVT range and also cancel preceding pending assertions. All four index
+roots are updated together in one immutable snapshot; publishing its chain head
+remains the caller's existing durable-write and compare-and-swap responsibility.
+A competing writer must cause a retry against the winning head, never an
+unconditional head replacement.
+
+Existing materialized views apply the same ordered changes. A changed or new
+view specification backfills only its declared attributes. View rows now have
+canonical serialized order; old view blocks remain readable. This normalization
+can change a view block's CID even when its logical row set is unchanged.
+
+This is not a constant-memory compactor: Prolly internal-node metadata and a
+flat materialized-view block still scale with their respective structures.
+Entity deletion necessarily visits that entity's facts, and bounded compaction
+still maintains the remaining novelty subject index. Large view creation and
+legacy migrations need separate capacity qualification. JVM and legacy schema
+migration use the explicit `fold-rebuild!` compatibility implementation.
+
+`incremental-fold-test` compares complete chain CIDs with that rebuild reference
+for mixed operations and view changes, and counts reads and crypto operations
+with unrelated indexed data present. These local work measurements do not
+establish production CPU time, memory limits, or an availability SLO.
+
+## Selective novelty reads
+
+`commit!` accepts the store's `blind-fn` to record keyed subject and attribute
+membership for each encrypted transaction block. Consumers must pass it at
+both ordinary and knowledge-graph write entry points. Reads use the bound
+entity's actual position in EAVT/AEVT/AVET/VAET, or a bound attribute when no
+entity is given. A value-only VAET prefix conservatively keeps all blocks.
+
+Legacy entries without metadata remain readable and are never excluded by
+absence. A transaction containing `retract-entity` omits attribute metadata for
+the whole block, including mixed transactions: deletion can affect attributes
+not named in the submitted transaction. Bounded compaction preserves metadata
+on the remaining entries. Existing unindexed backlog gets cheaper as it drains;
+metadata does not retroactively rewrite immutable history.
+
+`subject-pruning-test` compares all four index orders against unindexed reads,
+checks mixed legacy queues, and checks entity deletion before and after a
+bounded fold. Consumer compatibility build: 113 tests / 312 assertions pass.
+This qualification uses Shadow CLJS, not the currently unavailable native
+compiler path. Metadata traversal still scales with unreflected transactions;
+queue drainage remains required.
+
 ## Test
 
 ```bash
-clojure -M:test              # JVM      -- 183 tests / 479 assertions
+kbb -M:test              # JVM      -- 183 tests / 479 assertions
 npm run test:cljs            # cljs     -- 173 tests / 454 assertions (real shadow-cljs build + node, not nbb)
 ```
 
@@ -626,3 +696,56 @@ the underlying behavior is exercised on both platforms.
 ## License
 
 Apache-2.0.
+
+## Reusing a computed fold after contention
+
+The asynchronous `rebase-fold!` accepts a trusted fold candidate and attaches it
+to a newer head only when the indexed/view basis and the exact oldest folded
+transaction CIDs still match. It retains every later transaction, including
+entity deletions. A competing compactor or divergent prefix returns nil.
+It does not encrypt indexes again, publish a head, or weaken compare-and-set:
+the host must flush its metadata and CAS against the head it just read.
+Metadata traversal and maintenance of the remaining novelty directory remain
+size-dependent. This API is for an internally computed candidate, not an
+untrusted caller-supplied fold result.
+
+Compiled consumer peer suite: 114 tests / 317 assertions pass, including exact
+chain-CID equality with fresh compaction across an appended entity deletion,
+readback of both sides, changed-basis rejection and divergent-prefix rejection.
+
+## Cold materialized-view reads
+
+`view-rows` retains its five-argument compatibility arity and accepts optional
+`blind-fn` / `async-get-fn` arguments. The edge server supplies both: view data
+and pending metadata are fetched directly, rather than restarting the handler
+for every discovered block. Only transaction blocks matching declared
+attributes are decrypted when exact metadata exists; legacy entries and entity
+deletions remain conservative. Decryption runs in chronological batches of
+four, and relevant assertions use the existing bulk accumulator.
+
+The flat stored view representation is unchanged, so its own read size still
+scales with the materialized data. An absent view returns before any pending
+payload reads. Compiled consumer peer suite: 115 tests / 322 assertions pass;
+a cold mixed-legacy fixture needs only the stored view, one unknown legacy
+block and one deletion block, while preserving both remaining entities.
+
+## Persistent pending-update tails
+
+Bounded asynchronous compaction now detaches only the consumed front prefix
+and retains the remaining immutable queue links. It does not rebuild a second
+subject directory over every pending transaction. Readers use the exact
+membership already stored on queue entries; legacy unknown entries remain
+conservative. Back is reversed only when front is exhausted, the amortized
+persistent-queue transition. Legacy flat queues still pay their one-time
+conversion. Large reversals are not a strict per-invocation constant bound.
+
+Compaction rebase uses the same prefix operation. Queue node boundaries and
+optional directory presence can change chain CIDs without changing logical
+rows; stored node shapes remain readable. The full-rebuild compatibility path
+is unchanged.
+
+Compiled consumer suite: 116 tests / 328 assertions pass. After initializing a
+front, the next one-entry fold with 64 versus 1,024 pending updates performs
+10 reads and 7 writes in both cases, reads 4,098 versus 4,102 bytes, decrypts
+one transaction and encrypts three leaves. These local counts do not establish
+a production latency guarantee.

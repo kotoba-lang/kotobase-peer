@@ -1,0 +1,32 @@
+{:receipt/type :ldbc-snb-interactive-network-iteration
+ :iteration 34
+ :date "2026-09-11"
+ :benchmark :ldbc-snb-interactive-network-v2
+ :claim "The full LDBC SNB SF1 (20,569,957 quads) is loaded, gated and SERVED RESIDENT over the network for the first time: datalog 645c9e58 holds a one-value counterpart set as one object (datalog.singleton) instead of a ~160-byte hash set, and 99.5% of them hold one value."
+ :engine-change {:repo "kotoba-lang/datalog" :sha "645c9e587870eef8a037315c24ad108407b4a506"
+                 :what "datalog.singleton/of: a deftype that IS a set to every reader (set?, contains?, count, seq, get, conj, disj, = both ways, hash, clojure.set, java.util.Set); conj of a second value returns an ordinary set; ClojureScript keeps #{v}"
+                 :tests {:jvm "131 tests / 341 assertions / 0 failures (levi, through the .cljk mirror)" :cljs "135 / 352 / 0 (kbb engine); the cljs runner had been red since iteration 31 on `format`, fixed in the same commit"}
+                 :readers-changed 0}
+ :footprint
+ {:subset-2.0M-quads {:before-mb 726 :after-mb 386 :bytes-per-quad {:before 362 :after 192} :gate {:checked 1082 :disagreements 0 :both true}
+                      :served-latency "identical within noise at 8 slots / reads 2048 (ic02 3.8/3.8, ic09 7.6/7.2, is3 7.6/6.8 ms p50 before/after)"
+                      :receipts ["2026-09-11-ldbc-snb-network-iteration-34-subset-before-singleton.edn" "2026-09-11-ldbc-snb-network-iteration-34-subset-after-singleton.edn"]}
+  :full-sf1-20.6M-quads {:before "10.9 GB used heap (iteration 26-27): not servable resident on a 16 GiB host"
+                         :after {:heap-used-mb 4357 :heap-max-mb 10240 :rss-mb 10661 :swap-used-pct 23.1 :load-ms 13983 :build-ms 31401 :ready-after-s 180}
+                         :gate {:checked 1082 :disagreements 0}
+                         :elements {:persons 9892 :knows-edges 180623 :messages 3055774 :posts 1003605 :comments 2052169 :likes 2190095}}}
+ :sut {:host "levi" :heap "-Xmx10g" :threads 8 :port 8091 :params "the subset-derived parameter set (all persons; 100 IS messages that exist in the full data) -- a full-data parameter set is a follow-up"}
+ :driver {:host "judah" :load-avg-on-sut ["6.91" "6.72" "4.79"]}
+ :prediction-before-running "the compact representation halves the subset footprint with no latency change, and the full SF1 fits a 10 GB heap; served latencies on the full data will be higher for the date-ordered reads (IC02/IC09/IS2/IC07) because a person's messages go from ~9 to ~300 and the ordered drive's 512-value budget falls back to the plain join over 3M distinct dates."
+ :observed "footprint: 726 -> 386 MB on the subset, 4,357 MB on the full SF1 (fits). Latency on the full data: ic02 141 ms, ic09 113, ic07 31, is2 28, is3 8, ic08/is1/is4-7 0.1-0.5 ms (p50, server). Held."
+ :rows
+ [{:rung :sf1-full :inflight 8 :reads-rate 128 :tcr 0.0002 :on-time-pct 100.0 :failures 0 :throughput-ops-s 1215.8 :reads-per-s 128 :updates-per-s 1092 :updates-skipped 0
+   :read-after-write {:checked 234 :not-visible 0 :outside-window 10 :unverifiable 0 :is6-checked 40 :no-covering-read 40}
+   :note "first row on the full SF1; the stream dominates the ops count; reads 192 fails (91.7%) so this is a ceiling"
+   :receipt "2026-09-11-ldbc-snb-network-iteration-34-full-sf1-8slots.edn"}
+  {:rung :sf1-full :inflight 8 :reads-rate 192 :tcr 0.0002 :on-time-pct 91.73 :verdict :fails-95pct-rule :delay-p95-ms 1517}
+  {:rung :sf1-full :inflight 32 :reads-rate 256 :tcr 0.00015 :on-time-pct 89.44 :verdict :fails-95pct-rule :delay-p95-ms 2237 :note "the 32-slot sweep began on a failing rate: no passing 32-slot row on the full SF1 this iteration" :receipt "2026-09-11-ldbc-snb-network-iteration-34-full-sf1-32slots-fail-control.edn"}]
+ :server-ms-p50-full-sf1 {:ic02 140.9 :ic07 31.1 :ic08 0.5 :ic09 113.2 :is1 0.3 :is2 28.3 :is3 8.1 :is4 0.2 :is5 0.2 :is6 0.2 :is7 0.2 :ins1-8 "0.0-0.1"}
+ :unverifiable-now-zero "on the full data every INS2/INS3 post and INS8 person is held, so the unverifiable class is 0 (it was 50-84 on the subset): the subset was the reason, as the receipts said"
+ :not-an-ldbc-score "SF1 is below the audited table (SF30+); 11 of 21 reads; subset-derived parameters; no ACID suite; no auditor. Audited No.1 (Huawei GES 3.1.0, SF300 139,411 ops/s) is 115x this row on a dataset 300x larger."
+ :seeds [:s25-date-ordered-reads-at-full-scale-ic02-ic09-is2-ic07 :s26-full-data-parameter-set :s23b-ic05-covers-ins5 :m3-sf30-needs-a-host-with-more-memory-or-a-persisted-plane]}

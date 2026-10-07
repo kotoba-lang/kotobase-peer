@@ -1,0 +1,51 @@
+{:schema 1
+ :date "2026-08-14"
+ :receipt/type :representation-experiment
+ :follows "2026-08-14-what-generality-costs.edn"
+
+ :question "Is the residue how the engine READS the index?"
+ :answer "No. The read path is 1.50x of it. The hypothesis is refuted, like the two before it."
+
+ :measured
+ {:b3-direct-index-reads-ms 1.622
+  :b4-reads-via-dq-query-ms 2.430
+  :a-engine-ms 24.585
+  :b4-over-b3 "1.50x -- the cost of materialising an {:s :p :o} map per candidate"
+  :a-over-b4 "10.12x -- the residue, still unnamed"
+  :a-over-b3 "15.15x"
+  :host-load 4.29
+  :agreement "both arms asserted to return the same set as the engine, all five start persons, before timing"}
+
+ :everything-priced-so-far
+ [{:piece "visibility, visible? per candidate" :cost "1.07x"}
+  {:piece "deduplication, a set at every step" :cost "1.67x"}
+  {:piece "map-shaped bindings, assoc per variable per row" :cost "1.67x"}
+  {:piece "quad materialisation on read, {:s :p :o} per candidate" :cost "1.50x"}
+  {:piece "everything else inside the join" :cost "~10x" :named? false}]
+
+ :the-state-of-it
+ "Four nameable pieces multiply to about 4.2x. The engine is 15x. The remaining
+  ~10x is inside `join-clause` and its callers -- group-by per step, the lazy
+  mapcat chains, clause dispatch, substitute -- none of which can be isolated
+  from outside the engine, because there is no public entry point that does part
+  of a join.
+
+  External decomposition is therefore exhausted. Three hypotheses about the
+  residue have now been proposed from outside and refuted by measurement: that it
+  was binding representation, that it was generality, that it was the read path.
+  A fourth guess from the same vantage point would be worth less than the first
+  three, which is not much."
+
+ :next
+ "Instrument inside datalog: time `join-clause`'s phases in a worktree, run IC02,
+  throw the instrumentation away. That is the only remaining way to name the 10x,
+  and it is a different kind of work from everything above -- a temporary change
+  to the engine rather than an experiment beside it."
+
+ :caveats
+ ["The engine's own number moved 17.853 -> 24.585 ms between this run and the
+   previous one at similar load. Cross-run ratios are unreliable at that
+   variance; only within-run comparisons are used here, and the pieces above come
+   from different runs and should be read as magnitudes, not as a product that
+   must equal 15."
+  "One query shape. Every arm is hand-written for IC02's clause order."]}

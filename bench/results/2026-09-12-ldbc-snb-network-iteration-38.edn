@@ -1,0 +1,24 @@
+{:receipt/type :ldbc-snb-interactive-network-iteration
+ :iteration 38
+ :date "2026-09-12"
+ :benchmark :ldbc-snb-interactive-network-v2
+ :experiments
+ [{:name :s29-http-cost-per-request
+   :method "a :noop op through the same route, parse and response shape (SUT refuses an unknown op with 400 -- control shown); driven alone from judah at 64 slots"
+   :prediction "8-12k ops/s; at or below 5k the HTTP layer is the wall"
+   :observed "16,064.8 ops/s at rate 16,384 with 100% on-time and the sweep not yet failing; wire p50 1.7-1.9 ms (the LAN hop). The HTTP layer and the single-threaded node driver are NOT the wall at 3.9k real ops/s."
+   :receipt "2026-09-12-ldbc-snb-network-iteration-38-noop-64slots.edn"}
+  {:name :g1-marking-cycles
+   :method "jstat -gcutil on the SUT (16 threads, -Xmx10g) during a 64-slot / 2560-read run"
+   :observed "GC pause time 0.30 s in 26 s (1.2%) -- pauses are not it; but 4 concurrent marking cycles in 26 s with old-gen occupancy at 90%: the default adaptive IHOP started marking below the 5 GB live set, so G1 marked continuously on other cores (load 13 on 10 cores while server-ms accounted for ~5)."
+   :change "-XX:-G1UseAdaptiveIHOP -XX:InitiatingHeapOccupancyPercent=75 (marking starts at 7.5 GB, above the live set)"
+   :after "6 concurrent cycles over the whole 90 s sample; load 8 at the same rate; 64 slots: 3072 reads went from 48% to 84-86% on-time"
+   :receipts ["2026-09-12-ldbc-snb-network-iteration-38-jstat-adaptive-ihop.txt" "2026-09-12-ldbc-snb-network-iteration-38-jstat-ihop75.txt"]}]
+ :sut {:host "levi" :cores 10 :jvm-flags "-Xmx10g -XX:-G1UseAdaptiveIHOP -XX:InitiatingHeapOccupancyPercent=75" :threads 16 :quads 20569957 :gate {:checked 1082 :disagreements 0} :resident {:heap-used-mb 5079 :rss-mb 9302 :swap-used-pct 25.5}}
+ :rows
+ [{:rung :sf1-full :inflight 64 :sut-threads 16 :reads-rate 2944 :tcr 0.00015 :on-time-pct 100.0 :failures 0 :throughput-ops-s 4233.3 :reads-per-s 2944 :updates-per-s 1475
+   :read-after-write {:checked 360 :not-visible 0 :outside-window 0 :unverifiable 0 :is6-checked 60 :no-covering-read 60}
+   :note "3072 fails (85.9%); iteration 37's 64-slot row was 3852.3 at 2560" :receipt "2026-09-12-ldbc-snb-network-iteration-38-full-sf1-64slots-b.edn"}]
+ :wire-p50-ms-at-64-slots-2944 {:ic02 10.8 :ic07 22.3 :ic08 10.9 :ic09 30.7 :is1 10.9 :is3 22.5 :others 10.8 :reading "64 in flight over 16 threads: ~9 ms of the wire time is queueing in the SUT"}
+ :not-an-ldbc-score "SF1 is below the audited table; 11 of 21 reads; subset-derived parameters; no ACID suite; no auditor. Audited No.1 (SF300 139,411 ops/s) is 33x this row."
+ :seeds [:m4-more-cores-for-the-sut :s30-cpu-profile-of-the-engine-under-the-mix :s26-full-data-parameter-set :s23b-ic05-covers-ins5 :m3-sf3-needs-13gb]}

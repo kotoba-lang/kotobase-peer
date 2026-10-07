@@ -1,0 +1,21 @@
+{:receipt/type :ldbc-snb-interactive-network-iteration
+ :iteration 33
+ :date "2026-09-11"
+ :benchmark :ldbc-snb-interactive-network-v2
+ :claim "The update stream is replayed whole: INS4 (forum: title, creationDate, moderator; tags dropped, no read uses them) and INS5 (membership reified with its join date) are served, so no event is skipped. INS4 is verified through IS6 on a post that lands in the forum it created (the SUT says :forum-known when the forum is held with a named moderator); INS5 has no covering read among the served ops and is counted as :no-covering-read, a third class beside verified and unverifiable."
+ :control-before-measuring "curl on levi: INS4 -> 3 datoms, INS5 -> 3 datoms, INS6 into the new forum -> :forum-known true, IS6 on that post -> [forum title moderator Brian Kelly]; :ins9 -> 400 insert not served"
+ :sut {:host "levi" :heap "-Xmx6g" :quads 2004832 :index-path-gate {:checked 1082 :disagreements 0} :resident {:heap-used-mb 781 :rss-mb 2790 :swap-used-pct 23.9}}
+ :driver {:host "judah" :load-avg ["2.37" "2.00" "2.00"]}
+ :prediction-before-running "8 slots at reads 1536 + TCR 0.0002 keeps passing; at 32 slots / TCR 0.00015 the passing read rate drops (2560 -> ~2048) because the 48% of events that were skipped now cost write ops; total ops/s rises because they now count."
+ :observed "8 slots: reads 1536 FAILS (58.5% on-time, delay p95 2944 ms) -- wrong; the ceiling is reads 1280 + 1092 upd/s = 2332.6. 32 slots: reads 3072 PASSES (4545.5 = 3072 + 1475 upd/s, delay p95 250 ms) and 3584 fails (42.1%) -- the read rate did not drop, it ROSE, because iteration 32's 32-slot sweep stopped at its last listed rate (2560) without finding the ceiling. Iteration 32's 3371.6 row was sweep-limited, not SUT-limited; recorded here, not hidden."
+ :rows
+ [{:inflight 8 :reads-rate 1280 :tcr 0.0002 :on-time-pct 100.0 :failures 0 :throughput-ops-s 2332.6 :reads-per-s 1280 :updates-per-s 1092 :updates-skipped 0
+   :read-after-write {:checked 276 :not-visible 0 :outside-window 15 :unverifiable 75 :is6-checked 57 :no-covering-read 60}
+   :receipt "2026-09-11-ldbc-snb-network-iteration-33-all-inserts-8slots.edn"}
+  {:inflight 32 :reads-rate 3072 :tcr 0.00015 :on-time-pct 100.0 :failures 0 :throughput-ops-s 4545.5 :reads-per-s 3072 :updates-per-s 1475 :updates-skipped 0
+   :read-after-write {:checked 276 :not-visible 0 :outside-window 0 :unverifiable 84 :is6-checked 57 :no-covering-read 60}
+   :receipt "2026-09-11-ldbc-snb-network-iteration-33-all-inserts-32slots.edn"}
+  {:inflight 32 :reads-rate 3584 :tcr 0.00015 :on-time-pct 42.09 :failures 0 :verdict :fails-95pct-rule :delay-p95-ms 2272 :note "control; the rule discriminates" :receipt "2026-09-11-ldbc-snb-network-iteration-33-all-inserts-32slots-fail-control.edn"}
+  {:inflight 8 :reads-rate 1536 :tcr 0.0002 :on-time-pct 58.50 :failures 0 :verdict :fails-95pct-rule :delay-p95-ms 2944 :note "control; refuted the 8-slot prediction (file overwritten by the passing re-sweep; numbers from the run's table)"}]
+ :not-an-ldbc-score "SF1 subset, 11 of 21 reads, all 8 inserts, no ACID suite, no auditor; audited No.1 (Huawei GES 3.1.0, SF300 139,411 ops/s) is 31x the 32-slot row on a dataset 300x larger"
+ :seeds [:s24-ic05-new-groups-covers-ins5 :adr-2609121100-decision-singleton-counterparts :s15-static-tables-for-ic-coverage :sweeps-must-end-on-a-failing-rate]}

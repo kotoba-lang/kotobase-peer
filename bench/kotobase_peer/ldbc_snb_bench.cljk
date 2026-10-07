@@ -1,0 +1,981 @@
+(ns kotobase-peer.ldbc-snb-bench
+  "LDBC SNB Interactive complex reads IC02 / IC07 / IC08 / IC09 against
+  kotobase's hot db and against Neo4j embedded, in the SAME JVM, over the
+  SAME real LDBC dataset.
+
+  Why: every prior kotobase head-to-head receipt (2026-07-25 Datomic /
+  Neo4j / RisingWave) measured a SINGLE-ATTRIBUTE point lookup and a full
+  scan, and said so -- \"no joins, no history queries, no concurrent load --
+  this is a first receipt, not a TPC substitute\". Those are the cheapest
+  queries a graph engine can be asked. NamiDB (namidb.com/benchmarks)
+  publishes exactly these four LDBC SNB Interactive queries against Kuzu and
+  Neo4j, so measuring the same four here is what makes the two projects'
+  numbers comparable at all -- and Neo4j, measured on BOTH sides, is the
+  common yardstick that lets a ratio survive the different machines.
+
+  Data: the real LDBC SNB Interactive v1 SF1 dataset (Datagen v1.0.0,
+  CsvComposite/LongDateFormatter, from the SURF/CWI repository), NOT a
+  synthetic imitation. SF1 in full is ~10.5M elements, far more than one
+  session can fold, so a DETERMINISTIC, STATED subset is loaded:
+
+    * ALL 9,892 persons and ALL 180,623 `knows` edges -- the social topology
+      that IC02/IC09's fan-out depends on is preserved exactly, not sampled.
+    * the `posts` most recent Posts by creationDate, plus EVERY Comment that
+      transitively replies into that set (whole conversation trees, so IC08's
+      reply lookup and IC07's likes have real depth, not truncated stubs).
+    * `hasCreator` for every included Message, and every `likes` edge whose
+      target Message is included.
+
+  Two modelling asymmetries, stated rather than averaged away:
+    * `knows` is stored ONE direction in the CSV and is undirected in the
+      LDBC spec. Neo4j matches it undirected natively (`-[:KNOWS]-`);
+      kotobase's datom model has no undirected edge, so BOTH directions are
+      asserted (2x the quads). This is what a real kotobase app would do.
+    * LDBC's `likes` edge carries a creationDate PROPERTY. Neo4j puts it on
+      the relationship; kotobase has no edge properties, so each like is
+      REIFIED into an entity with 3 datoms. Both the element counts and the
+      IC07 cost reflect that -- it is a genuine data-model cost, not overhead
+      the harness invented.
+    * kotobase's query language has no ORDER BY / LIMIT (arrangement.datalog
+      is a conjunctive Datalog with aggregates, no ordering), so the
+      top-20-by-date step runs in harness Clojure over the join's full
+      result. Neo4j does it inside Cypher. Both sides are timed to the SAME
+      final answer, and the answers are asserted EQUAL before any timing is
+      reported -- but the work is not distributed the same way, and that is
+      itself a finding about kotobase's query surface.
+
+  Usage: kbb -M:ldbc-snb-bench <ldbc-dynamic-dir> [posts] [samples] [params-dir]
+  With `params-dir` (substitution_parameters-sf<N> plus short_message_param.txt)
+  every served read is also compared with Neo4j over every official parameter
+  -- the reference the network rows cite."
+  (:require [kotoba.io :as kio] [kotobase-peer.core :as eng]
+            [arrangement.core :as qs]
+            [kotoba.lang.text :as str]
+            [clojure.java.io :as io])
+  (:import [org.neo4j.dbms.api DatabaseManagementServiceBuilder]
+           [org.neo4j.graphdb Label]
+           [java.util.concurrent TimeUnit]))
+
+;; ── CSV ────────────────────────────────────────────────────────────────────
+
+(defn- reduce-rows
+  "Stream one LDBC composite CSV through `rf` (header dropped), splitting each
+  line only as it is consumed. The comment and likes files are 2M+ rows each;
+  realising them as a seq of vectors was costing multiple GB of heap for data
+  the subset immediately discards."
+  [dir file rf init]
+  (let [f (io/file dir file)]
+    (when-not (.exists f)
+      (throw (ex-info "LDBC csv missing" {:file (.getPath f)})))
+    (with-open [r (io/reader f)]
+      (reduce (fn [acc line] (rf acc (str/split line #"\|" -1)))
+              init (rest (line-seq r))))))
+
+(defn- rows
+  "Fully realised rows -- only for the small files (person, knows)."
+  [dir file]
+  (reduce-rows dir file conj []))
+
+(defn- load-subset
+  "Real LDBC SF1, subset per the ns docstring. Two passes on purpose: the
+  reply forest is resolved from the (small-per-row) replyOf files first, so
+  the 2M-row comment body file is streamed once and only the kept rows are
+  retained."
+  [dir n-posts]
+  (let [persons (into {} (map (fn [[id fname lname & _]] [id [fname lname]]))
+                      (rows dir "person_0_0.csv"))
+        ;; profile fields (IS1) and friendship dates (IS3), ayatori iteration 24
+        profiles (into {} (map (fn [[id _ _ gender birthday cd ip browser & _]]
+                                 [id {:gender gender :birthday (parse-long birthday) :creationDate (parse-long cd)
+                                      :locationIP ip :browserUsed browser}]))
+                       (rows dir "person_0_0.csv"))
+        city (into {} (map (fn [[p place]] [p place])) (rows dir "person_isLocatedIn_place_0_0.csv"))
+        knows (mapv (fn [[a b cd]] [a b (parse-long cd)]) (rows dir "person_knows_person_0_0.csv"))
+        ;; posts: keep the n-posts most recent by creationDate
+        kept-posts (->> (reduce-rows dir "post_0_0.csv"
+                                     (fn [acc [id _img cd _ip _br _lang content _len]]
+                                       (conj! acc [id (parse-long cd) content]))
+                                     (transient []))
+                        persistent! (sort-by second >) (take n-posts) vec)
+        post-ids (into #{} (map first) kept-posts)
+        reply-post (reduce-rows dir "comment_replyOf_post_0_0.csv"
+                                (fn [acc [c p]] (if (post-ids p) (conj! acc c) acc))
+                                (transient []))
+        reply-comment (persistent!
+                       (reduce-rows dir "comment_replyOf_comment_0_0.csv"
+                                    (fn [acc [c p]] (conj! acc [c p])) (transient [])))
+        ;; fixpoint over the reply forest: a comment is kept if its parent is kept
+        kept-comments
+        (loop [frontier (set (persistent! reply-post)) kept #{}]
+          (if (empty? frontier)
+            kept
+            (let [kept' (into kept frontier)
+                  nxt (into #{} (comp (filter (fn [[_ parent]] (frontier parent)))
+                                      (map first)
+                                      (remove kept'))
+                            reply-comment)]
+              (recur nxt kept'))))
+        comment-meta (persistent!
+                      (reduce-rows dir "comment_0_0.csv"
+                                   (fn [acc [id cd _ip _br content _len]]
+                                     (if (kept-comments id)
+                                       (assoc! acc id [(parse-long cd) content])
+                                       acc))
+                                   (transient {})))
+        keep-pairs (fn [file pred]
+                     (persistent!
+                      (reduce-rows dir file
+                                   (fn [acc [a b]] (if (pred a) (assoc! acc a b) acc))
+                                   (transient {}))))
+        keep-likes (fn [file pred]
+                     (persistent!
+                      (reduce-rows dir file
+                                   (fn [acc [p m cd]]
+                                     (if (pred m) (conj! acc [p m (parse-long cd)]) acc))
+                                   (transient []))))]
+    {:persons persons
+     :knows knows
+     :messages (into (into {} (map (fn [[id cd content]] [id [cd content]])) kept-posts)
+                     (map (fn [c] [c (comment-meta c)])) kept-comments)
+     :post-ids post-ids
+     :comment-ids kept-comments
+     :creator (merge (keep-pairs "post_hasCreator_person_0_0.csv" post-ids)
+                     (keep-pairs "comment_hasCreator_person_0_0.csv" kept-comments))
+     :reply-of (into (into {} (filter (fn [[c p]] (and (kept-comments c) (post-ids p))))
+                           (persistent!
+                            (reduce-rows dir "comment_replyOf_post_0_0.csv"
+                                         (fn [acc [c p]] (conj! acc [c p])) (transient []))))
+                     (filter (fn [[c p]] (and (kept-comments c) (kept-comments p))))
+                     reply-comment)
+     :likes (into (keep-likes "person_likes_post_0_0.csv" post-ids)
+                  (keep-likes "person_likes_comment_0_0.csv" kept-comments))
+     :profiles profiles
+     :city city
+     ;; forums (IS6): the forum of every kept Post, its title, creationDate
+     ;; and moderator -- only forums that contain a kept post are loaded
+     :forums (let [post->forum (persistent!
+                                (reduce-rows dir "forum_containerOf_post_0_0.csv"
+                                             (fn [acc [f post]] (if (post-ids post) (assoc! acc post f) acc))
+                                             (transient {})))
+                   wanted (set (vals post->forum))
+                   moderator (persistent!
+                              (reduce-rows dir "forum_hasModerator_person_0_0.csv"
+                                           (fn [acc [f p]] (if (wanted f) (assoc! acc f p) acc))
+                                           (transient {})))
+                   meta (persistent!
+                         (reduce-rows dir "forum_0_0.csv"
+                                      (fn [acc [f title cd]] (if (wanted f) (assoc! acc f [title (parse-long cd)]) acc))
+                                      (transient {})))]
+               {:post->forum post->forum
+                :forums (into {} (map (fn [[f [title cd]]] [f {:title title :creationDate cd :moderator (get moderator f)}])) meta)})
+     ;; memberships (IC05, ayatori iteration 44): every forum_hasMember row,
+     ;; reified as INS5 reifies a membership -- mb:<forum>:<person> with its
+     ;; join date -- so the loaded and the streamed memberships have one shape.
+     ;; All of them: IC05 asks which forums a person's friends joined, and a
+     ;; forum without a kept post is still a forum they joined.
+     :memberships (persistent!
+                   (reduce-rows dir "forum_hasMember_person_0_0.csv"
+                                (fn [acc [f p jd]] (conj! acc [f p (parse-long jd)]))
+                                (transient [])))}))
+
+;; ── kotobase side ──────────────────────────────────────────────────────────
+
+(defn- build-kotobase
+  "Hot db built via `eng/transact` -- the same db VALUE the persisted path
+  produces (`hydrate-db` reduces `assert-quad` over cold rows into
+  `qs/empty-db`; `transact` is that same assert), without paying this
+  subset's AES-GCM + content-addressing write cost, which is measured
+  separately in the merkle-lsm receipts and is not what an IC query's
+  latency depends on. Stated, not hidden: no crypto and no persistence in
+  THIS number."
+  [{:keys [persons knows messages creator reply-of likes profiles city forums memberships]}]
+  (let [q (fn [s p o] {:s s :p p :o o})
+        ;; a LAZY seq of quads, transacted in batches: one transact over 20M
+        ;; quads (full SF1) held every quad map and every effective delta at
+        ;; once and ran a 13 GB heap out (ayatori iteration 25); 250k per
+        ;; batch bounds both, and the db value accumulates across batches
+        quads (concat
+               (for [[id [fname lname]] persons
+                     x [(q id "person/firstName" fname) (q id "person/lastName" lname)]] x)
+               (for [[id {:keys [gender birthday creationDate locationIP browserUsed]}] profiles
+                     x [(q id "person/gender" gender) (q id "person/birthday" (str birthday))
+                        (q id "person/creationDate" (str creationDate)) (q id "person/locationIP" locationIP)
+                        (q id "person/browserUsed" browserUsed)]] x)
+               (for [[p place] city] (q p "person/city" place))
+               ;; undirected -> both directions; the friendship date reified per
+               ;; direction (no edge properties): 3 datoms x 2 -- the data-model
+               ;; cost IS3 pays, stated like `likes` below
+               (for [[a b cd] knows
+                     x (concat [(q a "knows" b) (q b "knows" a)]
+                               (for [[x y] [[a b] [b a]]
+                                     :let [kid (str "kn:" x ":" y)]
+                                     z [(q kid "knows/person" x) (q kid "knows/friend" y) (q kid "knows/creationDate" (str cd))]] z))] x)
+               (for [[post f] (:post->forum forums)] (q post "post/forum" f))
+               (for [[f p jd] memberships
+                     :let [mb (str "mb:" f ":" p)]
+                     x [(q mb "membership/forum" f) (q mb "membership/person" p) (q mb "membership/joinDate" (str jd))]] x)
+               (for [[f {:keys [title creationDate moderator]}] (:forums forums)
+                     x (cond-> [(q f "forum/title" title) (q f "forum/creationDate" (str creationDate))]
+                         moderator (conj (q f "forum/moderator" moderator)))] x)
+               (for [[id [cd content]] messages
+                     x [(q id "message/creationDate" (str cd)) (q id "message/content" (or content ""))]] x)
+               (for [[m p] creator] (q m "hasCreator" p))
+               (for [[c parent] reply-of] (q c "replyOf" parent))
+               (for [[p m cd] likes                 ; reified: no edge properties
+                     :let [lid (str "like:" p ":" m)]
+                     x [(q lid "like/person" p) (q lid "like/message" m) (q lid "like/creationDate" (str cd))]] x))
+        result (reduce (fn [{:keys [db n]} batch]
+                         {:db (eng/transact db batch) :n (+ n (count batch))})
+                       {:db (eng/empty-db) :n 0}
+                       (partition-all 250000 quads))]
+    {:db (:db result) :quads (:n result)}))
+
+(def ^:private everything (constantly true))
+
+(defn- top20-before
+  "The date bound and the top-20 written INTO the query (ayatori iteration
+  18): `[(< ?date max)]` is fused by the engine into a range on
+  creationDate -- a keyed scan per bound message since datalog da95b877 --
+  and `:order-by`/`:limit` do the ordering. The bound is the STRING form of
+  max-date because creationDate is stored as a string here and the range
+  compares like with like; every stored value is a 13-digit epoch-ms, so
+  string order is date order. Rows come back `[x msg date-string]` and are
+  returned as `[x msg date-long]`, the shape the Neo4j gate compares.
+  The planner refuses to reorder a query with a predicate clause, so the
+  clause order written here is the plan."
+  [db where person max-date]
+  (->> (eng/query db
+                  {:find '[?x ?msg ?date]
+                   :in '[?person]
+                   :where (conj where [(list '< '?date (str max-date))])
+                   :order-by '[[?date :desc] [?msg :asc]]
+                   :limit 20}
+                  everything [person])
+       (mapv (fn [[x m d]] [x m (parse-long d)]))))
+
+(defn- kb-ic02
+  "IC02: the 20 most recent Messages by the start person's direct friends,
+  created before max-date. Date bound and top-20 inside the query."
+  [db person max-date]
+  (top20-before db '[[?person "knows" ?x]
+                     [?msg "hasCreator" ?x]
+                     [?msg "message/creationDate" ?date]]
+                person max-date))
+
+(defn- kb-ic09
+  "IC09: same as IC02 but over friends AND friends-of-friends, excluding the
+  start person. TWO joins unioned, not one join plus a query per reachable
+  person: a high-degree LDBC start person reaches ~1,300 people at two hops,
+  and issuing 1,300 point queries would measure the harness's loop rather
+  than the engine's join."
+  [db person max-date]
+  (let [one (top20-before db '[[?person "knows" ?x]
+                               [?msg "hasCreator" ?x]
+                               [?msg "message/creationDate" ?date]]
+                          person max-date)
+        ;; the two-hop half reaches the start person (a friend's friend is
+        ;; you); the exclusion is INSIDE the query so the limit is taken
+        ;; after it. Iteration 18 excluded afterwards, which cut rows the
+        ;; answer needed whenever the start person's own messages sat in the
+        ;; two-hop top 20 -- never on the subset (every official IC09 was
+        ;; empty there), caught by the startup gate on full SF1 (iteration
+        ;; 25, one parameter). The union's top 20 is a subset of the union of
+        ;; the two top-20s, so limiting each is exact once both are filtered.
+        two (top20-before db '[[?person "knows" ?f1]
+                               [?f1 "knows" ?x]
+                               [(not= ?x ?person)]
+                               [?msg "hasCreator" ?x]
+                               [?msg "message/creationDate" ?date]]
+                          person max-date)]
+    (->> (into one two)
+         distinct
+         (sort-by (juxt (comp - #(nth % 2)) second))
+         (take 20) vec)))
+
+(defn- kb-ic05
+  "IC05: the forums the start person's friends and friends-of-friends joined
+  after min-date, with the count of posts in each forum by those persons --
+  top 20 by count desc, forum id asc.
+
+  ONE query with the count in `:find` (ayatori iteration 47): the reach is
+  an `or-join` on [?person ?x] (a person who is both a friend and a
+  friend-of-friend is one ?x), the membership cut and the (creator, forum)
+  posts are the engine's composite lookups, and `(count ?post)` is pushed
+  into the last composite -- one weighted binding per (person, forum)
+  instead of one binding per post. Iteration 45 materialized ~200k
+  (forum, post) pairs per mid-timeline parameter to produce 20 counts."
+  [db person min-date]
+  (->> (eng/query db
+                  {:find '[?f (count ?post)]
+                   :in '[?person]
+                   :where [(list 'or-join '[?person ?x]
+                                 '[?person "knows" ?x]
+                                 (list 'and '[?person "knows" ?f1] '[?f1 "knows" ?x]))
+                           '[(not= ?x ?person)]
+                           '[?mb "membership/person" ?x]
+                           '[?mb "membership/joinDate" ?d]
+                           [(list '> '?d (str min-date))]
+                           '[?mb "membership/forum" ?f]
+                           '[?post "hasCreator" ?x]
+                           '[?post "post/forum" ?f]]}
+                  everything [person])
+       (sort-by (juxt (comp - second) first))
+       (take 20)
+       (mapv (fn [[f n]] [f n]))))
+
+(defn- kb-ic07
+  "IC07: the 20 most recent likes on the start person's Messages, one row per
+  liker (their latest like), like date desc then liker asc.
+
+  The top-N is written INTO the query (ayatori iteration 36) so the grouped
+  drive answers it: the driver is like/creationDate, the group is
+  `[?like like/message ?msg]` over the person's messages, and the drive
+  merges those groups' like orders instead of joining every like. One row
+  per liker is not a query clause, so N starts at 20 and doubles while the
+  N rows returned hold fewer than 20 distinct likers AND the query was not
+  exhausted (fewer than N rows back means there are no more)."
+  [db person]
+  (loop [n 20]
+    (let [rows (eng/query db
+                          {:find '[?liker ?msg ?date]
+                           :in '[?person]
+                           :where '[[?msg "hasCreator" ?person]
+                                    [?like "like/message" ?msg]
+                                    [?like "like/person" ?liker]
+                                    [?like "like/creationDate" ?date]]
+                           :order-by '[[?date :desc] [?liker :asc]]
+                           :limit n}
+                          everything [person])
+          per-liker (reduce (fn [acc [l m d]] (if (some #(= l (first %)) acc) acc (conj acc [l m (parse-long d)])))
+                            [] rows)]
+      (if (or (>= (count per-liker) 20) (< (count rows) n))
+        (vec (take 20 per-liker))
+        (recur (* 2 n))))))
+
+(defn- kb-ic08
+  "IC08: the 20 most recent Comments that are direct replies to the start
+  person's Messages, date desc then reply id asc. Top-20 inside the query
+  (ayatori iteration 36): the driver is the reply's creationDate, the group
+  is `[?reply replyOf ?msg]` over the person's messages."
+  [db person]
+  (->> (eng/query db
+                  '{:find [?author ?reply ?date]
+                    :in [?person]
+                    :where [[?msg "hasCreator" ?person]
+                            [?reply "replyOf" ?msg]
+                            [?reply "hasCreator" ?author]
+                            [?reply "message/creationDate" ?date]]
+                    :order-by [[?date :desc] [?reply :asc]]
+                    :limit 20}
+                  everything [person])
+       (mapv (fn [[a r d]] [a r (parse-long d)]))))
+
+;; ── kotobase side, index path ──────────────────────────────────────────────
+;; The same four reads written against the datom plane's index access paths
+;; (`entity` = EAVT, `datoms :avet [a v]` = AVET point lookup) instead of the
+;; Datalog join. ADR-2608039970: a surface whose algebra binds directly to L1
+;; index access may do so; `bridge/q` is an option, not the default. These
+;; exist because the co-scientist loop (ayatori iteration 16, 2026-09-11)
+;; found IC09 = 71% and IC08 = 25% of the SUT's CPU at its throughput
+;; ceiling, most of it in `datalog.core/hash-join-rows` building a broad
+;; index per query. Every one of these returns the SAME rows as its Datalog
+;; twin above -- `index-path-agrees?` checks that on real parameters and the
+;; net server refuses to serve the index path if it does not.
+
+(defn- by-avet
+  "Subjects with `[s p o]` -- the AVET point lookup. Straight off the index
+  (arrangement.core/by-predicate-value, a set of subjects): the public
+  `eng/datoms` route built one `{:e :a :v_edn :added}` map per subject and
+  wire-encoded the value, which was 20-30% of the IC09 twin on 80k messages
+  (ayatori iteration 26)."
+  [db p o]
+  (qs/by-predicate-value db p o))
+
+(defn- top-k-by
+  "The `k` smallest rows under `cmp`, kept in a bounded sorted set as rows
+  stream by -- so a twin that sees 80k candidate rows sorts 20, not 80k."
+  [k cmp rows]
+  (vec (reduce (fn [acc r]
+                 (let [acc (conj acc r)]
+                   (if (> (count acc) k) (disj acc (first (rseq acc))) acc)))
+               (sorted-set-by cmp)
+               rows)))
+
+(def ^:private newest-first-then-msg
+  "creationDate desc, message id asc -- the LDBC tie rule, as a comparator on
+  `[x msg date]` rows; distinct rows never compare equal (msg is a key)."
+  (fn [[xa ma da] [xb mb db2]]
+    (let [c (compare db2 da)] (if (zero? c) (let [c2 (compare ma mb)] (if (zero? c2) (compare xa xb) c2)) c))))
+
+(defn- attr1 [db s a] (first (get (eng/entity db s) a)))
+
+(defn- msg-rows
+  "[creator msg date] for every Message by `creator` with date < max-date."
+  [db creator max-date]
+  (keep (fn [m] (let [d (parse-long (attr1 db m "message/creationDate"))]
+                  (when (< d max-date) [creator m d])))
+        (by-avet db "hasCreator" creator)))
+
+(defn- kb-ic02-index [db person max-date]
+  (->> (get (eng/entity db person) "knows")
+       (mapcat #(msg-rows db % max-date))
+       (top-k-by 20 newest-first-then-msg)))
+
+(defn- kb-ic09-index [db person max-date]
+  (let [friends (get (eng/entity db person) "knows" #{})
+        fof (into friends (mapcat #(get (eng/entity db %) "knows")) friends)]
+    (->> (disj fof person)
+         (mapcat #(msg-rows db % max-date))
+         (top-k-by 20 newest-first-then-msg))))
+
+(defn- kb-ic05-index [db person min-date]
+  (let [friends (get (eng/entity db person) "knows" #{})
+        reach (disj (into friends (mapcat #(get (eng/entity db %) "knows" #{})) friends) person)
+        md (str min-date)]
+    (->> (for [x reach
+               post (by-avet db "hasCreator" x)
+               :let [f (attr1 db post "post/forum")]
+               :when f
+               :let [jd (attr1 db (str "mb:" f ":" x) "membership/joinDate")]
+               :when (and jd (pos? (compare jd md)))]
+           f)
+         frequencies
+         (sort-by (juxt (comp - val) key))
+         (take 20)
+         (mapv (fn [[f n]] [f n])))))
+
+(defn- kb-ic07-index [db person]
+  (->> (by-avet db "hasCreator" person)
+       (mapcat (fn [m] (map (fn [like] [(attr1 db like "like/person") m
+                                         (parse-long (attr1 db like "like/creationDate"))])
+                            (by-avet db "like/message" m))))
+       (group-by first)
+       (map (fn [[_ ls]] (first (sort-by (comp - #(nth % 2)) ls))))
+       (sort-by (juxt (comp - #(nth % 2)) first))
+       (take 20) vec))
+
+(defn- kb-ic08-index [db person]
+  (->> (by-avet db "hasCreator" person)
+       (mapcat (fn [m] (map (fn [r] [(attr1 db r "hasCreator") r
+                                      (parse-long (attr1 db r "message/creationDate"))])
+                            (by-avet db "replyOf" m))))
+       (sort-by (juxt (comp - #(nth % 2)) second))
+       (take 20) vec))
+
+;; ── short reads IS2 / IS4 / IS5 / IS7 (ayatori iteration 22) ─────────────
+;; LDBC SNB Interactive v1 short reads on the attributes this subset loads
+;; (names, message content and creationDate, hasCreator, replyOf, knows).
+;; IS1 (profile), IS3 (friends with friendship date) and IS6 (forum) need
+;; attributes the subset does not load and are not served. Each read is
+;; written twice, Datalog and index path, and gated like the complex reads.
+
+(defn- root-post
+  "Follow replyOf up to the message with no replyOf (the original Post)."
+  [db m]
+  (loop [m m n 0]
+    (let [parent (attr1 db m "replyOf")]
+      (if (or (nil? parent) (> n 64)) m (recur parent (inc n))))))
+
+(defn- person-name [db p]
+  (let [e (eng/entity db p)]
+    [(first (get e "person/firstName")) (first (get e "person/lastName"))]))
+
+(defn- kb-is2
+  "IS2: the 10 most recent Messages by the person -- [msg content date
+  root-post root-author root-first root-last], newest first, id desc on ties."
+  [db person]
+  (->> (eng/query db {:find '[?m ?c ?d] :in '[?p]
+                      :where '[[?m "hasCreator" ?p] [?m "message/creationDate" ?d] [?m "message/content" ?c]]
+                      :order-by '[[?d :desc] [?m :desc]] :limit 10}
+                  everything [person])
+       (mapv (fn [[m c d]]
+               (let [root (root-post db m) author (attr1 db root "hasCreator")
+                     [f l] (person-name db author)]
+                 [m c (parse-long d) root author f l])))))
+
+(defn- kb-is2-index [db person]
+  (->> (by-avet db "hasCreator" person)
+       (map (fn [m] [m (attr1 db m "message/content") (parse-long (attr1 db m "message/creationDate"))]))
+       (sort-by (fn [[m _ d]] [(- d) m]) (fn [[da ma] [db2 mb]] (let [c (compare da db2)] (if (zero? c) (compare mb ma) c))))
+       (take 10)
+       (mapv (fn [[m c d]]
+               (let [root (root-post db m) author (attr1 db root "hasCreator")
+                     [f l] (person-name db author)]
+                 [m c d root author f l])))))
+
+(defn- kb-is4
+  "IS4: a message's creationDate and content -- [date content] or []."
+  [db message]
+  (->> (eng/query db {:find '[?d ?c] :in '[?m]
+                      :where '[[?m "message/creationDate" ?d] [?m "message/content" ?c]]}
+                  everything [message])
+       (mapv (fn [[d c]] [(parse-long d) c]))))
+
+(defn- kb-is4-index [db message]
+  (let [e (eng/entity db message)]
+    (if-let [d (first (get e "message/creationDate"))]
+      [[(parse-long d) (first (get e "message/content"))]]
+      [])))
+
+(defn- kb-is5
+  "IS5: a message's creator -- [person first last] or []."
+  [db message]
+  (->> (eng/query db {:find '[?p ?f ?l] :in '[?m]
+                      :where '[[?m "hasCreator" ?p] [?p "person/firstName" ?f] [?p "person/lastName" ?l]]}
+                  everything [message])
+       vec))
+
+(defn- kb-is5-index [db message]
+  (if-let [p (attr1 db message "hasCreator")]
+    (let [[f l] (person-name db p)] [[p f l]])
+    []))
+
+(defn- kb-is7
+  "IS7: the replies to a message -- [reply content date author first last
+  knows?], newest first, author asc on ties; knows? = the reply's author and
+  the message's author know each other."
+  [db message]
+  (let [author (attr1 db message "hasCreator")
+        friends (get (eng/entity db author) "knows" #{})]
+    (->> (eng/query db {:find '[?r ?c ?d ?a ?f ?l] :in '[?m]
+                        :where '[[?r "replyOf" ?m] [?r "hasCreator" ?a] [?r "message/creationDate" ?d]
+                                 [?r "message/content" ?c] [?a "person/firstName" ?f] [?a "person/lastName" ?l]]}
+                    everything [message])
+         (map (fn [[r c d a f l]] [r c (parse-long d) a f l (contains? friends a)]))
+         (sort-by (juxt (comp - #(nth % 2)) #(nth % 3)))
+         vec)))
+
+(defn- kb-is7-index [db message]
+  (let [author (attr1 db message "hasCreator")
+        friends (get (eng/entity db author) "knows" #{})]
+    (->> (by-avet db "replyOf" message)
+         (map (fn [r] (let [e (eng/entity db r) a (first (get e "hasCreator")) [f l] (person-name db a)]
+                        [r (first (get e "message/content")) (parse-long (first (get e "message/creationDate"))) a f l (contains? friends a)])))
+         (sort-by (juxt (comp - #(nth % 2)) #(nth % 3)))
+         vec)))
+
+(defn- kb-is1
+  "IS1: a person's profile -- [first last birthday locationIP browserUsed
+  city gender creationDate] or []."
+  [db person]
+  (->> (eng/query db {:find '[?f ?l ?b ?ip ?br ?c ?g ?cd] :in '[?p]
+                      :where '[[?p "person/firstName" ?f] [?p "person/lastName" ?l] [?p "person/birthday" ?b]
+                               [?p "person/locationIP" ?ip] [?p "person/browserUsed" ?br] [?p "person/city" ?c]
+                               [?p "person/gender" ?g] [?p "person/creationDate" ?cd]]}
+                  everything [person])
+       (mapv (fn [[f l b ip br c g cd]] [f l (parse-long b) ip br c g (parse-long cd)]))))
+
+(defn- kb-is1-index [db person]
+  (let [e (eng/entity db person) one (fn [a] (first (get e a)))]
+    (if (one "person/firstName")
+      [[(one "person/firstName") (one "person/lastName") (parse-long (one "person/birthday")) (one "person/locationIP")
+        (one "person/browserUsed") (one "person/city") (one "person/gender") (parse-long (one "person/creationDate"))]]
+      [])))
+
+(defn- kb-is3
+  "IS3: a person's friends -- [friend first last friendshipDate], newest
+  friendship first, friend id asc on ties."
+  [db person]
+  (->> (eng/query db {:find '[?f ?fn ?ln ?d] :in '[?p]
+                      :where '[[?k "knows/person" ?p] [?k "knows/friend" ?f] [?k "knows/creationDate" ?d]
+                               [?f "person/firstName" ?fn] [?f "person/lastName" ?ln]]}
+                  everything [person])
+       (map (fn [[f fn ln d]] [f fn ln (parse-long d)]))
+       (sort-by (juxt (comp - #(nth % 3)) first))
+       vec))
+
+(defn- kb-is3-index [db person]
+  (->> (by-avet db "knows/person" person)
+       (map (fn [k] (let [f (attr1 db k "knows/friend") [fn ln] (person-name db f)]
+                      [f fn ln (parse-long (attr1 db k "knows/creationDate"))])))
+       (sort-by (juxt (comp - #(nth % 3)) first))
+       vec))
+
+(defn- kb-is6
+  "IS6: the forum of a message (of its root post) -- [forum title
+  moderator first last] or []."
+  [db message]
+  (let [root (root-post db message)]
+    (->> (eng/query db {:find '[?f ?t ?m ?fn ?ln] :in '[?post]
+                        :where '[[?post "post/forum" ?f] [?f "forum/title" ?t] [?f "forum/moderator" ?m]
+                                 [?m "person/firstName" ?fn] [?m "person/lastName" ?ln]]}
+                    everything [root])
+         vec)))
+
+(defn- kb-is6-index [db message]
+  (let [root (root-post db message) f (attr1 db root "post/forum")]
+    (if-let [m (and f (attr1 db f "forum/moderator"))]
+      (let [[fn ln] (person-name db m)] [[f (attr1 db f "forum/title") m fn ln]])
+      [])))
+
+(defn index-path-agrees?
+  "For every `{:op :person :max-date}` in `params`, the index path returns the
+  rows the Datalog path returns (ordered rows for IC02/IC08; IC07 compares
+  liker sets and IC09 message sets, the same tie rule the Neo4j gate uses).
+  Returns `{:checked n :disagreements [...]}` -- a count, so one disagreement
+  and a broken run are different answers."
+  [db max-date params]
+  (let [one (fn [{:keys [op person] :as p}]
+              (let [md (or (:max-date p) max-date)]
+                (case op
+                  :ic02 (= (kb-ic02 db person md) (kb-ic02-index db person md))
+                  :ic05 (= (kb-ic05 db person (:min-date p)) (kb-ic05-index db person (:min-date p)))
+                  :ic07 (= (set (map first (kb-ic07 db person))) (set (map first (kb-ic07-index db person))))
+                  :ic08 (= (kb-ic08 db person) (kb-ic08-index db person))
+                  :ic09 (= (set (map second (kb-ic09 db person md))) (set (map second (kb-ic09-index db person md))))
+                  :is2 (= (kb-is2 db person) (kb-is2-index db person))
+                  :is4 (= (kb-is4 db (:message p)) (kb-is4-index db (:message p)))
+                  :is5 (= (kb-is5 db (:message p)) (kb-is5-index db (:message p)))
+                  :is7 (= (kb-is7 db (:message p)) (kb-is7-index db (:message p)))
+                  :is1 (= (kb-is1 db person) (kb-is1-index db person))
+                  :is3 (= (kb-is3 db person) (kb-is3-index db person))
+                  :is6 (= (kb-is6 db (:message p)) (kb-is6-index db (:message p))))))]
+    {:checked (count params)
+     :disagreements (vec (remove one params))}))
+
+;; ── neo4j side ─────────────────────────────────────────────────────────────
+
+(def ^:private cy-ic02
+  "MATCH (p:Person {pid:$pid})-[:KNOWS]-(f:Person)<-[:HAS_CREATOR]-(m:Message)
+   WHERE m.creationDate < $maxDate
+   RETURN f.pid AS friend, m.pid AS msg, m.creationDate AS date
+   ORDER BY date DESC, msg ASC LIMIT 20")
+
+(def ^:private cy-ic09
+  "MATCH (p:Person {pid:$pid})-[:KNOWS*1..2]-(f:Person)<-[:HAS_CREATOR]-(m:Message)
+   WHERE m.creationDate < $maxDate AND f <> p
+   RETURN DISTINCT f.pid AS friend, m.pid AS msg, m.creationDate AS date
+   ORDER BY date DESC, msg ASC LIMIT 20")
+
+(def ^:private cy-ic07
+  "MATCH (p:Person {pid:$pid})<-[:HAS_CREATOR]-(m:Message)<-[l:LIKES]-(liker:Person)
+   WITH liker, m, l.creationDate AS date
+   ORDER BY date DESC
+   WITH liker, collect({m:m.pid, d:date})[0] AS top
+   RETURN liker.pid AS liker, top.m AS msg, top.d AS date
+   ORDER BY date DESC, liker ASC LIMIT 20")
+
+(def ^:private cy-ic08
+  "MATCH (p:Person {pid:$pid})<-[:HAS_CREATOR]-(m:Message)<-[:REPLY_OF]-(r:Message)-[:HAS_CREATOR]->(a:Person)
+   RETURN a.pid AS author, r.pid AS reply, r.creationDate AS date
+   ORDER BY date DESC, reply ASC LIMIT 20")
+
+(def ^:private cy-is2
+  "MATCH (p:Person {pid:$pid})<-[:HAS_CREATOR]-(m:Message)
+   WITH m ORDER BY m.creationDate DESC, m.pid DESC LIMIT 10
+   MATCH (m)-[:REPLY_OF*0..]->(root:Message) WHERE NOT (root)-[:REPLY_OF]->()
+   MATCH (root)-[:HAS_CREATOR]->(a:Person)
+   RETURN m.pid AS msg, m.content AS content, m.creationDate AS date,
+          root.pid AS root, a.pid AS author, a.firstName AS f, a.lastName AS l
+   ORDER BY date DESC, msg DESC")
+
+(def ^:private cy-is4
+  "MATCH (m:Message {pid:$mid}) RETURN m.creationDate AS date, m.content AS content")
+
+(def ^:private cy-is5
+  "MATCH (m:Message {pid:$mid})-[:HAS_CREATOR]->(p:Person)
+   RETURN p.pid AS person, p.firstName AS f, p.lastName AS l")
+
+(def ^:private cy-is7
+  "MATCH (m:Message {pid:$mid})<-[:REPLY_OF]-(r:Message)-[:HAS_CREATOR]->(a:Person)
+   MATCH (m)-[:HAS_CREATOR]->(ma:Person)
+   RETURN r.pid AS reply, r.content AS content, r.creationDate AS date,
+          a.pid AS author, a.firstName AS f, a.lastName AS l,
+          EXISTS { (a)-[:KNOWS]-(ma) } AS knows
+   ORDER BY date DESC, author ASC")
+
+(def ^:private cy-is1
+  "MATCH (p:Person {pid:$pid})
+   RETURN p.firstName AS f, p.lastName AS l, p.birthday AS b, p.locationIP AS ip,
+          p.browserUsed AS br, p.city AS c, p.gender AS g, p.creationDate AS cd")
+
+(def ^:private cy-is3
+  "MATCH (p:Person {pid:$pid})-[k:KNOWS]-(f:Person)
+   RETURN f.pid AS friend, f.firstName AS fn, f.lastName AS ln, k.creationDate AS d
+   ORDER BY d DESC, friend ASC")
+
+(def ^:private cy-is6
+  "MATCH (m:Message {pid:$mid})-[:REPLY_OF*0..]->(root:Message) WHERE NOT (root)-[:REPLY_OF]->()
+   MATCH (fo:Forum)-[:CONTAINER_OF]->(root) MATCH (fo)-[:HAS_MODERATOR]->(mod:Person)
+   RETURN fo.pid AS forum, fo.title AS title, mod.pid AS mod, mod.firstName AS fn, mod.lastName AS ln")
+
+(defn- batched!
+  "Run one parameterised write per chunk, each in its OWN transaction --
+  a single transaction holding half a million relationship creates is a
+  memory problem, not a benchmark."
+  [gdb q rows]
+  (doseq [chunk (partition-all 20000 rows)]
+    (with-open [tx (.beginTx gdb)]
+      (.execute tx q {"rows" (vec chunk)})
+      (.commit tx))))
+
+(defn- neo4j-load!
+  "Nodes, then constraints (own transaction -- Neo4j forbids schema and data
+  changes in the same tx), then await online, then relationships.
+
+  Two things here are load-bearing and were both wrong in the first draft:
+
+  UNIQUENESS CONSTRAINTS, not plain indexes. A unique constraint gives the
+  planner a UniqueIndexSeek it will always prefer; a plain index on a label
+  whose statistics are still empty right after creation can lose to a
+  NodeByLabelScan.
+
+  SEPARATE MATCH CLAUSES, not `MATCH (a:X {..}), (b:Y {..})`. The comma form
+  is planned as a cartesian product of two node scans unless the planner
+  pushes both property predicates into seeks; when it does not, a 20,000-row
+  batch turns into 20,000 x 2 x |label| node touches. Measured symptom: the
+  relationship phase ran for tens of minutes at ~20% of one core with the
+  store file not growing at all. Two separate MATCH clauses give the planner
+  no cartesian option to choose."
+  [gdb {:keys [persons knows messages creator reply-of likes profiles city forums]}]
+  (batched! gdb (str "UNWIND $rows AS r CREATE (:Person {pid:r.pid, firstName:r.f, lastName:r.l, "
+                     "gender:r.g, birthday:r.b, creationDate:r.cd, locationIP:r.ip, browserUsed:r.br, city:r.city})")
+            (mapv (fn [[id [f l]]] (let [pr (get profiles id)]
+                                     {"pid" id "f" f "l" l "g" (:gender pr) "b" (:birthday pr) "cd" (:creationDate pr)
+                                      "ip" (:locationIP pr) "br" (:browserUsed pr) "city" (get city id)}))
+                  persons))
+  (batched! gdb "UNWIND $rows AS r CREATE (:Forum {pid:r.pid, title:r.t, creationDate:r.cd})"
+            (mapv (fn [[f {:keys [title creationDate]}]] {"pid" f "t" title "cd" creationDate}) (:forums forums)))
+  (batched! gdb "UNWIND $rows AS r CREATE (:Message {pid:r.pid, creationDate:r.d, content:r.c})"
+            (mapv (fn [[id [d c]]] {"pid" id "d" d "c" (or c "")}) messages))
+  (with-open [tx (.beginTx gdb)]
+    (-> (.schema tx) (.constraintFor (Label/label "Person")) (.assertPropertyIsUnique "pid") (.create))
+    (-> (.schema tx) (.constraintFor (Label/label "Message")) (.assertPropertyIsUnique "pid") (.create))
+    (.commit tx))
+  (with-open [tx (.beginTx gdb)]
+    (-> (.schema tx) (.awaitIndexesOnline 600 TimeUnit/SECONDS)))
+  (batched! gdb (str "UNWIND $rows AS r "
+                     "MATCH (a:Person {pid:r.a}) MATCH (b:Person {pid:r.b}) "
+                     "CREATE (a)-[:KNOWS {creationDate:r.d}]->(b)")
+            (mapv (fn [[a b d]] {"a" a "b" b "d" d}) knows))
+  (with-open [tx (.beginTx gdb)]
+    (-> (.schema tx) (.constraintFor (Label/label "Forum")) (.assertPropertyIsUnique "pid") (.create))
+    (.commit tx))
+  (with-open [tx (.beginTx gdb)]
+    (-> (.schema tx) (.awaitIndexesOnline 600 TimeUnit/SECONDS)))
+  (batched! gdb (str "UNWIND $rows AS r "
+                     "MATCH (f:Forum {pid:r.f}) MATCH (m:Message {pid:r.m}) "
+                     "CREATE (f)-[:CONTAINER_OF]->(m)")
+            (mapv (fn [[post f]] {"f" f "m" post}) (:post->forum forums)))
+  (batched! gdb (str "UNWIND $rows AS r "
+                     "MATCH (f:Forum {pid:r.f}) MATCH (p:Person {pid:r.p}) "
+                     "CREATE (f)-[:HAS_MODERATOR]->(p)")
+            (vec (for [[f {:keys [moderator]}] (:forums forums) :when moderator] {"f" f "p" moderator})))
+  (batched! gdb (str "UNWIND $rows AS r "
+                     "MATCH (m:Message {pid:r.m}) MATCH (p:Person {pid:r.p}) "
+                     "CREATE (m)-[:HAS_CREATOR]->(p)")
+            (mapv (fn [[m p]] {"m" m "p" p}) creator))
+  (batched! gdb (str "UNWIND $rows AS r "
+                     "MATCH (c:Message {pid:r.c}) MATCH (p:Message {pid:r.p}) "
+                     "CREATE (c)-[:REPLY_OF]->(p)")
+            (mapv (fn [[c p]] {"c" c "p" p}) reply-of))
+  (batched! gdb (str "UNWIND $rows AS r "
+                     "MATCH (p:Person {pid:r.p}) MATCH (m:Message {pid:r.m}) "
+                     "CREATE (p)-[:LIKES {creationDate:r.d}]->(m)")
+            (mapv (fn [[p m d]] {"p" p "m" m "d" d}) likes)))
+
+(defn- neo4j-rows [tx cypher params]
+  (with-open [res (.execute tx cypher params)]
+    (mapv (fn [^java.util.Map row] (into {} (map (fn [[k v]] [(keyword k) v])) row))
+          (iterator-seq res))))
+
+;; ── measurement ────────────────────────────────────────────────────────────
+
+(defn- elapsed-ms [f]
+  (let [start (System/nanoTime) result (f)]
+    {:ms (/ (- (System/nanoTime) start) 1e6) :result result}))
+
+(defn- percentile [xs q]
+  (let [s (vec (sort xs))]
+    (nth s (min (dec (count s)) (long (Math/floor (* q (count s))))))))
+
+(defn- stats [xs]
+  {:p50-ms (percentile xs 0.50) :p95-ms (percentile xs 0.95)
+   :p99-ms (percentile xs 0.99)
+   :mean-ms (/ (reduce + xs) (double (count xs)))
+   :samples (count xs)})
+
+(defn- pick-persons
+  "Deterministic start-person set: the persons with the most `knows` edges,
+  which is where LDBC's own parameter curation aims (a start person with no
+  friends measures nothing). Sorted by id for reproducibility."
+  [{:keys [knows]} n]
+  (let [deg (reduce (fn [m [a b]] (-> m (update a (fnil inc 0)) (update b (fnil inc 0)))) {} knows)]
+    (->> deg (sort-by (juxt (comp - val) key)) (take n) (mapv key) sort vec)))
+
+(defn- read-param-lines [params-dir file]
+  (->> (str/split-lines (slurp (str params-dir "/" file))) rest (remove empty?) vec))
+
+(defn reference-agreement
+  "Every served read against Neo4j on the OFFICIAL parameters (and this
+  subset's short-read message ids), not only on the first start person:
+  `{op {:checked n :disagreements [...]}}`. IC02/IC08/IS2/IS4/IS5/IS7 compare
+  ordered rows; IC07 liker sets and IC09 message sets (creationDate ties at
+  the limit boundary, as the first-person gate already does). A count per
+  op, so one disagreement and a broken run are different answers."
+  [db tx max-date params-dir]
+  (let [split (fn [line] (str/split line #"\|"))
+        norm-kb (fn [rows] (mapv (fn [r] [(str (first r)) (str (second r)) (nth r 2)]) rows))
+        norm-neo (fn [rows ka kb] (mapv (fn [r] [(str (get r ka)) (str (get r kb)) (:date r)]) rows))
+        ic (fn [n f] (let [lines (read-param-lines params-dir (str "interactive_" n "_param.txt"))
+                           bad (remove (fn [line] (let [[p md] (split line)] (f p (if md (parse-long md) max-date)))) lines)]
+                       {:checked (count lines) :disagreements (vec bad)}))
+        msgs (read-param-lines params-dir "short_message_param.txt")
+        is (fn [f] (let [bad (remove f msgs)] {:checked (count msgs) :disagreements (vec bad)}))
+        is2-persons (read-param-lines params-dir "interactive_7_param.txt")]
+    {:ic02 (ic 2 (fn [p md] (= (norm-kb (kb-ic02 db p md)) (norm-neo (neo4j-rows tx cy-ic02 {"pid" p "maxDate" md}) :friend :msg))))
+     :ic07 (ic 7 (fn [p _] (= (set (map first (kb-ic07 db p))) (set (map (comp str :liker) (neo4j-rows tx cy-ic07 {"pid" p}))))))
+     :ic08 (ic 8 (fn [p _] (= (norm-kb (kb-ic08 db p)) (norm-neo (neo4j-rows tx cy-ic08 {"pid" p}) :author :reply))))
+     :ic09 (ic 9 (fn [p md] (= (set (map second (kb-ic09 db p md))) (set (map (comp str :msg) (neo4j-rows tx cy-ic09 {"pid" p "maxDate" md}))))))
+     :is2 (let [bad (remove (fn [p] (= (kb-is2 db p)
+                                       (mapv (fn [r] [(str (:msg r)) (:content r) (:date r) (str (:root r)) (str (:author r)) (:f r) (:l r)])
+                                             (neo4j-rows tx cy-is2 {"pid" p}))))
+                            is2-persons)]
+            {:checked (count is2-persons) :disagreements (vec bad)})
+     :is4 (is (fn [m] (= (kb-is4 db m) (mapv (fn [r] [(:date r) (:content r)]) (neo4j-rows tx cy-is4 {"mid" m})))))
+     :is5 (is (fn [m] (= (kb-is5 db m) (mapv (fn [r] [(str (:person r)) (:f r) (:l r)]) (neo4j-rows tx cy-is5 {"mid" m})))))
+     :is1 (let [bad (remove (fn [p] (= (kb-is1 db p)
+                                       (mapv (fn [r] [(:f r) (:l r) (:b r) (:ip r) (:br r) (str (:c r)) (:g r) (:cd r)])
+                                             (neo4j-rows tx cy-is1 {"pid" p}))))
+                            is2-persons)]
+            {:checked (count is2-persons) :disagreements (vec bad)})
+     :is3 (let [bad (remove (fn [p] (= (kb-is3 db p)
+                                       (mapv (fn [r] [(str (:friend r)) (:fn r) (:ln r) (:d r)])
+                                             (neo4j-rows tx cy-is3 {"pid" p}))))
+                            is2-persons)]
+            {:checked (count is2-persons) :disagreements (vec bad)})
+     :is6 (is (fn [m] (= (kb-is6 db m)
+                         (mapv (fn [r] [(str (:forum r)) (:title r) (str (:mod r)) (:fn r) (:ln r)])
+                               (neo4j-rows tx cy-is6 {"mid" m})))))
+     :is7 (is (fn [m] (= (kb-is7 db m)
+                         (mapv (fn [r] [(str (:reply r)) (:content r) (:date r) (str (:author r)) (:f r) (:l r) (boolean (:knows r))])
+                               (neo4j-rows tx cy-is7 {"mid" m})))))}))
+
+(defn -main [& args]
+  (let [dir (or (first args)
+                (throw (ex-info "usage: kbb -M:ldbc-snb-bench <ldbc-dynamic-dir> [posts] [samples]" {})))
+        n-posts (parse-long (or (second args) "35000"))
+        samples (parse-long (or (nth args 2 nil) "30"))
+        params-dir (nth args 3 nil)
+        load-t (elapsed-ms #(load-subset dir n-posts))
+        data (:result load-t)
+        max-date (+ 1 (reduce max 0 (keep first (vals (:messages data)))))
+        starts (pick-persons data samples)
+        elements {:persons (count (:persons data))
+                  :knows-edges (count (:knows data))
+                  :messages (count (:messages data))
+                  :posts (count (:post-ids data))
+                  :comments (count (:comment-ids data))
+                  :has-creator (count (:creator data))
+                  :reply-of (count (:reply-of data))
+                  :likes (count (:likes data))}
+        elements (assoc elements :total (reduce + (vals (dissoc elements :posts :comments))))
+        kb-build (elapsed-ms #(build-kotobase data))
+        {:keys [db quads]} (:result kb-build)
+        tmp (kio/temp-dir "ldbc-neo4j")
+        dbms (.build (DatabaseManagementServiceBuilder. (.toPath tmp)))
+        gdb (.database dbms "neo4j")
+        neo-load (elapsed-ms #(neo4j-load! gdb data))
+        ;; ---- correctness: the two engines must agree before any timing counts
+        agreement
+        (with-open [tx (.beginTx gdb)]
+          (let [p (first starts)
+                norm-kb (fn [rows] (mapv (fn [r] [(str (first r)) (str (second r)) (nth r 2)]) rows))
+                norm-neo (fn [rows ka kb] (mapv (fn [r] [(str (get r ka)) (str (get r kb)) (:date r)]) rows))]
+            {:ic02 (= (norm-kb (kb-ic02 db p max-date))
+                      (norm-neo (neo4j-rows tx cy-ic02 {"pid" p "maxDate" max-date}) :friend :msg))
+             :ic07 (= (set (map first (kb-ic07 db p)))
+                      (set (map (comp str :liker) (neo4j-rows tx cy-ic07 {"pid" p}))))
+             :ic08 (= (norm-kb (kb-ic08 db p))
+                      (norm-neo (neo4j-rows tx cy-ic08 {"pid" p}) :author :reply))
+             :ic09 (= (set (map second (kb-ic09 db p max-date)))
+                      (set (map (comp str :msg) (neo4j-rows tx cy-ic09 {"pid" p "maxDate" max-date}))))}))
+        ;; ---- the same, over every official parameter (and the subset's
+        ;; short-read messages) when a params dir is given -- the reference
+        ;; the network rows cite (ayatori iteration 23)
+        official-agreement (when params-dir
+                             (with-open [tx (.beginTx gdb)]
+                               (reference-agreement db tx max-date params-dir)))
+        ;; ---- warm both engines
+        _ (with-open [tx (.beginTx gdb)]
+            (doseq [p (take 5 starts)]
+              (kb-ic02 db p max-date) (kb-ic07 db p) (kb-ic08 db p) (kb-ic09 db p max-date)
+              (neo4j-rows tx cy-ic02 {"pid" p "maxDate" max-date})
+              (neo4j-rows tx cy-ic07 {"pid" p})
+              (neo4j-rows tx cy-ic08 {"pid" p})
+              (neo4j-rows tx cy-ic09 {"pid" p "maxDate" max-date})))
+        ;; INTERLEAVED, one start person at a time, both engines before moving
+        ;; on. This used to run all 15 kotobase samples and THEN all 15 Neo4j
+        ;; samples, which meant the two halves saw different minutes of a shared
+        ;; machine -- and the kb/neo ratio was presented in every receipt as the
+        ;; load-invariant column precisely because both engines were supposed to
+        ;; be measured under the same conditions.
+        ;;
+        ;; They were not. Measured (bench/results/
+        ;; 2026-08-02-limit-pushdown-third-attempt.edn): across two runs of
+        ;; BYTE-IDENTICAL kotobase code, IC07's kotobase side went 6.4 -> 16.1 ms
+        ;; while its Neo4j side went 1.4 -> 1.2 ms, moving the ratio 4.7x ->
+        ;; 13.9x with nothing changed. That is the defect this fixes, and it
+        ;; invalidates 20-30% movements in every ratio measured before it.
+        both (with-open [tx (.beginTx gdb)]
+               (reduce
+                (fn [acc p]
+                  (-> acc
+                      (update-in [:kb :ic02] conj (:ms (elapsed-ms #(kb-ic02 db p max-date))))
+                      (update-in [:neo :ic02] conj (:ms (elapsed-ms #(neo4j-rows tx cy-ic02 {"pid" p "maxDate" max-date}))))
+                      (update-in [:kb :ic07] conj (:ms (elapsed-ms #(kb-ic07 db p))))
+                      (update-in [:neo :ic07] conj (:ms (elapsed-ms #(neo4j-rows tx cy-ic07 {"pid" p}))))
+                      (update-in [:kb :ic08] conj (:ms (elapsed-ms #(kb-ic08 db p))))
+                      (update-in [:neo :ic08] conj (:ms (elapsed-ms #(neo4j-rows tx cy-ic08 {"pid" p}))))
+                      (update-in [:kb :ic09] conj (:ms (elapsed-ms #(kb-ic09 db p max-date))))
+                      (update-in [:neo :ic09] conj (:ms (elapsed-ms #(neo4j-rows tx cy-ic09 {"pid" p "maxDate" max-date}))))))
+                {:kb {:ic02 [] :ic07 [] :ic08 [] :ic09 []}
+                 :neo {:ic02 [] :ic07 [] :ic08 [] :ic09 []}}
+                starts))
+        kb-times (:kb both)
+        neo-times (:neo both)
+        ;; The ratio taken PER SAMPLE and then summarised, not as a quotient of
+        ;; two independently-summarised numbers. A per-sample ratio cancels
+        ;; whatever the machine was doing during that pair; a quotient of
+        ;; medians does not.
+        paired-ratios (into {}
+                            (map (fn [k]
+                                   [k (stats (mapv / (get kb-times k) (get neo-times k)))]))
+                            [:ic02 :ic07 :ic08 :ic09])]
+    (.shutdown dbms)
+    (prn
+     {:schema 1
+      :receipt/type :ldbc-snb-interactive
+      :implementation "kotobase-peer.ldbc-snb-bench"
+      :dataset {:name "LDBC SNB Interactive v1, SF1, Datagen v1.0.0, CsvComposite/LongDateFormatter"
+                :source "https://repository.surfsara.nl/datasets/cwi/ldbc-snb-interactive-v1-datagen-v100"
+                :subset-rule (str "all persons + all knows; " n-posts " most recent Posts + full transitive reply trees; "
+                                  "hasCreator for included Messages; likes onto included Messages")
+                :elements elements
+                :load-ms (:ms load-t)}
+      :kotobase {:quads quads
+                 :build-ms (:ms kb-build)
+                 :note "hot db via eng/transact -- same db value the persisted path hydrates to; no AES-GCM/content-addressing in this number"
+                 :ic02 (stats (:ic02 kb-times)) :ic07 (stats (:ic07 kb-times))
+                 :ic08 (stats (:ic08 kb-times)) :ic09 (stats (:ic09 kb-times))}
+      :neo4j-embedded {:load-ms (:ms neo-load)
+                       :version "org.neo4j/neo4j 2025.03.0 embedded (community), temp on-disk store, pid UNIQUE constraints awaited online"
+                       :ic02 (stats (:ic02 neo-times)) :ic07 (stats (:ic07 neo-times))
+                       :ic08 (stats (:ic08 neo-times)) :ic09 (stats (:ic09 neo-times))}
+      :answers-agree agreement
+      :answers-agree-official (when official-agreement
+                                (into {} (map (fn [[op v]] [op (assoc v :disagreements (count (:disagreements v))
+                                                                          :first-disagreement (first (:disagreements v)))]))
+                                      official-agreement))
+      :paired-ratio
+      (assoc paired-ratios
+             :note "kotobase-ms / neo4j-ms computed PER SAMPLE with the two engines run back to back, then summarised. This is the column to compare across runs; a quotient of two separately-summarised medians is not, which is what every receipt before 2026-08-02 used.")
+      :start-persons {:n (count starts) :rule "highest knows-degree, sorted by id"}
+      :caveats
+      ["Subset of SF1, not full SF1 (~10.5M elements) -- the subset rule is stated above and is deterministic."
+       "kotobase has no ORDER BY/LIMIT in its query language; the top-20 step runs in harness Clojure over the join's full result, while Neo4j does it inside Cypher. Both are timed to the same final answer and the answers are asserted equal."
+       "kotobase stores knows in both directions (no undirected edge) and reifies likes (no edge properties); Neo4j uses a native undirected match and a relationship property."
+       "kotobase's number is a hot in-memory db with no encryption and no persistence; the persisted path additionally pays hydration, which is measured in ADR-2607310900 and the dag-shape receipt, not here."
+       "Neo4j embedded has no pure in-memory mode; its temp on-disk store is read through the page cache after warmup."
+       "Single machine, single JVM, no concurrency. NamiDB's published numbers are on different hardware -- only the ratio against the shared Neo4j yardstick is comparable, and only loosely."
+       "IC07/IC09 agreement compares result SETS (likers / message ids) rather than ordered rows: both queries can have creationDate ties at the LIMIT-20 boundary, where the two engines are free to pick different rows. IC02/IC08 are compared as ordered rows. A reported disagreement is reported, never relaxed after the fact."]})))

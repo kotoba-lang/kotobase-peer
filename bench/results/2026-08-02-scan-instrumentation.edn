@@ -1,0 +1,57 @@
+{:schema 1
+ :receipt/type :scan-instrumentation
+ :date "2026-08-02"
+ :implementation "kotobase-peer.scan-instrument -- arrangement.datalog/scan* wrapped with a counter via with-redefs; nothing reimplemented, nothing changed in the library"
+ :adr "ADR-2608021000 -- closes the 30x that 2026-08-02-ic02-diagnosis.edn opened, and corrects two numbers I published"
+ :pins {:old "arrangement 1c0f86a0 -- before join batching" :new "arrangement 5519c5eb -- batching + hash join, post-revert"}
+ :note "Both runs: kotobase-peer at 74e01be, identical dataset (210,389 elements / 409,877 quads), same machine, back to back."
+
+ :measured
+ {:ic09-two-hop
+  {:scans {:old 143270 :new 885 :reduction 162.0}
+   :rows-returned {:old 230321 :new 70927}
+   :execute-wall-ms {:old 5270.6 :new 1872.8}
+   :time-inside-scans-ms {:old 4249.3 :new 174.4}
+   :scan-share-of-execute {:old 0.81 :new 0.09}
+   :planning-wall-ms {:old 928.9 :new 1153.3}}
+  :ic02
+  {:scans {:old 1793 :new 1793 :reduction 1.0}
+   :rows-returned {:old 2702 :new 2702}
+   :execute-wall-ms {:old 98.5 :new 197.8}
+   :time-inside-scans-ms {:old 73.2 :new 131.8}
+   :planning-wall-ms {:old 29.8 :new 55.8}}}
+
+ :correction-1-the-batching-win-was-overstated
+ "I reported ~11.5x for the join work (2026-08-02-ic09-after-hash-join.edn). It is about 3.5x.
+
+  The baseline that number rested on -- 35,641 ms for IC09 execute, from 2026-08-01-ic09-diagnosis.edn -- was taken on a host at load average 150-190. The SAME pre-batching code, measured here on a quiet machine, does it in 5,270 ms. The baseline was inflated roughly sevenfold by the host, and every ratio computed against it inherited that.
+
+  Load-corrected against planning (unchanged code in both runs, 928.9 -> 1153.3 ms, so this run's host was ~1.24x slower): execute went 5,270.6 -> 1,872.8 ms raw, 2.81x, times 1.24 = about 3.5x attributable to the change.
+
+  The load control I built caught inflation twice and still missed this, because it corrects WITHIN a pair of runs -- it cannot tell you the pair itself was taken somewhere unrepresentative. I compared one version measured fresh against another version remembered."
+
+ :correction-2-ic02-did-not-regress
+ "I reported IC02 as a regression I introduced (7.7x -> 14.7x -> 19.2x of Neo4j across three LDBC runs) and spent two changes on it, one shipped and reverted.
+
+  It does not appear here. IC02 issues exactly 1,793 scans returning exactly 2,702 rows on BOTH pins -- the change does not touch what it asks the store. Execute went 98.5 -> 197.8 ms raw, 2.01x, against a host its own planning says was 1.87x slower (29.8 -> 55.8 ms for identical planner code). That leaves about 1.07x: unchanged.
+
+  What moved in the LDBC receipts was a ratio whose denominator is Neo4j's IC02 at 5 ms -- too small and too different a workload to control a kotobase query dominated by planner probes. IC02 was never the regression I thought it was, and neither explanation I gave for it was answering a real question."
+
+ :what-the-instrumentation-actually-shows
+ ["162x fewer scans (143,270 -> 885) is the load-invariant product of batching plus hash join. It does not move with the host, and it is the number worth quoting."
+  "Only 9% of IC09 execute is now inside the store (174 of 1,873 ms), down from 81%. Scan-side work is finished as a source of wins; what remains is the join's own bookkeeping -- grouping, hash index construction, unification, set building."
+  "The planner's probes do not go through scan* at all (0 counted, yet 1,153 ms of planning wall for IC09) -- they call arrangement.query/query directly. Planning is now 38% of IC09's total, and all of it is scanning to learn a number :query-statistics could supply."
+  "Rows returned fell 230,321 -> 70,927, so the hash join is not only batching requests -- it stops re-fetching the same rows for different bindings."]
+
+ :next
+ "Two things, in order. First :query-statistics: planning is 38% of IC09 and is pure waste. Second the join's own bookkeeping, now 91% of execute.
+
+  And a method fix: never compare a fresh measurement against a remembered one. Both versions, same machine, same session, or it is not a comparison."
+
+ :caveats
+ ["Single run per pin, one start person. Counts are exact and load-invariant; millisecond figures are within-run ratios only."
+  "The counter itself adds per-call overhead, which inflates the OLD pin more than the NEW (143,270 calls against 885) -- so 3.5x is if anything generous to the change."
+  "The planner's probes are invisible to this counter because they bypass scan*; their cost appears only as planning wall time."]
+
+ :raw-new {:schema 1, :start-person "17592186053137", :analyses [{:query :ic02, :planning {:ms 55.801917, :scans 0, :rows-returned 0, :scan-ms 0.0, :by-pattern-shape {}}, :executing {:ms 197.790041, :scans 1793, :rows-returned 2702, :scan-ms 131.812668, :by-pattern-shape {[true true false] 911, [false true true] 882}, :result-rows 910}, :scan-share-of-execute 0.6664272242099388} {:query :ic09-two-hop, :planning {:ms 1153.277166, :scans 0, :rows-returned 0, :scan-ms 0.0, :by-pattern-shape {}}, :executing {:ms 1872.783, :scans 885, :rows-returned 70927, :scan-ms 174.379723, :by-pattern-shape {[true true false] 883, [false true false] 2}, :result-rows 6733}, :scan-share-of-execute 0.09311261528965183}], :adr "ADR-2608021000 -- close the 30x between the reimplemented strategies and the real engine", :caveats ["scan* is wrapped via with-redefs, so this is the real engine with a counter around one function -- nothing is reimplemented." "Counts and rows are load-invariant; the ms figures are not. Compare counts across runs, and treat times as within-run ratios." "Single run, one start person. A diagnosis, not a benchmark."], :arrangement-pin "see deps.edn", :receipt/type :scan-instrumentation, :reading "For each query, :planning and :executing each report how many times the engine called scan*, how many rows those calls returned, and how much of the wall time was inside them. :by-pattern-shape keys are [s-bound? p-bound? o-bound?] -- [false true false] is a broad scan of an attribute, [true true false] is a keyed seek. If execute time is not mostly scan time, the cost is in the join's own bookkeeping, not in the store.", :implementation "kotobase-peer.scan-instrument", :dataset {:subset-posts 3000, :quads 409877, :messages 7355}}
+ :raw-old {:schema 1, :start-person "17592186053137", :analyses [{:query :ic02, :planning {:ms 29.825541, :scans 0, :rows-returned 0, :scan-ms 0.0, :by-pattern-shape {}}, :executing {:ms 98.458583, :scans 1793, :rows-returned 2702, :scan-ms 73.189013, :by-pattern-shape {[true true false] 911, [false true true] 882}, :result-rows 910}, :scan-share-of-execute 0.7433482259235845} {:query :ic09-two-hop, :planning {:ms 928.892167, :scans 0, :rows-returned 0, :scan-ms 0.0, :by-pattern-shape {}}, :executing {:ms 5270.642333, :scans 143270, :rows-returned 230321, :scan-ms 4249.324254, :by-pattern-shape {[true true false] 87935, [false true true] 55335}, :result-rows 6733}, :scan-share-of-execute 0.8062251212522185}], :adr "ADR-2608021000 -- close the 30x between the reimplemented strategies and the real engine", :caveats ["scan* is wrapped via with-redefs, so this is the real engine with a counter around one function -- nothing is reimplemented." "Counts and rows are load-invariant; the ms figures are not. Compare counts across runs, and treat times as within-run ratios." "Single run, one start person. A diagnosis, not a benchmark."], :arrangement-pin "see deps.edn", :receipt/type :scan-instrumentation, :reading "For each query, :planning and :executing each report how many times the engine called scan*, how many rows those calls returned, and how much of the wall time was inside them. :by-pattern-shape keys are [s-bound? p-bound? o-bound?] -- [false true false] is a broad scan of an attribute, [true true false] is a keyed seek. If execute time is not mostly scan time, the cost is in the join's own bookkeeping, not in the store.", :implementation "kotobase-peer.scan-instrument", :dataset {:subset-posts 3000, :quads 409877, :messages 7355}}}

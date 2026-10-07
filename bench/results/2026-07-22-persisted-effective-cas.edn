@@ -1,5 +1,5 @@
 {:date "2026-07-22"
- :command "clojure -M:persisted-effective-bench 10000 20"
+ :command "kbb -M:persisted-effective-bench 10000 20"
  :environment {:runtime "OpenJDK 26.0.1"
                :store :in-memory
                :crypto :identity

@@ -1,0 +1,13 @@
+{:receipt/type :ldbc-snb-interactive-network-iteration
+ :iteration 42
+ :date "2026-09-12"
+ :benchmark :ldbc-snb-interactive-network-v2
+ :s33 {:change {:repo "kotoba-lang/datalog" :sha "3ebd67ddd5ac176416076f368b25378f4ccd5ca9" :what "join-clause: [?e a ?v] with ?e bound in every binding, and [?e a v] with v bound/ground and ?e free, extend each binding from one :eavt / :avet lookup; the general path (substitute, group-by, scan to a vector of quad maps, unify) stays for every other shape and for pattern sources"}
+       :at-saturation-ms-p50 {:before {:is3 5.82 :ic07 4.05 :ic09 5.12 :ic02 0.58 :ic08 0.40 :is2 0.12}
+                              :after {:is3 5.29 :ic07 3.72 :ic09 5.00 :ic02 0.59 :ic08 0.57 :is2 0.36 :is7 0.18}
+                              :reading "IS3 -9%, IC07 -8%, IC09 -2%; IS2 and IC08 read +0.2 ms, which is inside restart-to-restart variance for sub-millisecond ops (IC08 moved 0.68 -> 0.40 across two restarts in iteration 41 with no relevant change) -- an A/B inside one JVM is the only way to see a 0.2 ms difference, and it was not done"}
+       :sweep {:inflight 64 :sut-threads 16 :reads-rate 3328 :throughput-ops-s 4785.6 :on-time-pct 100.0 :next-rate 3712 :next-on-time-pct 65.1 :verdict "unchanged from iteration 41 (4797.0): the ceiling is the host's total CPU, and the keyed path was ~1 us of a 1.2 ms mean op"}}
+ :sut {:host "levi (M4: 4P+6E)" :threads 16 :gate {:checked 1082 :disagreements 0} :order-rebuilds {:value 1 :group 3}}
+ :rows "none moved; iteration 41's 4797.0 stands (this sweep 4785.6 at the same rate)"
+ :not-an-ldbc-score "SF1 is below the audited table; 11 of 21 reads; subset-derived parameters; no ACID suite; no auditor."
+ :seeds [:m4-p-cores-is-the-wall :s26-full-data-parameter-set :s23b-ic05 :m3-sf3 :s34-is3-still-7x-its-twin-the-binding-maps-themselves]}

@@ -1,0 +1,41 @@
+{:schema 1
+ :receipt/type :projection-pushdown-effect
+ :date "2026-08-02"
+ :implementation "kotobase-peer.scan-instrument, both pins run back to back in the same window"
+ :adr "ADR-2608021000 §6-5 B-3 -- drop variables no remaining clause and no output reads"
+ :pins {:b1-only "arrangement 68c2225d" :b1-and-b3 "arrangement 83b3fe95"}
+
+ :measured-same-window
+ {:ic09-two-hop {:executing-ms {:b1 1183.4 :b3 412.3 :ratio 2.87}
+                 :planning-ms {:b1 157.1 :b3 153.8 :ratio 1.02}
+                 :scans {:b1 885 :b3 885}}
+  :ic02 {:executing-ms {:b1 164.5 :b3 144.2 :ratio 1.14}
+         :planning-ms {:b1 11.2 :b3 14.2 :ratio 0.79}
+         :scans {:b1 1793 :b3 1793}}}
+
+ :result
+ "IC09 execute is 2.87x faster. Planning is flat at 1.02x -- and planning is unchanged code between these pins, so it is the load control, and it says the host did not move. IC02 is 1.14x, within noise.
+
+  Scans are identical (885 / 1,793) on both pins, so the plan and the store traffic are unchanged. What changed is how many bindings the join carries between steps: IC09 was moving 55,335 into a step that used 8,130 distinct values of one variable, and those 47,000 existed only because two earlier variables were still attached."
+
+ :a-regression-i-reported-and-then-unreported
+ "Measuring B1+B3 against the EARLIER B1 run showed IC02 execute at 0.54x -- about twice as slow -- and I had a structural story ready for it: IC02 drops one variable at step 0 and merges nothing, so it pays select-keys and a set rebuild for no return.
+
+  The same-window comparison says 1.14x. The regression was the earlier run's host, not the code. The story was plausible and it was about something that was not happening.
+
+  Third time in this session that comparing a fresh measurement against an older one produced a false result, and the second time I had an explanation ready for a number that was not real. Same-window is not a refinement of the method; without it the measurement is not evidence."
+
+ :the-guard-still-only-half-fires
+ "The structural point survives even though the regression did not. `prune-bindings` skips when every variable is still needed, but not when variables ARE dropped and nothing merges -- which is IC02's step 0 exactly. That costs something; it is simply too small to see at this scale. Worth fixing only with a measurement that can see it, not on the strength of the argument."
+
+ :where-the-time-is-now
+ ["IC09: 154 ms planning, 412 ms execute, down from 627 / 1,085 before B1 and B3. Both halves roughly a third of what they were."
+  "Scan-side work remains finished as a source of wins (9% of execute at last count)."
+  "B2 -- pushing the limit into the join -- is the remaining large item and is not implemented. Evidence for it: IC02 matches 910 of 7,355 messages, so a date-ordered scan stopping at 20 would touch about 160 rows, and all four LDBC complex reads are most-recent-N queries."]
+
+ :caveats
+ ["Single run per pin, one start person. Counts exact; milliseconds are same-window ratios only."
+  "IC02's execute is 144-165 ms and its planning 11-14 ms -- both small enough that its ratios carry little weight either way. IC09 is the query this receipt can actually speak about."]
+
+ :raw-b1-and-b3 {:schema 1, :start-person "17592186053137", :analyses [{:query :ic02, :planning {:ms 14.244708, :scans 0, :rows-returned 0, :scan-ms 0.0, :by-pattern-shape {}}, :executing {:ms 144.249416, :scans 1793, :rows-returned 2702, :scan-ms 110.605194, :by-pattern-shape {[true true false] 911, [false true true] 882}, :result-rows 910}, :scan-share-of-execute 0.7667635479369982} {:query :ic09-two-hop, :planning {:ms 153.8035, :scans 0, :rows-returned 0, :scan-ms 0.0, :by-pattern-shape {}}, :executing {:ms 412.324792, :scans 885, :rows-returned 70927, :scan-ms 90.441129, :by-pattern-shape {[true true false] 883, [false true false] 2}, :result-rows 6733}, :scan-share-of-execute 0.21934438761567362}], :adr "ADR-2608021000 -- close the 30x between the reimplemented strategies and the real engine", :caveats ["scan* is wrapped via with-redefs, so this is the real engine with a counter around one function -- nothing is reimplemented." "Counts and rows are load-invariant; the ms figures are not. Compare counts across runs, and treat times as within-run ratios." "Single run, one start person. A diagnosis, not a benchmark."], :arrangement-pin "see deps.edn", :receipt/type :scan-instrumentation, :reading "For each query, :planning and :executing each report how many times the engine called scan*, how many rows those calls returned, and how much of the wall time was inside them. :by-pattern-shape keys are [s-bound? p-bound? o-bound?] -- [false true false] is a broad scan of an attribute, [true true false] is a keyed seek. If execute time is not mostly scan time, the cost is in the join's own bookkeeping, not in the store.", :implementation "kotobase-peer.scan-instrument", :dataset {:subset-posts 3000, :quads 409877, :messages 7355}}
+ :raw-b1-only {:schema 1, :start-person "17592186053137", :analyses [{:query :ic02, :planning {:ms 11.242666, :scans 0, :rows-returned 0, :scan-ms 0.0, :by-pattern-shape {}}, :executing {:ms 164.522584, :scans 1793, :rows-returned 2702, :scan-ms 129.206272, :by-pattern-shape {[true true false] 911, [false true true] 882}, :result-rows 910}, :scan-share-of-execute 0.7853406435678157} {:query :ic09-two-hop, :planning {:ms 157.094458, :scans 0, :rows-returned 0, :scan-ms 0.0, :by-pattern-shape {}}, :executing {:ms 1183.36825, :scans 885, :rows-returned 70927, :scan-ms 117.728457, :by-pattern-shape {[true true false] 883, [false true false] 2}, :result-rows 6733}, :scan-share-of-execute 0.0994859013667132}], :adr "ADR-2608021000 -- close the 30x between the reimplemented strategies and the real engine", :caveats ["scan* is wrapped via with-redefs, so this is the real engine with a counter around one function -- nothing is reimplemented." "Counts and rows are load-invariant; the ms figures are not. Compare counts across runs, and treat times as within-run ratios." "Single run, one start person. A diagnosis, not a benchmark."], :arrangement-pin "see deps.edn", :receipt/type :scan-instrumentation, :reading "For each query, :planning and :executing each report how many times the engine called scan*, how many rows those calls returned, and how much of the wall time was inside them. :by-pattern-shape keys are [s-bound? p-bound? o-bound?] -- [false true false] is a broad scan of an attribute, [true true false] is a keyed seek. If execute time is not mostly scan time, the cost is in the join's own bookkeeping, not in the store.", :implementation "kotobase-peer.scan-instrument", :dataset {:subset-posts 3000, :quads 409877, :messages 7355}}}

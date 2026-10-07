@@ -1,0 +1,54 @@
+{:schema 1
+ :date "2026-08-14"
+ :receipt/type :scan-layer-decomposition
+
+ :question
+ "IC02 costs about 3.5 microseconds per row. The 2026-08-13 receipt guessed that
+  the `{:s :p :o}` map allocated per candidate in the scan path was that cost.
+  Is it?"
+
+ :answer "No. It is 6% of it. The hypothesis is refuted."
+
+ :method
+ "Four public entry points over the same relation, each doing strictly more than
+  the last, so the deltas name the layers. Nothing inside the engine is modified.
+  10 iterations for hasCreator and 3 for knows, after 3 warmups, one JVM, host
+  load average 3.87 recorded by the probe."
+
+ :knows-361246-rows
+ {:estimate-cardinality {:ms 0.147 :ns-per-row 0.4  :does "index read only"}
+  :cardinality          {:ms 47.445 :ns-per-row 131.3 :adds "builds {:s :p :o} per candidate, applies visible?" :delta-ns 131}
+  :query                {:ms 212.611 :ns-per-row 588.6 :adds "hashes those maps into a set" :delta-ns 457}
+  :dl-q                 {:ms 760.473 :ns-per-row 2105.1 :adds "unify-positional, then a set of :find-ordered vectors" :delta-ns 1517}}
+
+ :hasCreator-7355-rows
+ {:estimate-cardinality {:ms 0.373}
+  :cardinality          {:ms 2.508 :ns-per-row 340.9}
+  :query                {:ms 2.988 :ns-per-row 406.3}
+  :dl-q                 {:ms 11.187 :ns-per-row 1521.0}
+  :note "Small relation, noisier. The knows row is the reliable one. estimate-cardinality
+         is roughly CONSTANT rather than per-row -- 0.373 ms here against 0.147 ms for a
+         relation 49x larger -- so its ns/row column is not meaningful."}
+
+ :breakdown-of-the-per-row-cost
+ {"building the quad maps" "6%"
+  "hashing them into a set" "22%"
+  "unify + projecting into result vectors" "72%"}
+
+ :reading
+ "The dominant cost is turning matched quads into the result collection, not
+  reading the index and not allocating the quads. `q` returns a SET of
+  :find-ordered vectors, so a step producing 361,246 rows allocates and hashes
+  361,246 two-element vectors. This is the same shape as the planning fix landed
+  on 2026-08-13: the expensive part was materialising a collection in a form
+  nobody downstream needed. There the fix was to stop materialising; here the
+  equivalent question is whether every join step needs its intermediate as a set
+  of vectors, and that question is NOT answered by this receipt."
+
+ :what-this-does-not-say
+ ["It does not propose a change. The last two times someone reasoned from a
+   decomposition straight to a mechanism in this query, the mechanism made IC02
+   worse (2026-08-02) or measured an empty answer (2026-08-13)."
+  "It does not measure the join's own bookkeeping across multiple clauses -- only
+   the single-clause path. A three-clause join may spend its time differently."
+  "Absolute milliseconds move with host load; these were taken at 3.87."]}

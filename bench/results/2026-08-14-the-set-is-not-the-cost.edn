@@ -1,0 +1,54 @@
+{:schema 1
+ :date "2026-08-14"
+ :receipt/type :scan-layer-decomposition
+ :follows "2026-08-14-scan-layer-decomposition.edn"
+
+ :question
+ "That receipt found 72% of the per-row cost in 'unify + project into a set of
+  vectors', and asked whether every join step needs its intermediate as a set.
+  Measure the set before changing anything."
+
+ :answer "The set is not the cost. Second hypothesis refuted."
+
+ :set-versus-vector
+ {:995-result-vectors  {:into-set-ms 0.0779 :into-vector-ms 0.0116 :set-costs-ms 0.0664
+                        :note "IC02's actual intermediate size"}
+  :920-result-vectors  {:into-set-ms 0.0741 :into-vector-ms 0.0108 :set-costs-ms 0.0633}
+  :7355-quad-maps      {:into-set-ms 0.3874 :into-vector-ms 0.0763 :set-costs-ms 0.3111}
+  :reading "IC02's whole query is ~45 ms. Deduplicating its intermediates into sets
+            costs 0.066 ms, which is 0.15% of it. The repo's own ic02-diag already
+            reported :dedup-ratio 1.0 at every IC02 step -- the set removes nothing
+            there -- and this says that removing nothing is also nearly free."}
+
+ :where-the-cost-actually-is
+ {:dl-q-hasCreator-ms 9.406
+  :dq-query-set-of-maps-ms 2.760
+  :difference-ms 6.646
+  :rows 7355
+  :ns-per-row 904
+  :of-which-the-final-set "about 0.6 ms, scaling the 995-vector measurement"
+  :remainder "about 6 ms, roughly 815 ns a row, in unify-positional and building
+              the per-row binding and result vector"
+  :reading "Per-row binding construction and unification, not the collection type.
+            815 ns to unify one binding and build a two-element vector is the
+            number worth explaining next."}
+
+ :two-hypotheses-now-refuted
+ ["The {:s :p :o} map allocated per candidate -- 6% of the per-row cost (2026-08-14)."
+  "The set that holds the intermediate -- 0.15% of IC02 (this receipt)."]
+
+ :caveats
+ ["Absolute milliseconds for the same single-clause query have read 26.13, 11.19 and
+   9.41 ms across three runs today at host loads 5.3, 3.87 and 2.90. Only comparisons
+   made WITHIN one run are used here; nothing is inferred from a 2x difference across
+   runs."
+  "Single-clause path. A multi-clause join may distribute its time differently, and
+   this receipt does not claim otherwise."]
+
+ :still-not-proposing-a-change
+ "Three attempts in this query's history went from a decomposition to a mechanism:
+  2026-08-02 made IC02 monotonically worse, 2026-08-13 measured an empty answer,
+  2026-08-14 blamed an allocation that was 6%. The pattern is not that the
+  measurements were bad -- it is that each one was acted on before it was narrow
+  enough. 815 ns a row is narrower than 3.5 microseconds a row, and still not a
+  mechanism."}

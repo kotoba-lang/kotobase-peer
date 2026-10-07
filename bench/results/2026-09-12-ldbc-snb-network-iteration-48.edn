@@ -1,0 +1,23 @@
+{:receipt/type :ldbc-snb-interactive-network-iteration
+ :iteration 48
+ :date "2026-09-12"
+ :benchmark :ldbc-snb-interactive-network-v2
+ :s38-exact-short-read-generator
+ {:source "ldbc/ldbc_snb_interactive_v1_driver LdbcSnbShortReadGenerator.java + LdbcSnbInteractiveWorkload.java (read 2026-09-12)"
+  :rules ["two id buffers (person, message) replenished from EVERY read's rows: IC02/IC07/IC09 person+message per row, IC08 author+comment, IS2 original-post author + message + original post, IS3 person, IS5 person, IS6 moderator, IS7 reply author + comment; IC05, IS1, IS4 add nothing"
+          "after a complex read a chain starts at probability 1.0; the first short read is a random choice between the first person query (S1) and the first message query (S4); the chain order is S1->S2->S3->S4->S5->S6->S7->S1...; each step is a coin toss (state > uniform) and polls an id from its buffer (empty buffer ends the chain); after the LAST enabled person query (S3) and the LAST enabled message query (S7) the state drops by short_read_dissipation 0.2"
+          "each short read is scheduled at the previous operation's actual finish (PREVIOUS_OPERATION_ACTUAL_FINISH_TIME when a DB is connected), so a chain runs sequentially; lateness is queueing only"]
+  :observed "~6.4 short reads per complex read (12,036 / 1,888 at TCR 0.0002) against ~1 under the iteration-46 approximation"
+  :runs-64-slots [{:tcr 0.0002 :on-time-pct 100.0 :throughput-ops-s 1773.1 :updates-per-s 1092 :complex 1888 :short-reads 12036}
+                  {:tcr 0.00015 :on-time-pct 93.31 :throughput-ops-s 2009.1 :verdict :fails-95pct-rule :delay-p95-ms 1217}]
+  :runs-128-slots [{:tcr 0.00015 :on-time-pct 75.17 :verdict :fails-95pct-rule :delay-p95-ms 4515 :note "more slots deepen the SUT's queue; 64 stays the column"}]
+  :supersedes "the official-column rows of iterations 46 and 47 (1360.9 at 0.00015, 1995.6 at 0.00012) were measured with ~1 short read per complex read; they are not comparable to this row and are marked as such in the scoreboard"}
+ :sut {:host "levi (M4: 4P+6E)" :threads 16 :quads 25405564 :gate {:checked 4780 :disagreements 0}}
+ :rows
+ [{:rung :sf1-full :schedule :official :generator :exact :inflight 64 :sut-threads 16 :tcr 0.0002 :on-time-pct 100.0 :failures 0 :throughput-ops-s 1773.1
+   :ops {:ic [:ic02 :ic05 :ic07 :ic08 :ic09] :is [:is1 :is2 :is3 :is4 :is5 :is6 :is7] :ins [:ins1 :ins2 :ins3 :ins4 :ins5 :ins6 :ins7 :ins8]}
+   :per-second {:updates 1092 :complex 94 :short-reads 602}
+   :read-after-write {:checked 237 :not-visible 0 :outside-window 13 :unverifiable 0 :is6-checked 40 :no-covering-read 40}
+   :note "first row with LDBC's exact short-read generator; 0.00015 fails (93.3%)" :receipt "2026-09-12-ldbc-snb-network-iteration-48-official-exact-generator-64slots.edn"}]
+ :not-an-ldbc-score "SF1 is below the audited table; 5 of 14 complex reads; no ACID suite; no auditor. Audited No.1 (SF300 139,411 ops/s at TCR 0.00315) is 79x this row at a 16x slower TCR."
+ :seeds [:s39-ic05-112ms-x26-per-second-is-the-schedule-wall :s40-on-time-by-op-in-the-receipt :s34-bindings-as-arrays :m4-owner-decision-a-host]}

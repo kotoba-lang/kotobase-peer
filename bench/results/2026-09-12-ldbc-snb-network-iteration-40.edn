@@ -1,0 +1,13 @@
+{:receipt/type :ldbc-snb-interactive-network-iteration
+ :iteration 40
+ :date "2026-09-12"
+ :benchmark :ldbc-snb-interactive-network-v2
+ :s31 {:question "served IC09 ~12 ms p50 while the same code in one process is 4.9 ms on the same parameters"
+       :ruled-out [{:parameters "identical files (md5 3cdc2568…) on judah and levi"}
+                   {:concurrency "1 slot and 8 slots both 12.0 ms p50 (receipts s31b, s31d)"}
+                   {:request-shape "curl over all 99 parameters once, back-to-back: p50 4.3 ms, second pass 4.1 (curl-99-params-server-ms.txt); the SUT's new :repeat n route shows 4.2 ms steady for one parameter with the first call 4.7-7"}]
+       :found "the PACING: the driver at 32/s with 1 slot leaves ~27 ms idle between requests and measures 12.0 ms p50; the same driver at 200/s with 1 slot (back-to-back, saturated) measures 4.8 ms (receipt s31c). levi is an Apple M4 with 4 performance + 6 efficiency cores: a lightly loaded process is scheduled onto the efficiency cores (about 2.5x slower on this pointer-chasing work) and its caches go cold between requests."
+       :consequence "server-ms p50 at low rates measures efficiency-core placement, not the engine; compare per-op costs only at saturation. Ceilings are unaffected (at the ceiling every core is busy). The host's compute at saturation is ~4 P + 6 E, not 10 equal cores -- M4 restated."
+       :sut-change "kotobase-peer.ldbc-snb-net: `:repeat n` on /ldbc/ic answers the same request n times in one thread and returns every timing (diagnostic; the driver never sends it)"}
+ :rows "none: no row moved this iteration; the previous 64-slot row (4374.1) stands"
+ :seeds [:s32-binding-set-machinery :m4-p-core-count-is-the-real-wall :s26-full-data-parameter-set :s23b-ic05 :m3-sf3]}

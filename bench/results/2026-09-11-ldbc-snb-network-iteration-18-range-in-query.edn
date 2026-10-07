@@ -1,0 +1,358 @@
+{:prediction-verdict
+ "half held: the row went 93.9 -> 190.2 (2.0x) but IC09 stopped at 86-109 ms served / 63 in-process, not 5 -- the two-hop join still materialises friend-of-friend x messages before the range prunes per message. The range prunes rows, not the join that produces them.",
+ :in-process-official-params
+ {:before
+  {:ic02 {:empty 2.5, :nonempty 8.1},
+   :ic09-empty 163.7,
+   :ic08 2,
+   :ic07 1.7},
+  :after
+  {:ic02 {:empty 0.8, :nonempty 1.1},
+   :ic09-empty 63.1,
+   :ic08 2,
+   :ic07 1.7}},
+ :schema 1,
+ :date "2026-09-11",
+ :engine-change
+ {:repo "kotoba-lang/datalog",
+  :sha "da95b8772c1a7160df1b0a38a6e2d3235300862c",
+  :what
+  "range on a bound entity = keyed scan [e a _] + in-range?; open entity = scan-range* as before; same in the async branch",
+  :test
+  "core_test/a-range-on-a-bound-entity-is-a-keyed-scan-not-a-domain-walk (counting IPatternSource/IRangeSource stub): fails on the previous engine at 2 assertions (20 range walks for 20 bound entities), passes now; suite 124/237/0",
+  :pin
+  "kotobase-peer deps.edn names the sha as an explicit floor (ADR-2609051700); datalog main is .cljk since 8645651 and loads through scripts/cljk-classpath.cljk; kotobase-peer suite on the new pin 261/798/0"},
+ :prediction-before-network-run
+ "IC09 empty -> ~5 ms; Datalog row toward the rtt ceiling (~250 at 8 slots)",
+ :agreement
+ {:checked 392,
+  :disagreements 0,
+  :against
+  "the index-path twins, which iteration 16 validated against the previous Datalog on the same 392 parameters"},
+ :question
+ "iteration 17 seed S7: write the date bound and the top-20 INTO the IC02/IC09 queries so the engine prunes before the join instead of the harness filtering after it.",
+ :what-this-is-not ["Not an LDBC score." "Not hardware-normalised."],
+ :iteration 18,
+ :query-change
+ "kb-ic02 / kb-ic09: [(< ?date max-date-as-string)] + :order-by [[?date :desc] [?msg :asc]] :limit 20 inside the query; IC09 keeps two queries (one-hop, two-hop) each limited to 20 -- the union top-20 is a subset of the union of the two top-20s, so limiting each is exact. creationDate is stored as a 13-digit string, so string order is date order and the bound is the string form.",
+ :benchmark
+ "kotoba-lang/ayatori bench/benchmark.edn :ldbc-snb-interactive-network-v2 (rung SF1 subset 35k posts, origin :cross-host, mix IC02/07/08/09, impl :datalog, 8 slots)",
+ :found-on-the-way
+ "the range branch of datalog.core (fuse-value-ranges output) grouped bindings by (a lo hi e) and ran the relation-wide scan-range* once per group -- with ?msg BOUND from the join that is one walk of all 86,932 creationDate values per distinct message. Fusing the predicate would have made IC09 slower than the harness filter it replaced.",
+ :result
+ {:throughput-ops-s 190.2,
+  :rate 192,
+  :previous 93.9,
+  :p50-ms {:ic02 12.5, :ic07 13.7, :ic08 14.3, :ic09 109.2},
+  :next-failed
+  {:rate 256, :on-time-pct 16.31, :throughput-at-failure 197.9}},
+ :receipt/type :ldbc-snb-interactive-network,
+ :origin
+ {:kind :cross-host,
+  :sut "simeon (fleet mac-mini, swap off), JDK 26, -Xmx8g, 8 threads",
+  :driver "this workstation over Tailscale, rtt ~10-14 ms"},
+ :sut
+ {:quads 810221,
+  :ready true,
+  :max-date 1347528903591,
+  :load-ms 6935.125417,
+  :host-memory
+  {:heap-used-mb 1376,
+   :heap-max-mb 8192,
+   :rss-mb 4493,
+   :swap-total-mib 0,
+   :swap-used-mib 0,
+   :swap-used-pct 0,
+   :host "simeonnoMac-mini.local"},
+  :elements
+  {:persons 9892,
+   :knows-edges 180623,
+   :messages 86932,
+   :posts 35000,
+   :comments 51932,
+   :has-creator 86932,
+   :reply-of 51932,
+   :likes 38821},
+  :build-ms 747.497375,
+  :threads 8,
+  :index-path
+  {:enabled true,
+   :checked 392,
+   :disagreements 0,
+   :first-disagreement nil},
+  :subset-rule
+  "all persons + all knows; 35000 most recent Posts + full transitive reply trees; hasCreator for included Messages; likes onto included Messages",
+  :implementation
+  "kotobase-peer.ldbc-snb-net over kotobase-peer.ldbc-snb-bench",
+  :dataset
+  "LDBC SNB Interactive v1, SF1, Datagen v1.0.0, CsvComposite/LongDateFormatter"},
+ :arms
+ {:datalog-inflight-8
+  [{:on-time 1920,
+    :server-ms
+    {:ic02
+     {:n 480,
+      :p50 1.165834,
+      :p95 2.182917,
+      :p99 3.26425,
+      :max 7.966083},
+     :ic07
+     {:n 480,
+      :p50 1.805958,
+      :p95 3.657375,
+      :p99 4.489125,
+      :max 6.871875},
+     :ic08
+     {:n 480,
+      :p50 2.444459,
+      :p95 2.627209,
+      :p99 4.548041,
+      :max 10.66225},
+     :ic09
+     {:n 480,
+      :p50 74.443583,
+      :p95 110.556875,
+      :p99 118.239042,
+      :max 128.943208}},
+    :completed 1920,
+    :latency-ms
+    {:ic02
+     {:n 480,
+      :p50 11.096667000000707,
+      :p95 19.688458000000537,
+      :p99 33.746375,
+      :max 150.52908299999996},
+     :ic07
+     {:n 480,
+      :p50 11.89458299999751,
+      :p95 22.789458000001105,
+      :p99 35.67695800000001,
+      :max 237.44383300000004},
+     :ic08
+     {:n 480,
+      :p50 12.320457999998325,
+      :p95 20.754041000000143,
+      :p99 40.234833999998955,
+      :max 254.56716700000004},
+     :ic09
+     {:n 480,
+      :p50 85.91370800000004,
+      :p95 123.51999999999953,
+      :p99 141.09254200000214,
+      :max 259.49354200000005}},
+    :empty-answers 833,
+    :throughput 95.59506369322915,
+    :inflight 8,
+    :rate 96,
+    :seconds 20,
+    :rows-mean 8.271875,
+    :scheduled 1920,
+    :pass true,
+    :on-time-pct 100,
+    :start-delay-ms
+    {:n 1920,
+     :p50 0.6549999999997453,
+     :p95 1.6671669999996084,
+     :p99 78.4199583333334,
+     :max 164.9108336666667},
+    :failed 0}
+   {:on-time 2560,
+    :server-ms
+    {:ic02
+     {:n 640, :p50 1.232833, :p95 3.0055, :p99 3.527917, :max 5.793},
+     :ic07
+     {:n 640,
+      :p50 1.842166,
+      :p95 3.999917,
+      :p99 4.562667,
+      :max 6.296916},
+     :ic08
+     {:n 640,
+      :p50 2.481959,
+      :p95 4.338834,
+      :p99 4.872584,
+      :max 6.8015},
+     :ic09
+     {:n 640,
+      :p50 79.396,
+      :p95 115.174709,
+      :p99 127.124708,
+      :max 141.862042}},
+    :completed 2560,
+    :latency-ms
+    {:ic02
+     {:n 640,
+      :p50 11.02595800000563,
+      :p95 20.413416999999754,
+      :p99 35.75383399999919,
+      :max 193.0122080000001},
+     :ic07
+     {:n 640,
+      :p50 11.806375000000116,
+      :p95 23.596624999998312,
+      :p99 41.21370900000329,
+      :max 214.67841699999917},
+     :ic08
+     {:n 640,
+      :p50 12.041457999999693,
+      :p95 24.700041000000056,
+      :p99 40.61504100000093,
+      :max 208.22849999999744},
+     :ic09
+     {:n 640,
+      :p50 91.28679199999897,
+      :p95 128.541500000003,
+      :p99 157.45779200000106,
+      :max 295.0873750000028}},
+    :empty-answers 1119,
+    :throughput 127.36824052271,
+    :inflight 8,
+    :rate 128,
+    :seconds 20,
+    :rows-mean 8.203515625,
+    :scheduled 2560,
+    :pass true,
+    :on-time-pct 100,
+    :start-delay-ms
+    {:n 2560,
+     :p50 0.639166999997542,
+     :p95 1.708082999997714,
+     :p99 64.93804199999795,
+     :max 168.88470799999777},
+    :failed 0}
+   {:on-time 3840,
+    :server-ms
+    {:ic02
+     {:n 960,
+      :p50 2.663875,
+      :p95 3.871792,
+      :p99 7.845458,
+      :max 10.584833},
+     :ic07
+     {:n 960,
+      :p50 3.824833,
+      :p95 5.224334,
+      :p99 10.025417,
+      :max 15.859125},
+     :ic08
+     {:n 960,
+      :p50 4.683375,
+      :p95 7.163417,
+      :p99 10.881792,
+      :max 19.672833},
+     :ic09
+     {:n 960,
+      :p50 97.49325,
+      :p95 152.652792,
+      :p99 175.223166,
+      :max 220.767}},
+    :completed 3840,
+    :latency-ms
+    {:ic02
+     {:n 960,
+      :p50 12.53925000000163,
+      :p95 21.78450000000157,
+      :p99 51.16899999999441,
+      :max 84.54616700000042},
+     :ic07
+     {:n 960,
+      :p50 13.660834000002069,
+      :p95 22.761541000007128,
+      :p99 52.91425000000163,
+      :max 84.92058300000645},
+     :ic08
+     {:n 960,
+      :p50 14.293625000005704,
+      :p95 24.617417000001296,
+      :p99 48.73291700000118,
+      :max 83.79770799999824},
+     :ic09
+     {:n 960,
+      :p50 109.24154099999578,
+      :p95 167.68666600000142,
+      :p99 190.0026249999937,
+      :max 232.71512500000244}},
+    :empty-answers 1665,
+    :throughput 190.19328190341662,
+    :inflight 8,
+    :rate 192,
+    :seconds 20,
+    :rows-mean 8.271614583333333,
+    :scheduled 3840,
+    :pass true,
+    :on-time-pct 100,
+    :start-delay-ms
+    {:n 3840,
+     :p50 19.581791666663776,
+     :p95 188.82316666666156,
+     :p99 224.11299999999756,
+     :max 233.76329100000294},
+    :failed 0}
+   {:on-time 835,
+    :server-ms
+    {:ic02
+     {:n 1280,
+      :p50 2.620541,
+      :p95 3.743,
+      :p99 4.695292,
+      :max 12.192667},
+     :ic07
+     {:n 1280,
+      :p50 3.840417,
+      :p95 5.087792,
+      :p99 10.207334,
+      :max 13.865792},
+     :ic08
+     {:n 1280,
+      :p50 4.688708,
+      :p95 6.768625,
+      :p99 10.821042,
+      :max 16.29975},
+     :ic09
+     {:n 1280,
+      :p50 100.717208,
+      :p95 146.063875,
+      :p99 156.589375,
+      :max 177.042458}},
+    :completed 5120,
+    :latency-ms
+    {:ic02
+     {:n 1280,
+      :p50 12.627332999996725,
+      :p95 24.25429100000474,
+      :p99 55.404166000007535,
+      :max 85.01299999999901},
+     :ic07
+     {:n 1280,
+      :p50 13.932082999999693,
+      :p95 24.32695899999817,
+      :p99 60.73775000000023,
+      :max 79.41829199999484},
+     :ic08
+     {:n 1280,
+      :p50 14.542124999999942,
+      :p95 25.019874999998137,
+      :p99 60.224333999998635,
+      :max 81.44350000000122},
+     :ic09
+     {:n 1280,
+      :p50 113.19749999999476,
+      :p95 158.63183299999218,
+      :p99 176.50624999999854,
+      :max 218.8440840000112}},
+    :empty-answers 2222,
+    :throughput 197.87879439774412,
+    :inflight 8,
+    :rate 256,
+    :seconds 20,
+    :rows-mean 8.272265625,
+    :scheduled 5120,
+    :pass false,
+    :on-time-pct 16.30859375,
+    :start-delay-ms
+    {:n 5120,
+     :p50 2867.768041999996,
+     :p95 5494.711167000001,
+     :p99 5747.174375000002, 
+     :max 5782.449041999993}, 
+    :failed 0}]}}

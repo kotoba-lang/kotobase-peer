@@ -1,7 +1,7 @@
 {:schema 1
  :date "2026-07-25"
  :implementation "kotobase-peer.stream-bench (compact-run-readers-streaming, ADR-2607244000 Stage A+B minimal)"
- :command "clojure -J-Xmx4g -M:stream-bench 1000000"
+ :command "kbb -J-Xmx4g -M:stream-bench 1000000"
  :environment
  {:machine "Apple M4, 32GB RAM, macOS (Darwin 25.4.0)"
   :jvm "OpenJDK 21.0.1"

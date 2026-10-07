@@ -9,11 +9,78 @@
  ;; datom (datom-clj): the canonical datom model — entity tx-map ↔ [e a v]
  ;; datom.core/eavt. The kotobase datom DATABASE consuming kotoba's shared datom
  ;; representation (kotoba : kotobase = Clojure : Datomic, ADR-2607032500).
- :deps {;; formerly two deps here (kqe + quad-store) -- kqe merged into
+ :deps {
+        ;; kotoba.lang.error replaced clojure.lang.ExceptionInfo here (2026-09-25).
+        ;; An explicit floor: tools.deps takes the NEWEST sha it is shown.
+        io.github.kotoba-lang/error {:git/sha "838dec56c9a5b74f9eec825a2fb28bda157f8cd3"}
+        ;; kotoba.bytes replaced java.util.Base64 here (2026-09-24). An explicit
+        ;; floor: tools.deps takes the NEWEST sha it is shown.
+        io.github.kotoba-lang/bytes {:git/sha "d5259f35ab7c4f5a66e63ca29ed4dcf7ba3f1ac5"}
+        ;; kotoba.io replaced clojure.java.io / java.io.File here (2026-09-24).
+        ;; An explicit floor: the java.io.File method functions (exists?, file?,
+        ;; parent-file, canonical-path, mkdirs, list-files ...) are in kotoba.io
+        ;; from this sha, and tools.deps takes the NEWEST sha it is shown.
+        io.github.kotoba-lang/io {:git/sha "72dde04b4c32854d70d17a670b277f8f7957a784"}
+        ;; kotoba.process replaced clojure.java.shell here (2026-09-24). An explicit
+        ;; floor: kotoba.process/sh parses clojure.java.shell's options from db49ea9,
+        ;; and tools.deps takes the NEWEST sha it is shown.
+        io.github.kotoba-lang/process {:git/sha "db49ea936e53d0bc698be0db79bf96ad86b5f7d0"}
+        ;; kotoba.lang.coll replaced clojure.set here (2026-09-24). An explicit
+        ;; floor: kotoba.lang.coll carries clojure.set's union/intersection/
+        ;; difference/map-invert from 0ffd5f6, and tools.deps takes the NEWEST
+        ;; sha it is shown.
+        io.github.kotoba-lang/coll {:git/sha "f74e248f0a07e8ae572885f50fab6bdb39dc24be"}
+        ;; kotoba.lang.edn replaced clojure.edn here (2026-09-23). An explicit floor:
+        ;; tools.deps takes the NEWEST sha it is shown, and kbb resolves git deps
+        ;; only from nbb.edn, so every project file this repo has names it.
+        io.github.kotoba-lang/edn {:git/sha "79dba32c8892058842c57783f06a2dfe4601aeb0"}
+       ;; kotoba.test (clojure.test-compatible surface), not clojure.test --
+        ;; scripts/migrate-clojure-test-to-kotoba-test.cljk. Explicit floor.
+        io.github.kotoba-lang/test {:git/url "https://github.com/kotoba-lang/test.git"
+                                    :git/sha "2ab4885f99fd25552d380d0f6b0b54c5a72eb7ae"}
+        ;; kotoba.lang.text, not clojure.string. Pinned as an explicit floor:
+        ;; tools.deps takes the NEWEST sha it is shown, so without a floor here
+        ;; this repo silently rides whatever a sibling happens to name.
+        ;; security: the ONE classification lattice
+        ;; (`kotoba.security.information-flow/ranks`). ADR-2607280100 D1 put
+        ;; it in exactly one place after finding two copies of it; D3 needs a
+        ;; rank comparison here, and a local copy of a four-entry map is
+        ;; precisely the drift that ADR closed. Pinned as an explicit floor.
+        io.github.kotoba-lang/security
+        {:git/sha "d87f334235bef7229bf8b8231c200612f824cbc2"}
+        io.github.kotoba-lang/text {:git/sha "73bdb13ae7a3d004b44bca08be03a3191157a38f"}
+        ;; authority: the ONE capability decider (root ADR-2608180200,
+        ;; adr-2609241800 step 7). `policy/clearance-rank` asks
+        ;; `authority.scope/covers?` whether a capability is a per-level read
+        ;; grant instead of a local `starts-with?` over kotoba://can/datom:*.
+        ;; Zero third-party deps (only kotoba-lang/text, pinned above).
+        ;; Explicit floor: 28ec4fcb is authority's main as of 2026-09-24.
+        io.github.kotoba-lang/authority {:git/sha "28ec4fcba9a375f0d0df166218c8d7c5f7a3ca14"}
+        ;; Explicit floor (ADR-2609051700: a base library's fix does not reach a
+        ;; deployer unless someone names the sha). 77197339 carries the range
+        ;; branch that treats a bound entity as a keyed scan (ayatori iteration
+        ;; 18) and the ordered drive -- :order-by + :limit walked through the
+        ;; value index with the independent half of the join run once
+        ;; (iteration 19). main is .cljk from 8645651 on, so this classpath
+        ;; loads only through scripts/cljk-classpath.cljk.
+        ;; 645c9e58 (iteration 34): a one-value counterpart set costs one
+        ;; object, not a hash set -- the full LDBC SF1 (20.6M quads) serves
+        ;; resident in 4.4 GB used heap where 10.9 GB did not fit before.
+        ;; d4cb417b (iteration 35): the grouped ordered drive -- IC02 on the
+        ;; full SF1 82 -> 0.4 ms; tracked order versions 16 -> 1024.
+        ;; 3ab273e4 (iteration 36): order versions as a conj/trim ring.
+        ;; dc7100c2 (iteration 37): PriorityQueue heap for the group merge.
+        ;; 4921e8b7a559c01db29cdc80172cfcfd196c51ac (iteration 39): grouped merge or global walk by expected steps.
+        ;; 8dc45c75ab5e3f04b333b4545e55ca893f6cb389 (iteration 41): an index scan as an eager vector (query-vec).
+        ;; 3ebd67ddd5ac176416076f368b25378f4ccd5ca9 (iteration 42): the two keyed clause shapes straight to the index.
+        ;; 9d010f9727ae5f10b8b6d2f25fb78cc2f4674454 (iteration 45): composite lookups through the group order.
+        ;; 9c86cc8d1009d4d2e72640a624bb5e0ea6a465e1 (iteration 47): count pushdown into a last-clause composite.
+        io.github.kotoba-lang/datalog {:git/sha "9c86cc8d1009d4d2e72640a624bb5e0ea6a465e1"}
+       ;; formerly two deps here (kqe + quad-store) -- kqe merged into
         ;; arrangement (ADR-2607050700), so this is the one coordinate now.
-        io.github.kotoba-lang/arrangement {:git/sha "f4e3118f8431e60259f501ee539773af3b35b1d3"}
-        io.github.kotoba-lang/chain {:git/sha "6da9ce3b69b5e591bdcf275519afa91b126a22a8"}
-        io.github.kotoba-lang/datom      {:git/sha "d27a5833d59d909367956705f2ec931399c891ee"}
+        io.github.kotoba-lang/arrangement {:git/sha "9c9f45d4cd043873cd5c5ea65fa3af8a8ead5e6d"}
+        io.github.kotoba-lang/chain {:git/sha "fa099efdcafddf7b82d479aca8ff12c845be24e2"}
+        io.github.kotoba-lang/datom      {:git/sha "3a45462b3b6da018e24c65d12f8f3d3250a0c38e"}
         ;; DIRECT dep as of ADR-2607120730's follow-up (hydrate-db-cached's
         ;; cold-datoms-async calling prolly-tree.core/scan-prefix-async
         ;; directly) -- previously only came in transitively via
@@ -23,19 +90,52 @@
         ;; AWS SigV4 (ADR-2607254100). The object-store worker used to carry
         ;; its own copy of the signer, byte-identical to the one in
         ;; kotobase-peer-atomic and kotobase-peer-main-test.
-        io.github.kotoba-lang/sigv4 {:git/sha "9babf9f29b99f128059515e74b00b19ac9cc5436"}
-        io.github.kotoba-lang/prolly-tree {:git/sha "b3d13b8175ce032622f7604615e914da9f292c59"}}
+        ;; The compression frame that sits on the tx-block quad payload,
+        ;; INSIDE `encrypt-fn` (ADR-2608060500). A hard pin, not an injected
+        ;; codec: its output bytes are inside every CID it frames, so two
+        ;; writers on different pins would fork the block graph.
+        io.github.kotoba-lang/kotobase-block-codec
+        {:git/sha "3ec88f11e7b35efd7f592f52c511a067d50bf096"}
+        io.github.kotoba-lang/sigv4 {:git/sha "ffc2845d63a1b80a6258ed871150c96ab1a11855"}
+        io.github.kotoba-lang/prolly-tree {:git/sha "3a12dd2b77430007031e408ee8db75d35f1757a1"}
+        ;; The write-optimised half of L4, extracted 2026-08-01 and consumed
+        ;; from here as of this pin (ADR-2607312100 D7, ADR-2608012800).
+        ;; `prolly-tree` above is the read-optimised half; the two are
+        ;; siblings, not alternatives. Until now the extraction existed only
+        ;; as a second copy -- the originals stayed in this repo's src/ and
+        ;; nothing consumed the new repo, so the two were free to diverge.
+        io.github.kotoba-lang/merkle-lsm {:git/sha "401b79985ca081b497c3cc3ddfb241c4f0ab04fe"}
+        ;; the host-side implementation of the :cache/get//:cache/put effects
+        ;; merkle-lsm has always declared and nothing has ever interpreted.
+        io.github.kotoba-lang/block-cache {:git/sha "d871dbc73d924e86767cf82a3d6e50d7b4e8eb3d"}
+        ;; Extracted capability owners. Namespaces in this repository now
+        ;; delegate to these reviewed, published revisions for compatibility.
+        ;; Advanced to the merged raw-CID fix (ADR-2609060000 rollout item 1).
+        ;; `kotobase.projection` addresses concatenated packs and ciphertext as
+        ;; raw CIDv1 from that commit on; its migration note required auditing
+        ;; consumers that assume every CID is DAG-CBOR before adopting it, and
+        ;; the reachability walkers in object-store/worker were one -- they
+        ;; recomputed `ipld/cid` unconditionally. Advance and audit are one
+        ;; change on purpose: either alone leaves the store readable only by
+        ;; accident.
+        io.github.kotoba-lang/kotobase-projection
+        {:git/sha "0455eb88860361f7ace9e5144525de3d49a0aada"}
+        io.github.kotoba-lang/kotobase-federation
+        {:git/sha "e175d7bb938f2d705dc06ed453e2e9759648d76b"}
+        io.github.kotoba-lang/kotobase-maintenance
+        {:git/sha "c47e6f3d94beb8550be17e7b503f10cab9e24ad9"}}
+
  :aliases
  {:test {:extra-paths ["test"]
          :extra-deps {io.github.cognitect-labs/test-runner
-                      {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
+                      {:git/tag "v0.5.1" :git/sha "dfb30dd6605cb6c0efc275e1df1736f6e90d4d73"}}
          :main-opts ["-m" "cognitect.test-runner"]
          :exec-fn cognitect.test-runner.api/test}
   ;; clj-kondo as a Clojars lib (no Homebrew/system install needed).
   :lint {:replace-deps {clj-kondo/clj-kondo {:mvn/version "2024.11.14"}}
          :main-opts ["-m" "clj-kondo.main" "--lint" "src" "test" "bench"
                      "--fail-level" "error"]}
-  ;; Load test / benchmark harness (bench/kotobase_peer/load_test.clj) --
+  ;; Load test / benchmark harness (bench/kotobase_peer/load_test.cljk) --
   ;; not part of :test (slow, not correctness-gating). In-memory store, real
   ;; JVM crypto, no external deps beyond the base :deps above.
   :bench {:extra-paths ["bench"]
@@ -43,6 +143,15 @@
   :merkle-bench {:extra-paths ["bench"]
                  :main-opts ["-m" "kotobase-peer.merkle-lsm-bench"]}
   ;; ADR-2607244000 streaming/spill gate harness (bounded-heap compaction).
+  ;; ADR-2607244000 Stage B gate: peak RSS vs dataset size, blocks on disk.
+  :chunk-bench {:extra-paths ["bench"]
+                ;; A FIXED SMALL HEAP is the gate, not an RSS slope. RSS tracks
+                ;; the JVM's high-water allocation, so with a large default
+                ;; -Xmx it grows with churn even when the live set is flat, and
+                ;; measures nothing. Completing under a cap the Worker's 128 MB
+                ;; is comparable to is the property we actually need.
+                :jvm-opts ["-Xmx2g"]
+                :main-opts ["-m" "kotobase-peer.chunk-bench"]}
   :stream-bench {:extra-paths ["bench"]
                  :main-opts ["-m" "kotobase-peer.stream-bench"]}
   ;; ADR-2607250100 axis 1: direct same-JVM comparison vs Datomic Pro
@@ -55,6 +164,44 @@
   :h2h-neo4j {:extra-paths ["bench"]
               :extra-deps {org.neo4j/neo4j {:mvn/version "2025.03.0"}}
               :main-opts ["-m" "kotobase-peer.head-to-head-neo4j"]}
+  :scan-instrument {:extra-paths ["bench"]
+                    :extra-deps {org.neo4j/neo4j {:mvn/version "2025.03.0"}}
+                    :jvm-opts ["-Xmx12g"]
+                    :main-opts ["-m" "kotobase-peer.scan-instrument"]}
+  :ic02-diag {:extra-paths ["bench"]
+              :extra-deps {org.neo4j/neo4j {:mvn/version "2025.03.0"}}
+              :jvm-opts ["-Xmx12g"]
+              :main-opts ["-m" "kotobase-peer.ic02-diag"]}
+  :ic02-scale-diag {:extra-paths ["bench"]
+                    :extra-deps {org.neo4j/neo4j {:mvn/version "2025.03.0"}}
+                    :jvm-opts ["-Xmx10g"]
+                    :main-opts ["-m" "kotobase-peer.ic02-scale-diag"]}
+  :ic09-scale-diag {:extra-paths ["bench"]
+                    :extra-deps {org.neo4j/neo4j {:mvn/version "2025.03.0"}}
+                    :jvm-opts ["-Xmx10g"]
+                    :main-opts ["-m" "kotobase-peer.ic09-scale-diag"]}
+  :ic09-diag {:extra-paths ["bench"]
+              ;; ldbc-snb-bench imports Neo4j classes at ns load; this
+              ;; diagnostic only reuses its loader, but the ns still has to
+              ;; resolve.
+              :extra-deps {org.neo4j/neo4j {:mvn/version "2025.03.0"}}
+              :jvm-opts ["-Xmx12g"]
+              :main-opts ["-m" "kotobase-peer.ic09-diag"]}
+  :ldbc-snb-bench {:extra-paths ["bench"]
+                   :extra-deps {org.neo4j/neo4j {:mvn/version "2025.03.0"}}
+                   :jvm-opts ["-Xmx12g"]
+                   :main-opts ["-m" "kotobase-peer.ldbc-snb-bench"]}
+  ;; The same four IC reads served over HTTP on loopback so a driver in
+  ;; another process can measure LDBC's own metric (scheduled throughput,
+  ;; 95% on-time). Reuses ldbc-snb-bench's loader/queries through their vars,
+  ;; so Neo4j is on the classpath for the ns to resolve and is never opened.
+  :ldbc-snb-net {:extra-paths ["bench"]
+                 :extra-deps {org.neo4j/neo4j {:mvn/version "2025.03.0"}}
+                 :jvm-opts ["-Xmx12g"]
+                 :main-opts ["-m" "kotobase-peer.ldbc-snb-net"]}
+  :dag-shape-bench {:extra-paths ["bench"]
+                    :jvm-opts ["-Xmx8g"]
+                    :main-opts ["-m" "kotobase-peer.dag-shape-bench"]}
   :view-bench {:extra-paths ["bench"]
                :main-opts ["-m" "kotobase-peer.materialized-view-bench"]}
   :view-delta-bench {:extra-paths ["bench"]

@@ -1,0 +1,56 @@
+{:load
+ {:first-attempt
+  "one transact over every quad: OutOfMemoryError at 13 GB inside transact-effective -- every quad map and every effective delta held at once",
+  :fix
+  "build-kotobase now produces a lazy quad seq and transacts 250k per batch; the db value accumulates across batches (bench/kotobase_peer/ldbc_snb_bench.cljk)",
+  :result
+  {:quads 20569957,
+   :load-ms 13847.6,
+   :build-ms 92286.9,
+   :elements
+   {:persons 9892,
+    :knows-edges 180623,
+    :messages 3055774,
+    :posts 1003605,
+    :comments 2052169,
+    :has-creator 3055774,
+    :reply-of 2052169,
+    :likes 2190095},
+   :heap-used-mb 11594,
+   :heap-max-mb 11848,
+   :rss-mb 9054,
+   :note
+   "used heap at the ceiling of a 13 GB max (garbage included; live is ~337 B/quad = ~6.9 GB): full SF1 fits this host with little room, and GC pressure will show in the throughput row"}},
+ :schema 1,
+ :date "2026-09-11",
+ :what-this-is-not
+ ["Not a throughput row."
+  "Not an LDBC score."
+  "No Neo4j pairing at this rung: both engines in one JVM do not fit 16 GiB with full SF1; the index twins are the gate here, and the subset rows carry the Neo4j reference for the same code."],
+ :iteration 25,
+ :benchmark
+ "kotoba-lang/ayatori bench/benchmark.edn :ldbc-snb-interactive-network-v2 -- rung SF1 PROPER (all 1,003,605 posts), no throughput row yet",
+ :host
+ "simeon (fleet mac-mini, 10 cores, 16 GiB, swap off), JDK 26, -Xmx13g -XX:+UseParallelGC, 8 server threads",
+ :receipt/type :ldbc-snb-rung-full-sf1,
+ :gate
+ {:first-run
+  {:checked 1082,
+   :disagreements 1,
+   :which
+   {:op :ic09, :person "17592186047707", :max-date 1336608000000},
+   :duration
+   "~30 minutes, almost all of it the naive IC09 index twin materialising friend-of-friend messages on 3M messages",
+   :verdict
+   "the index path was disabled at startup -- the gate did what it is for"},
+  :cause
+  "iteration 18 put IC09's :limit 20 inside each half of the query and excluded the start person AFTERWARDS (a friend's friend is you). When the start person's own messages sit in the two-hop top 20, the exclusion leaves fewer than 20 rows and the rows the answer needed were never fetched. Every official IC09 on the 35k subset was an empty answer, so the subset never exercised it; the first non-empty rung caught it on parameter 1 of 98 that mattered.",
+  :fix
+  {:harness
+   "`[(not= ?x ?person)]` inside the two-hop query, so the limit is taken after the exclusion",
+   :engine
+   "kotoba-lang/datalog f059e215: the ordered drive admits predicate clauses and runs each in the half its variables put it (a predicate on the ordering variable that was not fused keeps the plain join); a query with the exclusion would otherwise have lost the drive. Test: drive vs plain join with not= on the two-hop shape, start person absent. datalog 127/290/0; kotobase-peer on the new pin 262/804/0"},
+  :verified
+  "the disagreeing parameter re-checked in-process on full SF1: 20 rows both ways, sets equal, start person absent from both",
+  :second-run
+  "SUT restarted 17:38 with the fix; the 1,082-parameter gate is running (~30-40 minutes on this rung) -- the throughput row is the next iteration's"}}

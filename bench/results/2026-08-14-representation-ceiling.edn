@@ -1,0 +1,65 @@
+{:schema 1
+ :date "2026-08-14"
+ :receipt/type :representation-experiment
+ :follows "2026-08-14-the-gap-is-a-constant-factor.edn"
+
+ :question
+ "That receipt said the remaining 9x is in the representation and that the next
+  experiment worth running is a representation experiment. This is it: what does
+  a row cost if nothing but the covering indexes is kept?"
+
+ :method
+ "The same LDBC IC02 three-clause join, the same db, the same five start persons.
+  Arm A is `dl/q`. Arm B walks `:pos {p {o #{s}}}` and `:spo {s {p #{o}}}`
+  directly with nested loops into a transient vector -- no bindings, no
+  {:s :p :o} per candidate, no set. Answers asserted equal on all five persons
+  before either was timed. 10 warmup rounds, 60 timed samples, median."
+
+ :result
+ {:rows-per-query 910
+  :a-engine-ms 18.640 :a-min-ms 17.088 :a-ns-per-row 20483
+  :b-direct-walk-ms 0.465 :b-min-ms 0.368 :b-ns-per-row 511
+  :b-faster-by "40.0x"
+  :host-load 3.89}
+
+ :the-reading
+ "Neo4j is 9.7x faster than arm A on this query. Arm B is 40x faster than arm A,
+  which puts it about 4x FASTER than Neo4j, over the same data in the same JVM.
+
+  So the 9x is not a floor imposed by the JVM, by immutability, or by the index
+  layout. The covering indexes already hold the data in a shape that answers this
+  query faster than Neo4j does. What costs 40x is everything the engine puts
+  between those indexes and the answer: a persistent-map binding extended per
+  variable per row, an {:s :p :o} map per candidate, and a set at every step."
+
+ :what-arm-b-is-not
+ ["Not a proposal. It is a specialised walk for exactly this clause shape, with
+   the join order hardcoded. It has no variables, no arbitrary clause count, no
+   negation, rules, aggregates, `or`, or filters."
+  "It applies no `visible?`. Authorization is a real per-row cost the engine must
+   pay and arm B does not. `visible?` was `(constantly true)` in both arms, so
+   this does not affect the comparison, but it does affect what a redesign could
+   claim."
+  "It returns a vector, not a set. The equality assertion compared `(set ...)` of
+   it against the engine's set, so duplicates -- if any existed -- would have been
+   hidden by that comparison. Deduplication is a cost arm B skipped."
+  "One query shape, one dataset, one JVM. A bound, not a benchmark."]
+
+ :what-it-establishes
+ "A ceiling. Any redesign of the binding and intermediate representation is
+  working in a range where 40x exists to be recovered, and where the target
+  (Neo4j) sits well inside it. Before this, it was not known whether the 9x was
+  reachable at all from the current data layout; it is, and by a margin.
+
+  It also bounds the OTHER direction: whatever a general engine must keep --
+  visibility, dedup, arbitrary clause shapes, rules -- has to fit inside that
+  40x, and this experiment says nothing about how much of it that generality
+  actually needs."
+
+ :not-proposing-a-change
+ "Six receipts of profiling produced 2-6% items. This produced a 40x bound and
+  still does not name a mechanism, because a specialised walk is not evidence
+  that a general engine can be made to walk that way. The next honest step is to
+  find which of the three costs -- binding maps, quad maps, per-step sets -- a
+  GENERAL join can actually shed, and that is a design question rather than a
+  measurement."}

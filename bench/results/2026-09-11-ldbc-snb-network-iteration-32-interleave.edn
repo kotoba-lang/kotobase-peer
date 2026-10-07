@@ -1,0 +1,25 @@
+{:receipt/type :ldbc-snb-interactive-network-iteration
+ :iteration 32
+ :date "2026-09-11"
+ :benchmark :ldbc-snb-interactive-network-v2
+ :claim "First rows where the update stream is replayed in simulation time (scheduled = t0 + (sim - sim0) * TCR) with the LDBC dependency rule (an event is not sent until every event with a smaller simulation time has completed) instead of a fixed per-op update share."
+ :driver {:host "judah" :runner "npx -y nbb@1.3.200 ldbc_snb_driver.cljk" :new-flags ["--tcr <s per sim-ms>" "--updates <forum stream>" "--person-updates <person stream>"]
+          :dependency-rule "in-flight sims kept in a sorted-set; an event with :dep > completed-up-to waits; reads fill the slots meanwhile"
+          :counting "skipped events (INS4 forum / INS5 membership, not held by this SUT) are neither operations nor failures; :updates-skipped is reported beside :updates-completed and excluded from throughput"}
+ :sut {:host "levi" :heap "-Xmx6g" :quads 2004832 :subset "35000 most recent posts + reply trees, all persons/knows" :index-path-gate {:checked 1082 :disagreements 0}
+       :meta-change "/ldbc/meta now runs System/gc before reading used heap, so the driver's rss >= 0.95 x used-heap residency rule is judged on live data, not garbage"}
+ :rows
+ [{:inflight 8 :reads-rate 1536 :tcr 0.0002 :on-time-pct 100.0 :failures 0 :throughput-ops-s 2130.2 :reads-per-s 1536 :updates-per-s 595 :updates-skipped 9940
+   :read-after-write {:checked 184 :not-visible 0 :outside-window 16 :unverifiable 50}
+   :sut-memory {:heap-used-mb 792 :rss-mb 2158 :swap-used-pct 23.9} :driver-load-avg ["2.08" "2.21" "2.15"]
+   :receipt "2026-09-11-ldbc-snb-network-iteration-32-interleave-8slots.edn"}
+  {:inflight 32 :reads-rate 2560 :tcr 0.00015 :on-time-pct 100.0 :failures 0 :throughput-ops-s 3371.6 :reads-per-s 2560 :updates-per-s 813 :updates-skipped 13244
+   :read-after-write {:checked 184 :not-visible 0 :outside-window 10 :unverifiable 56}
+   :sut-memory {:heap-used-mb 792 :rss-mb 2158 :swap-used-pct 23.9} :driver-load-avg ["2.17" "2.23" "2.16"]
+   :receipt "2026-09-11-ldbc-snb-network-iteration-32-interleave-32slots.edn"}
+  {:inflight 32 :reads-rate 2048 :tcr 0.0001 :on-time-pct 87.46 :failures 0 :throughput-ops-s 4124.3 :verdict :fails-95pct-rule :delay-p95-ms 2315
+   :note "control: a faster stream (TCR 0.0001 = 2x the event density) at 32 slots over-subscribes the SUT; the rule discriminates. Not a scoreboard row."}]
+ :prediction-before-running "8 slots at reads 1024 + TCR 0.0002 would pass; 32 slots at reads 2048 + TCR 0.0001 would fail the 95% rule because the stream alone asks ~2,200 events/s of which ~1,100 are sent."
+ :observed "both predictions held; the passing 32-slot point is reads 2560 + TCR 0.00015 (3371.6 ops/s), below the 4089 ops/s of iteration 29's read-only 11-op mix — the interleaved stream costs ~700 ops/s of read headroom at this slot count."
+ :not-an-ldbc-score "SF1 subset, 11 of 29 operations, INS4/INS5 skipped, no auditor; the world No.1 row (Huawei GES 3.1.0, SF300 139,411 ops/s, 160 cores) is 41x this row on a dataset 300x larger."
+ :seeds [:s23-ins4-ins5-forums-and-is6 :adr-2609121100-decision-singleton-counterparts :s15-static-tables-for-ic-coverage]}

@@ -1,0 +1,26 @@
+{:receipt/type :ldbc-snb-interactive-network-iteration
+ :iteration 37
+ :date "2026-09-12"
+ :benchmark :ldbc-snb-interactive-network-v2
+ :experiments
+ [{:name :zgc :prediction "no 60-170 ms pauses: p99/max fall, ceilings unchanged"
+   :observed "REFUTED for this SUT: 8 slots identical (1024 passes, 2113 ops/s; tails ic07 max 48 vs 57), 32 slots at 2048 FAILS (66% on-time) where G1 passed -- ZGC's concurrent work takes CPU from 8 server threads on 10 cores; build 31 -> 71 s; host swap 44%. Reverted to G1."
+   :receipts ["2026-09-12-ldbc-snb-network-iteration-37-zgc-8.edn" "2026-09-12-ldbc-snb-network-iteration-37-zgc-32.edn"]}
+  {:name :ic09-scale-diagnosis :seed :s28
+   :before {:engine-ms 10.8 :two-hop-ms 8.7 :expansion-ms 3.6 :twin-ms 1119 :engine-plain-ms 5393 :median-two-hop-persons 2228 :max 2622}
+   :change "kotoba-lang/datalog dc7100c2: the group merge's heap is a java.util.PriorityQueue on the JVM (was a persistent sorted-map); cljs unchanged"
+   :after {:engine-ms 8.7 :two-hop-ms 7.1 :expansion-ms 3.5 :disagreements 0}
+   :reading "the two-hop drive is 500x the plain join and 120x the hand-written twin on 2,228 groups; what remains is 3.5 ms of generic two-hop expansion and ~3.5 ms of touching each group once (a cut and a heap insert per group)"
+   :receipts ["2026-09-12-ldbc-ic09-scale-diagnosis-sorted-map-heap.edn" "2026-09-12-ldbc-ic09-scale-diagnosis-priority-queue-heap.edn"]}
+  {:name :sut-threads-16 :prediction "the 32-slot ceiling is SUT CPU (8 threads on 10 cores): 16 threads and 64 slots raise it"
+   :observed "32 slots: 2048 passes (3522.2), 2560 at 89.5% (was 56% with 8 threads); 64 slots: 2560 passes = 3852.3 ops/s, 3072 fails (48%). Load average 13 on 10 cores -- the SUT is CPU-bound on this host now."
+   :receipts ["2026-09-12-ldbc-snb-network-iteration-37-full37-32t.edn" "2026-09-12-ldbc-snb-network-iteration-37-full37-64t.edn"]}]
+ :sut {:host "levi" :heap "-Xmx10g" :gc :g1 :quads 20569957 :gate {:checked 1082 :disagreements 0} :order-rebuilds {:value 0 :group 3} :resident {:heap-used-mb 5075 :rss-mb 10570 :swap-used-pct 21.3}}
+ :rows
+ [{:rung :sf1-full :inflight 8 :sut-threads 8 :reads-rate 1024 :tcr 0.0002 :on-time-pct 100.0 :throughput-ops-s 2113.5 :note "unchanged from iteration 36 (1280 fails 62.6%); the 8-slot column is bound by slots x the ~2 ms LAN round trip, not the SUT"}
+  {:rung :sf1-full :inflight 32 :sut-threads 16 :reads-rate 2048 :tcr 0.00015 :on-time-pct 100.0 :throughput-ops-s 3522.2 :note "2560 at 89.5% fails; within noise of iteration 36's 3512"}
+  {:rung :sf1-full :inflight 64 :sut-threads 16 :reads-rate 2560 :tcr 0.00015 :on-time-pct 100.0 :failures 0 :throughput-ops-s 3852.3 :reads-per-s 2560 :updates-per-s 1475
+   :read-after-write {:checked 240 :not-visible 0 :outside-window 0 :unverifiable 0 :is6-checked 40 :no-covering-read 40}
+   :note "first 64-slot row; 3072 fails (48.3%)" :receipt "2026-09-12-ldbc-snb-network-iteration-37-full37-64t.edn"}]
+ :not-an-ldbc-score "SF1 is below the audited table; 11 of 21 reads; subset-derived parameters; no ACID suite; no auditor. Audited No.1 (SF300 139,411 ops/s) is 36x the 64-slot row."
+ :seeds [:m4-a-bigger-host-or-less-cpu-per-op :s29-http-server-cost-per-request :s26-full-data-parameter-set :s23b-ic05-covers-ins5 :m3-sf3-needs-13gb]}
