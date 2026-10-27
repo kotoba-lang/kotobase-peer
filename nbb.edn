@@ -3,6 +3,13 @@
 ;; scripts/migrate-clojure-test-to-kotoba-test.cljk; :paths copied from deps.edn.
 {:paths ["src"]
  :deps {
+        ;; The host-free, dependency-closed core of this repository (13 namespaces and their
+        ;; tests) lives in kotoba lib/kotoba.kotobasePeerCore; this repository keeps the peer
+        ;; process (core, datalog-materialization, object-store worker) and requires the core.
+        io.github.kotoba-lang/kotobase-peer-core
+        {:git/url "https://github.com/kotoba-lang/kotoba.git"
+         :git/sha "c59d8fd4a5f4de6f8d51df28768e97b78d3f31fd"
+         :deps/root "lib/kotoba.kotobasePeerCore"}
         ;; kotoba.lang.error replaced clojure.lang.ExceptionInfo here (2026-09-25).
         ;; An explicit floor: tools.deps takes the NEWEST sha it is shown.
         io.github.kotoba-lang/error {:git/sha "838dec56c9a5b74f9eec825a2fb28bda157f8cd3"}
